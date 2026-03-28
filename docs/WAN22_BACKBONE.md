@@ -2,6 +2,8 @@
 
 This guide explains how to train DreamZero on the DROID dataset using **Wan2.2-TI2V-5B** as the backbone instead of the default Wan2.1-I2V-14B.
 
+For a `uv`-based training environment setup, see [README_DROID_WAN22_UV.md](README_DROID_WAN22_UV.md).
+
 ## Architecture Differences
 
 | Component | Wan2.1-I2V-14B | Wan2.2-TI2V-5B |

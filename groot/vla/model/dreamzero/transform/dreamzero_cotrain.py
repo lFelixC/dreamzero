@@ -89,6 +89,36 @@ class HuggingfaceTokenizer:
         return text
 
 
+def _pad_and_stack_numpy(values: List[np.ndarray]) -> np.ndarray:
+    """Pad variable-length arrays with zeros at the tail, then stack."""
+    if len(values) == 0:
+        raise ValueError("Cannot stack an empty list of arrays.")
+
+    if values[0].ndim == 0:
+        return np.stack(values)
+
+    ndims = {value.ndim for value in values}
+    if len(ndims) != 1:
+        raise ValueError(f"Cannot pad arrays with different ranks: {sorted(ndims)}")
+
+    target_shape = tuple(max(value.shape[dim] for value in values) for dim in range(values[0].ndim))
+    stacked = np.zeros((len(values), *target_shape), dtype=values[0].dtype)
+
+    for index, value in enumerate(values):
+        slices = tuple(slice(0, size) for size in value.shape)
+        stacked[(index, *slices)] = value
+
+    return stacked
+
+
+def _build_prefix_mask(lengths: List[int]) -> np.ndarray:
+    max_length = max(lengths)
+    mask = np.zeros((len(lengths), max_length), dtype=bool)
+    for index, length in enumerate(lengths):
+        mask[index, :length] = True
+    return mask
+
+
 def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
     batch = {}
     keys = features[0].keys()
@@ -160,7 +190,14 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            batch[key] = torch.from_numpy(np.stack(values))
+            if all(isinstance(value, np.ndarray) for value in values):
+                batch[key] = torch.from_numpy(_pad_and_stack_numpy(values))
+                if key == "images":
+                    batch["images_mask"] = torch.from_numpy(
+                        _build_prefix_mask([value.shape[0] for value in values])
+                    )
+            else:
+                batch[key] = torch.from_numpy(np.stack(values))
     return batch
 
 
@@ -627,4 +664,3 @@ class DreamTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
-

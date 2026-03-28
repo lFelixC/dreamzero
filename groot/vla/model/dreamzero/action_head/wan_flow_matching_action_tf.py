@@ -579,6 +579,17 @@ class WANPolicyHead(ActionHead):
             # concat: B * (4+16) * (1+(T-1)/4) * H_latent * W_latent
             y = torch.concat([msk, y], dim=1)
         return clip_context, y, new_image
+
+    def _masked_mean(self, values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+        mask = mask.to(dtype=values.dtype)
+        return (values * mask).sum(dim=dim) / mask.sum(dim=dim).clamp_min(1.0)
+
+    def _video_mask_to_latent_mask(self, video_frame_mask: torch.Tensor, latent_frames: int) -> torch.Tensor:
+        # WanVideoVAE keeps the first frame and compresses the remaining temporal axis by 4.
+        valid_video_frames = video_frame_mask.long().sum(dim=1)
+        valid_latent_frames = 1 + (valid_video_frames - 1).clamp_min(0) // 4
+        latent_index = torch.arange(latent_frames, device=video_frame_mask.device)
+        return latent_index.unsqueeze(0) < valid_latent_frames.unsqueeze(1)
     
     def prepare_extra_input(self, latents=None):
         return {}
@@ -610,6 +621,7 @@ class WANPolicyHead(ActionHead):
         # print("embodiment_id", embodiment_id)
         has_real_action = action_input.has_real_action
         action_mask = action_input.action_mask
+        video_frame_mask = getattr(action_input, "images_mask", None)
 
         state_features = action_input.state
 
@@ -620,7 +632,6 @@ class WANPolicyHead(ActionHead):
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
-        print("videos", videos.shape)
         
 
         if videos.dtype == torch.uint8:
@@ -657,6 +668,12 @@ class WANPolicyHead(ActionHead):
                 ).reshape(b, c, t, target_h, target_w)
 
         latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
+        latent_frame_mask = None
+        if video_frame_mask is not None:
+            latent_frame_mask = self._video_mask_to_latent_mask(
+                video_frame_mask.to(device=latents.device, dtype=torch.bool),
+                latents.shape[2],
+            )
 
         # print("latents shape", latents.shape, self.dtype)
         _, _, num_frames, height, width = videos.shape
@@ -786,17 +803,22 @@ class WANPolicyHead(ActionHead):
             ).mean(dim=(1,3,4))  # shape: [B, ...]
 
             weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
-            weighted_dynamics_loss = weight_dynamics.mean()
+            if latent_frame_mask is not None:
+                weighted_dynamics_loss = self._masked_mean(weight_dynamics, latent_frame_mask, dim=1).mean()
+            else:
+                weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                # Keep the per-sample mask as [B, 1, 1] so it broadcasts over [B, T, D].
+                action_loss_per_sample = has_real_action.float().view(-1, 1, 1) * action_loss_per_sample
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
-                weighted_action_loss = weight_action.mean()
+                action_token_mask = action_mask.any(dim=2)
+                weighted_action_loss = self._masked_mean(weight_action, action_token_mask, dim=1).mean()
                 loss = weighted_dynamics_loss + weighted_action_loss
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)

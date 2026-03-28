@@ -88,17 +88,32 @@ if [ ! -f "$EXPERIMENT_PY" ]; then
     echo "ERROR: Not found: $EXPERIMENT_PY"
     exit 1
 fi
-PYTHON_311="/usr/bin/python3.11"
-if [ -x "$PYTHON_311" ]; then
-    if [ -n "${FIX_NUMPY_IN_SCRIPT:-}" ]; then
-        "$PYTHON_311" -m pip install "numpy==1.26.4" --force-reinstall -q 2>/dev/null || true
-    fi
-    RUN_CMD=( "$PYTHON_311" -m torch.distributed.run --nproc_per_node "$NUM_GPUS" --standalone "$EXPERIMENT_PY" )
-    echo "Using image Python 3.11: $PYTHON_311"
+if [ -n "${PYTHON_BIN:-}" ]; then
+    :
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+elif command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.11)"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
 else
-    RUN_CMD=( python3 -m torch.distributed.run --nproc_per_node "$NUM_GPUS" --standalone "$EXPERIMENT_PY" )
-    echo "Using: $(command -v python3)"
+    echo "ERROR: Could not find a usable Python interpreter. Set PYTHON_BIN manually."
+    exit 1
 fi
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "ERROR: PYTHON_BIN is not executable: $PYTHON_BIN"
+    exit 1
+fi
+
+if [ -n "${FIX_NUMPY_IN_SCRIPT:-}" ]; then
+    "$PYTHON_BIN" -m pip install "numpy==1.26.4" --force-reinstall -q 2>/dev/null || true
+fi
+
+RUN_CMD=( "$PYTHON_BIN" -m torch.distributed.run --nproc_per_node "$NUM_GPUS" --standalone "$EXPERIMENT_PY" )
+echo "Using Python: $PYTHON_BIN"
 cd "$DREAMZERO_ROOT"
 
 # Full fine-tune: train_architecture=full, save_lora_only=false, ZeRO-2 (+ optional CPU offload)

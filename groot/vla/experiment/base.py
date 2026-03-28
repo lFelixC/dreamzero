@@ -98,6 +98,29 @@ class LossLoggerCallback(TrainerCallback):
                 f.write(json.dumps(entry) + "\n")
 
 
+def maybe_enable_swanlab_sync():
+    """Optionally route wandb logs through SwanLab with minimal intrusion.
+
+    Enable by setting `SWANLAB_SYNC_WANDB=1` in the environment. If `swanlab`
+    is not installed, training continues with plain wandb logging.
+    """
+    if os.environ.get("SWANLAB_SYNC_WANDB", "").lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    # Only initialize the bridge on the main process.
+    if os.environ.get("RANK", "0") != "0":
+        return
+
+    try:
+        import swanlab
+    except ImportError:
+        print("SWANLAB_SYNC_WANDB is enabled, but `swanlab` is not installed. Falling back to plain wandb.")
+        return
+
+    swanlab.sync_wandb()
+    print("Enabled SwanLab sync for wandb logging.")
+
+
 class CheckpointFormatCallback(TrainerCallback):
     """This callback format checkpoint to make them standalone. For now, it copies all config
     files to /checkpoint-{step}/experiment_cfg/:
@@ -389,9 +412,9 @@ class BaseTrainer(transformers.Trainer):
             output = super().training_step(model, inputs)
 
         time_taken = time.time() - start_time
-        print(
-            f"Rank {self.global_rank} time taken for training_step {self.current_step}: {time_taken:.2f} seconds"
-        )
+        # print(
+        #     f"Rank {self.global_rank} time taken for training_step {self.current_step}: {time_taken:.2f} seconds"
+        # )
 
         if enable_profile:
             trace_path = f"{self.torch_profile_dir}/trace_rank_{self.global_rank}_step_{self.current_step}.json.gz"
@@ -612,6 +635,9 @@ class BaseExperiment(ABC):
         training_args = instantiate(cfg.training_args)
         set_seed(training_args.seed)
 
+        # Optionally let SwanLab mirror wandb logs before wandb is initialized by HF Trainer.
+        maybe_enable_swanlab_sync()
+
         # Set the environment variables for wandb.
         if "WANDB_PROJECT" not in os.environ:
             os.environ["WANDB_PROJECT"] = cfg.wandb_project
@@ -736,7 +762,7 @@ class BaseExperiment(ABC):
             mprint("Successfully loaded pretrained weights")
 
         model.config.resume_path = model.config._name_or_path = training_args.output_dir
-        mprint(f"{model}\n")
+        # Avoid printing the full model structure during training startup.
         return model
 
     def create_train_dataset(self, cfg, model):
