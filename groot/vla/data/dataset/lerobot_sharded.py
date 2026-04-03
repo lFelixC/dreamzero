@@ -1476,7 +1476,8 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
 
         self._shards_sample_schedule = self.filter_shards_sample_schedule()
         self.curr_shard_index = -1
-        self.cache_next_shard()
+        if not self.cache_next_shard():
+            return
         rng = np.random.default_rng(self.seed)
         for i, (dataset_index, shard_index) in enumerate(self.shards_sample_schedule):
             self.curr_shard_index += 1
@@ -1526,10 +1527,14 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
             # Delete the cached shard and shard start indices to free up memory
             dataset.delete_cached_shard()
 
-    def cache_next_shard(self):
+    def cache_next_shard(self) -> bool:
         """Cache the next shard in a background thread."""
-        next_dataset_idx, next_shard_idx = self.shards_sample_schedule[self.curr_shard_index + 1]
+        next_index = self.curr_shard_index + 1
+        if next_index >= len(self.shards_sample_schedule):
+            return False
+        next_dataset_idx, next_shard_idx = self.shards_sample_schedule[next_index]
         self.datasets[next_dataset_idx].start_cache_shard(next_shard_idx)
+        return True
 
     def __getitem__(self, index: int) -> dict:
         raise NotImplementedError(
