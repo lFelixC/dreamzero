@@ -606,15 +606,17 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # Get language annotations for all steps in the trajectory
         # language_key = self.language_key
+        language_key = None
+        annotation_meta = getattr(self.lerobot_modality_meta, "annotation", None)
         for modality in self.modality_keys:
             for modality_key in self.modality_keys[modality]:
-                if modality_key.startswith("annotation."):
+                if modality_key.startswith("annotation.") and annotation_meta is not None:
                     subkey = modality_key.replace("annotation.", "")
-                    annotation_meta = self.lerobot_modality_meta.annotation
+                    if subkey not in annotation_meta:
+                        continue
                     subkey_meta = annotation_meta[subkey]
-                    language_key = subkey_meta.original_key
+                    language_key = subkey_meta.original_key or modality_key
                     break
-        assert language_key is not None, "Language key not found"
         if language_key in traj_data.columns:
             language_annotations = traj_data[language_key].values
         else:
@@ -773,13 +775,15 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         # language_key = self.language_key
         traj_data = self.get_trajectory_data(trajectory_id)
         language_key = None
+        annotation_meta = getattr(self.lerobot_modality_meta, "annotation", None)
         for modality_name in self.modality_keys:
             for modality_key in self.modality_keys[modality_name]:
-                if modality_key.startswith("annotation."):
+                if modality_key.startswith("annotation.") and annotation_meta is not None:
                     subkey = modality_key.replace("annotation.", "")
-                    annotation_meta = self.lerobot_modality_meta.annotation
+                    if subkey not in annotation_meta:
+                        continue
                     subkey_meta = annotation_meta[subkey]
-                    language_key = subkey_meta.original_key
+                    language_key = subkey_meta.original_key or modality_key
                     break
         if language_key is not None and language_key in traj_data.columns and len(step_indices) > 0:
             language_annotations = traj_data[language_key].values
@@ -942,13 +946,15 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         # language_key = self.language_key
         traj_data = self.get_trajectory_data(trajectory_id)
         language_key = None
+        annotation_meta = getattr(self.lerobot_modality_meta, "annotation", None)
         for modality_name in self.modality_keys:
             for modality_key in self.modality_keys[modality_name]:
-                if modality_key.startswith("annotation."):
+                if modality_key.startswith("annotation.") and annotation_meta is not None:
                     subkey = modality_key.replace("annotation.", "")
-                    annotation_meta = self.lerobot_modality_meta.annotation
+                    if subkey not in annotation_meta:
+                        continue
                     subkey_meta = annotation_meta[subkey]
-                    language_key = subkey_meta.original_key
+                    language_key = subkey_meta.original_key or modality_key
                     break
         if language_key is not None and language_key in traj_data.columns and len(step_indices) > 0:
             language_annotations = traj_data[language_key].values
