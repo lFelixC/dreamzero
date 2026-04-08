@@ -28,16 +28,18 @@ class WebsocketClientPolicy(BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000, log_wait: bool = True) -> None:
         self._uri = f"ws://{host}:{port}"
         self._packer = msgpack_numpy.Packer()
+        self._log_wait = log_wait
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
-        logging.info(f"Waiting for server at {self._uri}...")
+        if self._log_wait:
+            logging.info(f"Waiting for server at {self._uri}...")
         try:
             conn = websockets.sync.client.connect(
                 self._uri, 
@@ -48,8 +50,9 @@ class WebsocketClientPolicy(BasePolicy):
             )
             metadata = msgpack_numpy.unpackb(conn.recv())
             return conn, metadata
-        except:
-            logging.info("Connection to server with ws:// failed. Trying wss:// ...")
+        except Exception:
+            if self._log_wait:
+                logging.info("Connection to server with ws:// failed. Trying wss:// ...")
             
         self._uri = "wss://" + self._uri.split("//")[1]
         conn = websockets.sync.client.connect(
@@ -61,6 +64,9 @@ class WebsocketClientPolicy(BasePolicy):
         )
         metadata = msgpack_numpy.unpackb(conn.recv())
         return conn, metadata
+
+    def close(self) -> None:
+        self._ws.close()
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
