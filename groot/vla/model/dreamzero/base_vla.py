@@ -538,7 +538,8 @@ class VLA(PreTrainedModel):
             config_dict = json.load(f)
         config = VLAConfig(**config_dict)
         print("loading model")
-        print("config.action_head_cfg", config.action_head_cfg)
+        if isinstance(config.action_head_cfg, dict):
+            print(f"action_head_cfg target={config.action_head_cfg.get('_target_', 'unknown')}")
         # Always disable defer_lora_injection
         # config.action_head_cfg is a dict, and defer_lora_injection is nested in config.action_head_cfg['config']
         if 'config' in config.action_head_cfg and isinstance(config.action_head_cfg['config'], dict):
@@ -551,7 +552,7 @@ class VLA(PreTrainedModel):
 
         # Instantiate model
         model = cls(config)
-        print("model", model)
+        print(f"Instantiated model class: {type(model).__name__}")
         # Remove .base_layer from keys (e.g., 'action_head.model.base_model.model.blocks.19.self_attn.v.base_layer.bias' -> 'action_head.model.base_model.model.blocks.19.self_attn.v.bias')
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
         if has_base_layer:

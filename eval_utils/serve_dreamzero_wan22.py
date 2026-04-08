@@ -106,12 +106,15 @@ def _resize_frames_to_resolution(frames: np.ndarray, target_h: int, target_w: in
     return out
 
 
-def _maybe_init_distributed():
+def _maybe_init_distributed(master_port: int | None = None):
     """Initialize process group for single-GPU or multi-GPU. Required by GrootSimPolicy."""
     if dist.is_initialized():
         return
     os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    if master_port is not None:
+        os.environ["MASTER_PORT"] = str(master_port)
+    else:
+        os.environ.setdefault("MASTER_PORT", "29500")
     dist.init_process_group(backend="nccl", rank=0, world_size=1)
     torch.cuda.set_device(0)
 
