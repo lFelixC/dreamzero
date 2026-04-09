@@ -19,8 +19,18 @@ from openpi_client import msgpack_numpy
 # send a pong response immediately if it is busy processing a request.
 # Increase the ping interval and timeout so that the client can wait
 # for a longer time before closing the connection.
+OPEN_TIMEOUT_SECS = 0
 PING_INTERVAL_SECS = 60
 PING_TIMEOUT_SECS = 600
+
+
+def _normalize_timeout(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    if timeout_seconds <= 0:
+        return None
+    return timeout_seconds
+
 
 class WebsocketClientPolicy(BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
@@ -28,10 +38,17 @@ class WebsocketClientPolicy(BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000, log_wait: bool = True) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        log_wait: bool = True,
+        open_timeout: float | None = OPEN_TIMEOUT_SECS,
+    ) -> None:
         self._uri = f"ws://{host}:{port}"
         self._packer = msgpack_numpy.Packer()
         self._log_wait = log_wait
+        self._open_timeout = _normalize_timeout(open_timeout)
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -45,6 +62,7 @@ class WebsocketClientPolicy(BasePolicy):
                 self._uri, 
                 compression=None, 
                 max_size=None,
+                open_timeout=self._open_timeout,
                 ping_interval=PING_INTERVAL_SECS,
                 ping_timeout=PING_TIMEOUT_SECS,
             )
@@ -59,6 +77,7 @@ class WebsocketClientPolicy(BasePolicy):
             self._uri, 
             compression=None, 
             max_size=None,
+            open_timeout=self._open_timeout,
             ping_interval=PING_INTERVAL_SECS,
             ping_timeout=PING_TIMEOUT_SECS,
         )
