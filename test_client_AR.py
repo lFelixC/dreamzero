@@ -82,6 +82,40 @@ def load_camera_frames() -> dict[str, np.ndarray]:
     return camera_frames
 
 
+def resize_camera_frames(
+    camera_frames: dict[str, np.ndarray],
+    image_resolution: tuple[int, int] | list[int] | None,
+) -> dict[str, np.ndarray]:
+    """Resize camera frames to match the server's advertised image resolution."""
+    if image_resolution is None:
+        return camera_frames
+
+    target_h, target_w = image_resolution
+    resized_frames: dict[str, np.ndarray] = {}
+
+    for cam_key, frames in camera_frames.items():
+        if frames.shape[1:3] == (target_h, target_w):
+            resized_frames[cam_key] = frames
+            continue
+
+        logging.info(
+            "Resizing %s from %s to (%d, %d)",
+            cam_key,
+            frames.shape[1:3],
+            target_h,
+            target_w,
+        )
+        resized_frames[cam_key] = np.stack(
+            [
+                cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                for frame in frames
+            ],
+            axis=0,
+        )
+
+    return resized_frames
+
+
 def build_frame_schedule(total_frames: int, num_chunks: int) -> list[list[int]]:
     """Build the frame index schedule for multi-frame chunks.
 
@@ -238,6 +272,7 @@ def test_ar_droid_policy_server(
     # ── Real video frame mode ─────────────────────────────────────────
     logging.info("Loading real video frames from debug_image/ directory")
     camera_frames = load_camera_frames()
+    camera_frames = resize_camera_frames(camera_frames, server_config.image_resolution)
 
     total_frames = min(v.shape[0] for v in camera_frames.values())
     logging.info(f"Total frames available: {total_frames}")

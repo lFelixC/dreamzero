@@ -337,6 +337,7 @@ def main(
     tokenizer_path: str | None = None,
     port: int = 8000,
     host: str = "0.0.0.0",
+    handshake_timeout_seconds: float | None = 0.0,
     image_height: int | None = None,
     image_width: int | None = None,
     save_video_pred: bool = False,
@@ -386,6 +387,7 @@ def main(
         server_config=server_config,
         host=host,
         port=port,
+        open_timeout=handshake_timeout_seconds,
     )
     server.serve_forever()
 

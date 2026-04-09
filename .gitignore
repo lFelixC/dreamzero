@@ -218,6 +218,9 @@ plots/
 sysid_data/
 isaac_data/
 
+# DreamZero video eval artifacts
+video_eval/video_results/
+
 # External dependencies
 external_dependencies/ws_lidar_slam_ros2/build
 external_dependencies/ws_lidar_slam_ros2/install

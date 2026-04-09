@@ -157,6 +157,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--image-height", type=int, default=None, help="Optional image height override.")
     parser.add_argument("--image-width", type=int, default=None, help="Optional image width override.")
+    parser.add_argument(
+        "--handshake-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Websocket opening-handshake timeout in seconds. Use 0 or a negative value to disable it.",
+    )
     return parser
 
 
@@ -208,6 +214,7 @@ def main() -> None:
         server_config=server_config,
         host=args.host,
         port=args.port,
+        open_timeout=args.handshake_timeout_seconds,
     )
     server.serve_forever()
 

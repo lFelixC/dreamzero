@@ -16,6 +16,14 @@ import websockets.asyncio.server
 import websockets.frames
 
 
+def _normalize_timeout(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    if timeout_seconds <= 0:
+        return None
+    return timeout_seconds
+
+
 @dataclasses.dataclass
 class PolicyServerConfig:
     # Resolution that images get resized to client-side, None means no resizing.
@@ -61,11 +69,13 @@ class WebsocketPolicyServer:
         server_config: PolicyServerConfig,
         host: str = "0.0.0.0",
         port: int = 8000,
+        open_timeout: float | None = 0.0,
     ) -> None:
         self._policy = policy
         self._server_config = server_config
         self._host = host
         self._port = port
+        self._open_timeout = _normalize_timeout(open_timeout)
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -78,6 +88,8 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            open_timeout=self._open_timeout,
+            ping_interval=None,
         ) as server:
             await server.serve_forever()
 
