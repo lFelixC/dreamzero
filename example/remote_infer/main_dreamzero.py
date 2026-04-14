@@ -235,6 +235,48 @@ class DreamZeroRealPolicyClient:
         self._history["secondary"].append(secondary_image)
         self._history["wrist"].append(wrist_image)
 
+    def _normalize_action_chunk(self, response: object) -> np.ndarray:
+        if isinstance(response, dict):
+            if "actions" in response:
+                response = response["actions"]
+            elif "action" in response:
+                response = response["action"]
+            else:
+                joint_action = None
+                gripper_action = None
+                for key, value in response.items():
+                    if not isinstance(key, str):
+                        continue
+                    if "joint_position" in key:
+                        joint_action = np.asarray(value, dtype=np.float32)
+                    elif "gripper_position" in key or key.endswith("gripper"):
+                        gripper_action = np.asarray(value, dtype=np.float32)
+
+                if joint_action is None:
+                    raise TypeError(
+                        f"Policy response dict does not contain an action array. Keys: {list(response.keys())}"
+                    )
+
+                if joint_action.ndim == 1:
+                    joint_action = joint_action.reshape(1, -1)
+
+                if gripper_action is None:
+                    gripper_action = np.zeros((joint_action.shape[0], 1), dtype=np.float32)
+                else:
+                    if gripper_action.ndim == 0:
+                        gripper_action = gripper_action.reshape(1, 1)
+                    elif gripper_action.ndim == 1:
+                        gripper_action = gripper_action.reshape(-1, 1)
+                    if gripper_action.shape[-1] > 1:
+                        gripper_action = gripper_action[..., :1]
+
+                response = np.concatenate([joint_action, gripper_action], axis=-1)
+
+        pred_action_chunk = np.array(response, dtype=np.float32, copy=True)
+        if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 8:
+            raise ValueError(f"Expected action chunk with shape (N, 8), got {pred_action_chunk.shape}")
+        return pred_action_chunk
+
     def _should_query_policy(self) -> bool:
         if self._pred_action_chunk is None:
             return True
@@ -305,10 +347,7 @@ class DreamZeroRealPolicyClient:
             with prevent_keyboard_interrupt():
                 pred_action_chunk = self._client.infer(request_data)
             policy_roundtrip_ms = (time.perf_counter() - roundtrip_start) * 1000
-            pred_action_chunk = np.array(pred_action_chunk, dtype=np.float32, copy=True)
-
-            if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 8:
-                raise ValueError(f"Expected action chunk with shape (N, 8), got {pred_action_chunk.shape}")
+            pred_action_chunk = self._normalize_action_chunk(pred_action_chunk)
 
             self._pred_action_chunk = pred_action_chunk
             self._has_sent_initial_request = True

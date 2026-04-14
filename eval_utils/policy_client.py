@@ -98,7 +98,10 @@ class WebsocketClientPolicy(BasePolicy):
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
-        return msgpack_numpy.unpackb(response)
+        unpacked = msgpack_numpy.unpackb(response)
+        if isinstance(unpacked, dict) and "actions" in unpacked:
+            return unpacked["actions"]
+        return unpacked
 
     @override
     def reset(self, reset_info: Dict) -> None:

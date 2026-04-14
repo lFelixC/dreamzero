@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class Args:
     port: int = 8000
-    timeout_seconds: int = 50000  # 10 hours default, configurable
+    timeout_seconds: int = 604800  # 7 days default, configurable
     handshake_timeout_seconds: float | None = 0.0  # <= 0 disables the opening-handshake timeout.
     model_path: str = "./checkpoints/dreamzero"
     enable_dit_cache: bool = False
@@ -84,6 +84,7 @@ class ARDroidRoboarenaPolicy:
         
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
+        self._warned_single_external_fallback = False
         
         # Video across time for saving (similar to original server)
         self.video_across_time = []
@@ -115,6 +116,12 @@ class ARDroidRoboarenaPolicy:
             arr = arr.astype(np.uint8)
 
         return np.ascontiguousarray(arr)
+
+    def _append_frames_to_buffer(self, droid_key: str, data: np.ndarray) -> None:
+        if data.ndim == 4:
+            self._frame_buffers[droid_key].extend(list(data))
+        else:
+            self._frame_buffers[droid_key].append(data)
 
     @staticmethod
     def _extract_action_dict(action_chunk: Batch | dict) -> dict[str, np.ndarray | torch.Tensor]:
@@ -173,17 +180,34 @@ class ARDroidRoboarenaPolicy:
             "observation/wrist_image_left": "video.wrist_image_left",
         }
         
+        processed_images: dict[str, np.ndarray] = {}
+
         # Accumulate frames for each camera view
         for roboarena_key, droid_key in image_key_mapping.items():
             if roboarena_key in obs:
                 data = self._normalize_image_array(obs[roboarena_key], roboarena_key)
                 data = _resize_frames_to_resolution(data, self._image_height, self._image_width)
-                if data.ndim == 4:
-                    # Multiple frames (T, H, W, 3)
-                    self._frame_buffers[droid_key].extend(list(data))
-                else:
-                    # Single frame (H, W, 3)
-                    self._frame_buffers[droid_key].append(data)
+                processed_images[roboarena_key] = data
+                self._append_frames_to_buffer(droid_key, data)
+
+        # Accept either one or two exterior cameras from RoboArena.
+        # If only one exterior stream is present, duplicate it into the missing DreamZero slot.
+        exterior_0 = processed_images.get("observation/exterior_image_0_left")
+        exterior_1 = processed_images.get("observation/exterior_image_1_left")
+        if exterior_0 is None and exterior_1 is not None:
+            if not self._warned_single_external_fallback:
+                logger.warning(
+                    "Only observation/exterior_image_1_left was provided; duplicating it to fill missing observation/exterior_image_0_left."
+                )
+                self._warned_single_external_fallback = True
+            self._append_frames_to_buffer("video.exterior_image_1_left", exterior_1)
+        elif exterior_1 is None and exterior_0 is not None:
+            if not self._warned_single_external_fallback:
+                logger.warning(
+                    "Only observation/exterior_image_0_left was provided; duplicating it to fill missing observation/exterior_image_1_left."
+                )
+                self._warned_single_external_fallback = True
+            self._append_frames_to_buffer("video.exterior_image_2_left", exterior_0)
 
         # Determine how many frames to use
         if self._is_first_call:
@@ -405,6 +429,7 @@ class ARDroidRoboarenaPolicy:
         self._call_count = 0
         self._is_first_call = True
         self.video_across_time = []
+        self._warned_single_external_fallback = False
         self._reset_model_temporal_state()
     
     def reset(self, reset_info: dict) -> None:

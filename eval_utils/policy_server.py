@@ -60,6 +60,9 @@ class WebsocketPolicyServer:
       Action:
         - action: (N, 8,) or (N, 7,): either 7 movement actions (for joint action spaces) or 6 (for cartesian) plus one dimension for gripper position
                            --> all N actions will get executed on the robot before the server is queried again
+        - policies may return either a raw action array or a dict containing
+          {"actions": action_array}; the websocket server normalizes raw arrays
+          to the RoboArena-compatible dict response format.
 
     """
 
@@ -111,6 +114,8 @@ class WebsocketPolicyServer:
                     to_return = "reset successful"
                 else:
                     action = self._policy.infer(obs)
+                    if not isinstance(action, dict):
+                        action = {"actions": action}
                     to_return = packer.pack(action)
                 await websocket.send(to_return)
             except websockets.ConnectionClosed:
@@ -130,7 +135,7 @@ if __name__ == "__main__":
 
     class DummyPolicy(BasePolicy):
         def infer(self, obs):
-            return np.zeros((1, 8), dtype=np.float32)
+            return {"actions": np.zeros((1, 8), dtype=np.float32)}
         
         def reset(self, reset_info):
             pass
