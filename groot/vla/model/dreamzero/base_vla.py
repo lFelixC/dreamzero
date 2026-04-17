@@ -10,6 +10,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 import tree
+from groot.vla.utils.checkpoint_sidecar import prepare_action_head_cfg_for_checkpoint
 
 BACKBONE_FEATURE_KEY = "backbone_features"
 ACTION_KEY = "action_pred"
@@ -277,6 +278,7 @@ class VLA(PreTrainedModel):
         import gc
         from safetensors.torch import load_file
 
+        prepare_action_head_cfg_for_checkpoint(config.action_head_cfg, pretrained_model_name_or_path)
         model = cls(config)
 
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
@@ -374,6 +376,7 @@ class VLA(PreTrainedModel):
         with open(config_path, "r") as f:
             config_dict = json.load(f)
         config = VLAConfig(**config_dict)
+        prepare_action_head_cfg_for_checkpoint(config.action_head_cfg, pretrained_model_name_or_path)
         print("loading model")
 
         # Disable defer_lora_injection so LoRA layers are created during init,
@@ -537,6 +540,7 @@ class VLA(PreTrainedModel):
         with open(config_path, "r") as f:
             config_dict = json.load(f)
         config = VLAConfig(**config_dict)
+        prepare_action_head_cfg_for_checkpoint(config.action_head_cfg, pretrained_model_name_or_path)
         print("loading model")
         if isinstance(config.action_head_cfg, dict):
             print(f"action_head_cfg target={config.action_head_cfg.get('_target_', 'unknown')}")

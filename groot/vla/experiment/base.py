@@ -55,6 +55,10 @@ from groot.vla.experiment.utils import (
     mprint,
     safe_save_model_for_hf_trainer,
 )
+from groot.vla.utils.checkpoint_sidecar import (
+    materialize_component_sidecars,
+    prepare_action_head_cfg_for_checkpoint,
+)
 from groot.vla.utils.timer import ContextTimer
 
 # Fix resume: https://github.com/huggingface/transformers/pull/34632/files
@@ -518,6 +522,9 @@ class BaseTrainer(transformers.Trainer):
 
         if self.args.should_save:
             ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
+            sidecars = materialize_component_sidecars(self.model, output_dir)
+            if sidecars:
+                mprint(f"Materialized local component sidecars into {output_dir}: {sidecars}")
 
             # can separately save the VLM model for downstream evalualtion
             if self.base_cfg.save_llm:
@@ -724,6 +731,11 @@ class BaseExperiment(ABC):
         self.trainer = trainer
 
     def create_model(self, cfg, training_args):
+        if cfg.pretrained_model_path is not None:
+            prepare_action_head_cfg_for_checkpoint(
+                cfg.model.config.action_head_cfg,
+                cfg.pretrained_model_path,
+            )
         model = instantiate(cfg.model)
 
         if cfg.pretrained_model_path is not None:
