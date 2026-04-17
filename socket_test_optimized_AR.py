@@ -44,6 +44,20 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    use_rtc: bool = False
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
+    rtc_guidance_max_steps: int = 4
+    rtc_guidance_step_stride: int = 1
+
+
+@dataclasses.dataclass
+class RTCSessionState:
+    last_action_chunk_abs: np.ndarray | None = None
+    consumed_steps: int = 0
+    chunk_start_step_idx: int | None = None
+    request_count: int = 0
 
 
 class ARDroidRoboarenaPolicy:
@@ -66,12 +80,24 @@ class ARDroidRoboarenaPolicy:
         image_height: int,
         image_width: int,
         output_dir: str | None = None,
+        use_rtc: bool = False,
+        rtc_execution_horizon: int = 10,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "EXP",
+        rtc_guidance_max_steps: int = 4,
+        rtc_guidance_step_stride: int = 1,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._image_height = image_height
         self._image_width = image_width
         self._output_dir = output_dir
+        self._use_rtc = use_rtc
+        self._rtc_execution_horizon = rtc_execution_horizon
+        self._rtc_max_guidance_weight = rtc_max_guidance_weight
+        self._rtc_prefix_attention_schedule = rtc_prefix_attention_schedule
+        self._rtc_guidance_max_steps = rtc_guidance_max_steps
+        self._rtc_guidance_step_stride = rtc_guidance_step_stride
         
         # Frame buffers for accumulation (per camera view)
         self._frame_buffers: dict[str, list[np.ndarray]] = {
@@ -84,6 +110,7 @@ class ARDroidRoboarenaPolicy:
         
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
+        self._rtc_session_states: dict[str, RTCSessionState] = {}
         self._warned_single_external_fallback = False
         
         # Video across time for saving (similar to original server)
@@ -145,7 +172,33 @@ class ARDroidRoboarenaPolicy:
                     continue
             return action_dict
 
+    @staticmethod
+    def _extract_optional_int(value, default: int | None = None) -> int | None:
+        if value is None:
+            return default
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            value = value.item() if value.size == 1 else value.reshape(-1)[0]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _session_key(session_id: str | None) -> str:
+        return str(session_id) if session_id is not None else "__default__"
+
+    def _get_session_state(self, session_id: str | None) -> RTCSessionState:
+        key = self._session_key(session_id)
+        if key not in self._rtc_session_states:
+            self._rtc_session_states[key] = RTCSessionState()
+        return self._rtc_session_states[key]
+
     def _reset_model_temporal_state(self) -> None:
+        if hasattr(self._policy, "reset_inference_state"):
+            self._policy.reset_inference_state()
+            return
         if hasattr(self._policy.trained_model, "action_head") and hasattr(
             self._policy.trained_model.action_head, "current_start_frame"
         ):
@@ -313,21 +366,56 @@ class ARDroidRoboarenaPolicy:
         
         return action
     
-    def _broadcast_batch_to_workers(self, obs: dict) -> None:
-        """Broadcast batch data from rank 0 to all other ranks."""
+    def _broadcast_signal(self, signal: int) -> None:
+        signal_tensor = torch.tensor([signal], dtype=torch.int32, device="cpu")
+        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+
+    def _broadcast_payload_to_workers(self, payload: dict) -> None:
+        """Broadcast inference payload from rank 0 to all other ranks."""
         import pickle
         
-        # Serialize the obs
-        serialized = pickle.dumps(obs)
+        serialized = pickle.dumps(payload)
         data_size = len(serialized)
         
-        # Broadcast size first
-        size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
+        size_tensor = torch.tensor([data_size], dtype=torch.int64, device="cuda")
         dist.broadcast(size_tensor, src=0)
         
-        # Broadcast data
         data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
         dist.broadcast(data_tensor, src=0)
+
+    @staticmethod
+    def _trim_action_chunk_for_delay(
+        action: np.ndarray,
+        inference_delay_steps: int,
+    ) -> tuple[np.ndarray, int]:
+        if action.shape[0] <= 1 or inference_delay_steps <= 0:
+            return action, 0
+
+        trim_steps = min(inference_delay_steps, action.shape[0] - 1)
+        if inference_delay_steps >= action.shape[0]:
+            logger.warning(
+                "RTC inference delay %d exceeds chunk length %d; keeping the final action only.",
+                inference_delay_steps,
+                action.shape[0],
+            )
+        return action[trim_steps:], trim_steps
+
+    def _compute_prev_chunk_left_over(
+        self,
+        session_state: RTCSessionState,
+        rtc_step_idx: int | None,
+    ) -> np.ndarray | None:
+        if session_state.last_action_chunk_abs is None:
+            return None
+        if rtc_step_idx is None or session_state.chunk_start_step_idx is None:
+            return None
+
+        consumed_steps = max(int(rtc_step_idx) - int(session_state.chunk_start_step_idx), 0)
+        consumed_steps = min(consumed_steps, session_state.last_action_chunk_abs.shape[0])
+        session_state.consumed_steps = consumed_steps
+        if consumed_steps >= session_state.last_action_chunk_abs.shape[0]:
+            return None
+        return session_state.last_action_chunk_abs[consumed_steps:]
     
     def infer(self, obs: dict) -> np.ndarray:
         """Infer actions from observations.
@@ -348,19 +436,55 @@ class ARDroidRoboarenaPolicy:
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
+
+        rtc_step_idx = self._extract_optional_int(obs.get("rtc_step_idx", None))
+        rtc_inference_delay_steps = max(
+            self._extract_optional_int(obs.get("rtc_inference_delay_steps", 0), default=0) or 0,
+            0,
+        )
+        if self._use_rtc and rtc_step_idx is None:
+            logger.warning("RTC is enabled but request is missing rtc_step_idx; falling back to baseline chunking for this call.")
         
         self._msg_index += 1
         self._call_count += 1
         
         # Convert observation format
         converted_obs = self._convert_observation(obs)
+        session_state = self._get_session_state(session_id) if self._use_rtc else None
+        prev_chunk_left_over_abs = None
+        had_previous_chunk = False
+        model_kwargs: dict[str, object] = {}
+        if self._use_rtc and rtc_step_idx is not None and session_state is not None:
+            had_previous_chunk = session_state.last_action_chunk_abs is not None
+            prev_chunk_left_over_abs = self._compute_prev_chunk_left_over(session_state, rtc_step_idx)
+            model_kwargs = {
+                "use_rtc": True,
+                "prev_chunk_left_over_abs": prev_chunk_left_over_abs,
+                "inference_delay": rtc_inference_delay_steps,
+                "rtc_execution_horizon": self._rtc_execution_horizon,
+                "rtc_max_guidance_weight": self._rtc_max_guidance_weight,
+                "rtc_prefix_attention_schedule": self._rtc_prefix_attention_schedule,
+                "rtc_guidance_max_steps": self._rtc_guidance_max_steps,
+                "rtc_guidance_step_stride": self._rtc_guidance_step_stride,
+            }
+            if had_previous_chunk:
+                left_over_len = 0 if prev_chunk_left_over_abs is None else int(prev_chunk_left_over_abs.shape[0])
+                logger.info(
+                    "RTC request session=%s step_idx=%d prev_left_over=%d delay=%d",
+                    session_id,
+                    rtc_step_idx,
+                    left_over_len,
+                    rtc_inference_delay_steps,
+                )
         
-        # Signal workers to continue (0 = continue)
-        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+        self._broadcast_signal(0)
         
-        # Broadcast obs to workers
-        self._broadcast_batch_to_workers(converted_obs)
+        self._broadcast_payload_to_workers(
+            {
+                "obs": converted_obs,
+                "model_kwargs": model_kwargs,
+            }
+        )
         
         # Create batch for policy
         batch = Batch(obs=converted_obs)
@@ -368,7 +492,7 @@ class ARDroidRoboarenaPolicy:
         # Distributed forward pass
         dist.barrier()
         with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
         dist.barrier()
         
         # Store video predictions for potential saving
@@ -377,6 +501,29 @@ class ARDroidRoboarenaPolicy:
         # Extract and convert action
         action_dict = self._extract_action_dict(result_batch.act)
         action = self._convert_action(action_dict)
+        if self._use_rtc and had_previous_chunk:
+            action, applied_delay_steps = self._trim_action_chunk_for_delay(
+                action,
+                rtc_inference_delay_steps,
+            )
+        else:
+            applied_delay_steps = 0
+
+        if self._use_rtc and session_state is not None:
+            session_state.last_action_chunk_abs = action.copy()
+            session_state.request_count += 1
+            session_state.consumed_steps = 0
+            if rtc_step_idx is not None:
+                session_state.chunk_start_step_idx = rtc_step_idx + applied_delay_steps
+            else:
+                session_state.chunk_start_step_idx = None
+            logger.info(
+                "RTC stored executable chunk session=%s len=%d chunk_start_step_idx=%s delay_trim=%d",
+                session_id,
+                action.shape[0],
+                session_state.chunk_start_step_idx,
+                applied_delay_steps,
+            )
         
         # Update first call flag
         if self._is_first_call:
@@ -429,7 +576,9 @@ class ARDroidRoboarenaPolicy:
         self._call_count = 0
         self._is_first_call = True
         self.video_across_time = []
+        self._rtc_session_states.clear()
         self._warned_single_external_fallback = False
+        self._broadcast_signal(3)
         self._reset_model_temporal_state()
     
     def reset(self, reset_info: dict) -> None:
@@ -467,7 +616,11 @@ class WebsocketPolicyServer:
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
             os.makedirs(os.path.join(self._output_dir, "inputs"), exist_ok=True)
-    
+
+    def _reset_policy_temporal_state(self) -> None:
+        if hasattr(self._policy, "reset_inference_state"):
+            self._policy.reset_inference_state()
+
     def _save_input_obs(self, obs: dict) -> None:
         """Save incoming observation images per message.
         
@@ -578,14 +731,16 @@ class WebsocketPolicyServer:
                     logger.info(f"Rank {dist.get_rank()} received idle signal. Waiting for next client.")
                     # Loop back to the top and wait for the next signal
                     continue
+                elif signal == 3:
+                    logger.info(f"Rank {dist.get_rank()} received RTC reset signal.")
+                    self._reset_policy_temporal_state()
+                    continue
 
-                # Receive the batch data via broadcast/gather mechanism
-                # This is a simplified version - the actual obs structure needs to be broadcasted
-                batch = self._receive_batch_from_rank0()
+                batch, model_kwargs = self._receive_batch_from_rank0()
                 # Participate in distributed forward pass
                 dist.barrier()
                 with torch.no_grad():
-                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
                 dist.barrier()
 
             except Exception as e:
@@ -607,15 +762,20 @@ class WebsocketPolicyServer:
         dist.broadcast(data_tensor, src=0)
 
         # Deserialize
-        obs = pickle.loads(data_tensor.cpu().numpy().tobytes())
-        return Batch(obs=obs)
+        payload = pickle.loads(data_tensor.cpu().numpy().tobytes())
+        if isinstance(payload, dict) and "obs" in payload:
+            obs = payload["obs"]
+            model_kwargs = payload.get("model_kwargs", {})
+        else:
+            obs = payload
+            model_kwargs = {}
+        return Batch(obs=obs), model_kwargs
 
-    def _broadcast_batch_to_workers(self, obs):
+    def _broadcast_batch_to_workers(self, payload):
         """Broadcast batch data from rank 0 to all other ranks."""
         import pickle
 
-        # Serialize the obs
-        serialized = pickle.dumps(obs)
+        serialized = pickle.dumps(payload)
         data_size = len(serialized)
 
         # Broadcast size first
@@ -652,7 +812,7 @@ class WebsocketPolicyServer:
                     dist.broadcast(signal_tensor, src=0, group=self._signal_group) # <-- USE GLOO GROUP
 
                     # Broadcast the obs to all ranks for distributed inference
-                    self._broadcast_batch_to_workers(obs)
+                    self._broadcast_batch_to_workers({"obs": obs, "model_kwargs": {}})
                     batch = Batch(obs=obs)
 
                     # All ranks need to participate in the forward pass
@@ -826,9 +986,17 @@ def main(args: Args) -> None:
     # Use TE cuDNN backend for attention.
     os.environ["ATTENTION_BACKEND"] = "TE"
 
-    # Increase the recompile limit to 100 for inference due
-    # to autoregressive nature of the model (several possible shapes).
-    torch._dynamo.config.recompile_limit = 800
+    # Avoid FailOnRecompileLimitHit when serving with compile enabled: the
+    # autoregressive scheduler recompiles under varying shapes/inputs.
+    _dynamo = torch._dynamo.config
+    if hasattr(_dynamo, "cache_size_limit"):
+        _dynamo.cache_size_limit = 1000
+    if hasattr(_dynamo, "recompile_limit"):
+        _dynamo.recompile_limit = 800
+    if hasattr(_dynamo, "accumulated_cache_size_limit"):
+        _dynamo.accumulated_cache_size_limit = 1000
+    if hasattr(_dynamo, "accumulated_recompile_limit"):
+        _dynamo.accumulated_recompile_limit = 2000
 
     embodiment_tag = "oxe_droid"
     model_path = args.model_path
@@ -879,6 +1047,12 @@ def main(args: Args) -> None:
         image_height=image_height,
         image_width=image_width,
         output_dir=output_dir,
+        use_rtc=args.use_rtc,
+        rtc_execution_horizon=args.rtc_execution_horizon,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+        rtc_guidance_max_steps=args.rtc_guidance_max_steps,
+        rtc_guidance_step_stride=args.rtc_guidance_step_stride,
     )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)

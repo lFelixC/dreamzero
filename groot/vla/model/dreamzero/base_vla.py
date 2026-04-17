@@ -181,10 +181,16 @@ class VLA(PreTrainedModel):
         self,
         inputs: dict,
         latent_video: torch.Tensor | None = None,
+        **kwargs,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.lazy_joint_video_action(backbone_outputs, action_inputs, latent_video=latent_video)
+        action_head_outputs = self.action_head.lazy_joint_video_action(
+            backbone_outputs,
+            action_inputs,
+            latent_video=latent_video,
+            **kwargs,
+        )
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
     

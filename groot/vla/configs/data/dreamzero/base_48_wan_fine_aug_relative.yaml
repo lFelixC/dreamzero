@@ -9,6 +9,10 @@
 ################################################################################
 
 use_global_metadata: false
+use_recap_prompt: false
+recap_advantage_field: annotation.recap_advantage
+recap_positive_token: positive
+recap_negative_token: negative
 
 ################################################################################
 # Dimension Information
@@ -119,6 +123,7 @@ modality_config_oxe_droid:
       - annotation.language.language_instruction
       - annotation.language.language_instruction_2
       - annotation.language.language_instruction_3
+      - annotation.recap_instruction
   lapa_action:
     _target_: groot.vla.data.dataset.ModalityConfig
     delta_indices: [0]
@@ -207,6 +212,7 @@ modality_config_agibot:
     delta_indices: [0]
     modality_keys:
       - annotation.language.action_text
+      - annotation.recap_instruction
 
 transform_agibot:
   _target_: groot.vla.data.transform.ComposedModalityTransform
@@ -294,6 +300,7 @@ modality_config_yam:
     delta_indices: [0]
     modality_keys:
       - annotation.task
+      - annotation.recap_instruction
 
 transform_yam:
   _target_: groot.vla.data.transform.ComposedModalityTransform

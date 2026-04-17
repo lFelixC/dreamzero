@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import logging
+import math
 import time
 from typing import TypeAlias, cast
 import os
@@ -152,6 +153,38 @@ class WANPolicyHeadConfig(PretrainedConfig):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+
+def infer_target_video_resolution(
+    config: WANPolicyHeadConfig | object,
+    model: object | None = None,
+) -> tuple[int | None, int | None]:
+    """Infer the expected (height, width) for video inputs.
+
+    Prefer explicit target_video_height/width from newer checkpoints. As a narrow fallback,
+    support older Wan22 5B-style checkpoints that only expose frame_seqlen=50. Do not infer
+    a new target resolution for older DreamZero-DROID checkpoints, since that changes their
+    original inference behavior.
+    """
+
+    target_h = getattr(config, "target_video_height", None)
+    target_w = getattr(config, "target_video_width", None)
+    if target_h is not None and target_w is not None:
+        return int(target_h), int(target_w)
+
+    frame_seqlen = getattr(model, "frame_seqlen", None) if model is not None else None
+    if frame_seqlen is None:
+        diffusion_cfg = getattr(config, "diffusion_model_cfg", None)
+        if isinstance(diffusion_cfg, dict):
+            frame_seqlen = diffusion_cfg.get("frame_seqlen")
+        elif diffusion_cfg is not None:
+            frame_seqlen = getattr(diffusion_cfg, "frame_seqlen", None)
+
+    if frame_seqlen == 50:
+        return 160, 320
+    if frame_seqlen == 55:
+        return 176, 320
+    return None, None
 
 
 class WANPolicyHead(ActionHead):
@@ -590,6 +623,54 @@ class WANPolicyHead(ActionHead):
         valid_latent_frames = 1 + (valid_video_frames - 1).clamp_min(0) // 4
         latent_index = torch.arange(latent_frames, device=video_frame_mask.device)
         return latent_index.unsqueeze(0) < valid_latent_frames.unsqueeze(1)
+
+    def _should_freeze_masked_droid_right_view(self, videos: torch.Tensor) -> bool:
+        target_h, target_w = infer_target_video_resolution(self.config, self.model)
+        if (target_h, target_w) != (160, 320):
+            return False
+        if self.action_horizon != 24 or self.num_frame_per_block != 2:
+            return False
+        if getattr(self.model, "frame_seqlen", None) != 50:
+            return False
+        if videos.shape[-2:] != (target_h, target_w):
+            return False
+
+        # DROID 3-view layout after resize:
+        #   top half    = wrist
+        #   bottom-left = left exterior
+        #   bottom-right= right exterior
+        right_view = videos[:, :, :, videos.shape[-2] // 2 :, videos.shape[-1] // 2 :]
+        right_view = right_view.float()
+        roi_mean = right_view.mean().item()
+        roi_max = right_view.amax().item()
+        is_masked = roi_mean < -0.95 and roi_max < -0.70
+
+        if is_masked and self.ip_rank == 0:
+            print("Detected masked DROID right exterior view; freezing bottom-right latent region during diffusion.")
+        return is_masked
+
+    def _freeze_droid_right_view_latents(
+        self,
+        latents: torch.Tensor,
+        reference_latents: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if reference_latents is None:
+            return latents
+
+        if reference_latents.shape[1] == 1 and latents.shape[1] != 1:
+            reference_latents = reference_latents.expand(-1, latents.shape[1], -1, -1, -1)
+        elif reference_latents.shape[1] > latents.shape[1]:
+            reference_latents = reference_latents[:, -latents.shape[1] :]
+        elif reference_latents.shape[1] < latents.shape[1]:
+            repeat_factor = (latents.shape[1] + reference_latents.shape[1] - 1) // reference_latents.shape[1]
+            reference_latents = reference_latents.repeat(1, repeat_factor, 1, 1, 1)[
+                :, : latents.shape[1]
+            ]
+
+        h_start = latents.shape[-2] // 2
+        w_start = latents.shape[-1] // 2
+        latents[..., h_start:, w_start:] = reference_latents[..., h_start:, w_start:]
+        return latents
     
     def prepare_extra_input(self, latents=None):
         return {}
@@ -649,13 +730,7 @@ class WANPolicyHead(ActionHead):
 
         # Wan 5B: resize to target resolution so latent tokens/frame matches DiT. Use config target when set
         # (e.g. 160x320 so latent is 10x20 with VAE38 16x → even H,W, no crop in dynamics loss); else 176x320.
-        target_h = getattr(self.config, "target_video_height", None)
-        target_w = getattr(self.config, "target_video_width", None)
-        if target_h is None or target_w is None:
-            if getattr(self.model, "frame_seqlen", None) in (50, 55):
-                target_h, target_w = 176, 320
-            else:
-                target_h, target_w = None, None
+        target_h, target_w = infer_target_video_resolution(self.config, self.model)
         if target_h is not None and target_w is not None:
             _, _, _, h, w = videos.shape
             if (h, w) != (target_h, target_w):
@@ -992,7 +1067,274 @@ class WANPolicyHead(ActionHead):
 
         return True
 
-    def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
+    def reset_inference_state(self) -> None:
+        self.current_start_frame = 0
+        self.language = None
+        self.clip_feas = None
+        self.ys = None
+        self.kv_cache1 = None
+        self.kv_cache_neg = None
+        self.crossattn_cache = None
+        self.crossattn_cache_neg = None
+        self.skip_countdown = 0
+
+    @staticmethod
+    def _rtc_linweights(start: int, end: int, total: int) -> torch.Tensor:
+        skip_steps_at_end = max(total - end, 0)
+        linspace_steps = total - skip_steps_at_end - start
+        if end <= start or linspace_steps <= 0:
+            return torch.tensor([])
+        return torch.linspace(1, 0, linspace_steps + 2)[1:-1]
+
+    @staticmethod
+    def _rtc_add_trailing_zeros(weights: torch.Tensor, total: int, end: int) -> torch.Tensor:
+        zeros_len = total - end
+        if zeros_len <= 0:
+            return weights
+        zeros = torch.zeros(zeros_len)
+        return torch.cat([weights, zeros])
+
+    @staticmethod
+    def _rtc_add_leading_ones(weights: torch.Tensor, start: int, total: int) -> torch.Tensor:
+        ones_len = min(start, total)
+        if ones_len <= 0:
+            return weights
+        ones = torch.ones(ones_len)
+        return torch.cat([ones, weights])
+
+    def _rtc_get_prefix_weights(
+        self,
+        start: int,
+        end: int,
+        total: int,
+        schedule: str,
+    ) -> torch.Tensor:
+        start = min(start, end)
+        schedule_name = schedule.upper()
+
+        if schedule_name == "ZEROS":
+            weights = torch.zeros(total)
+            weights[:start] = 1.0
+            return weights
+
+        if schedule_name == "ONES":
+            weights = torch.ones(total)
+            weights[end:] = 0.0
+            return weights
+
+        lin_weights = self._rtc_linweights(start, end, total)
+        if schedule_name == "EXP" and lin_weights.numel() > 0:
+            lin_weights = lin_weights * torch.expm1(lin_weights).div(math.e - 1)
+        elif schedule_name not in {"LINEAR", "EXP"}:
+            raise ValueError(f"Unsupported RTC prefix attention schedule: {schedule}")
+
+        weights = self._rtc_add_trailing_zeros(lin_weights, total, end)
+        weights = self._rtc_add_leading_ones(weights, start, total)
+        return weights
+
+    def _run_diffusion_steps_with_rtc(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        prompt_embs: list[torch.Tensor],
+        seq_len: int,
+        y: torch.Tensor,
+        kv_caches: list[KVCacheType],
+        crossattn_caches: list[KVCacheType],
+        start_frame: int,
+        prev_chunk_left_over: torch.Tensor | None,
+        inference_delay: int,
+        rtc_execution_horizon: int,
+        rtc_max_guidance_weight: float,
+        rtc_prefix_attention_schedule: str,
+        apply_rtc_guidance: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if prev_chunk_left_over is None or not apply_rtc_guidance:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=start_frame,
+                    update_kv_cache=False,
+                ),
+            )
+            flow_pred_cond, flow_pred_cond_action = predictions[0]
+            flow_pred_uncond, _ = predictions[1]
+            flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+            return flow_pred, flow_pred_cond_action
+
+        prefix = prev_chunk_left_over
+        if prefix.ndim == 2:
+            prefix = prefix.unsqueeze(0)
+        prefix = prefix.to(device=noisy_input_action.device, dtype=noisy_input_action.dtype)
+
+        batch_size, action_chunk_size, action_dim = noisy_input_action.shape
+        if prefix.shape[0] != batch_size:
+            if prefix.shape[0] == 1:
+                prefix = prefix.expand(batch_size, -1, -1)
+            else:
+                raise ValueError(
+                    "RTC prev_chunk_left_over batch dimension must match current batch size, "
+                    f"got prefix {prefix.shape[0]} and batch {batch_size}."
+                )
+
+        execution_horizon = max(
+            0,
+            min(
+                int(rtc_execution_horizon),
+                int(prefix.shape[1]),
+                int(action_chunk_size),
+            ),
+        )
+        if execution_horizon <= 0:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=start_frame,
+                    update_kv_cache=False,
+                ),
+            )
+            flow_pred_cond, flow_pred_cond_action = predictions[0]
+            flow_pred_uncond, _ = predictions[1]
+            flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+            return flow_pred, flow_pred_cond_action
+
+        if prefix.shape[1] < action_chunk_size or prefix.shape[2] < action_dim:
+            padded_prefix = torch.zeros(
+                batch_size,
+                action_chunk_size,
+                action_dim,
+                device=noisy_input_action.device,
+                dtype=noisy_input_action.dtype,
+            )
+            padded_prefix[:, : prefix.shape[1], : prefix.shape[2]] = prefix
+            prefix = padded_prefix
+        else:
+            prefix = prefix[:, :action_chunk_size, :action_dim]
+
+        weights = self._rtc_get_prefix_weights(
+            start=max(int(inference_delay), 0),
+            end=execution_horizon,
+            total=action_chunk_size,
+            schedule=rtc_prefix_attention_schedule,
+        ).to(device=noisy_input_action.device, dtype=noisy_input_action.dtype)
+        weights = weights.unsqueeze(0).unsqueeze(-1)
+        if torch.count_nonzero(weights).item() == 0:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=start_frame,
+                    update_kv_cache=False,
+                ),
+            )
+            flow_pred_cond, flow_pred_cond_action = predictions[0]
+            flow_pred_uncond, _ = predictions[1]
+            flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+            return flow_pred, flow_pred_cond_action
+
+        with torch.inference_mode(False), torch.enable_grad():
+            rtc_action = noisy_input_action.detach().clone().requires_grad_(True)
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=rtc_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=start_frame,
+                    update_kv_cache=False,
+                ),
+            )
+            flow_pred_cond, flow_pred_cond_action = predictions[0]
+            flow_pred_uncond, _ = predictions[1]
+
+            time = timestep_action[:, :1].to(dtype=rtc_action.dtype)
+            time = time / float(self.scheduler.num_train_timesteps)
+            time = time.unsqueeze(-1)
+            tau = 1 - time
+
+            x1_t = rtc_action - time * flow_pred_cond_action
+            err = (prefix - x1_t) * weights
+            correction = torch.autograd.grad(
+                x1_t,
+                rtc_action,
+                grad_outputs=err.detach(),
+                retain_graph=False,
+            )[0]
+
+            max_guidance_weight = torch.as_tensor(
+                rtc_max_guidance_weight,
+                device=rtc_action.device,
+                dtype=rtc_action.dtype,
+            )
+            squared_one_minus_tau = (1 - tau) ** 2
+            inv_r2 = (squared_one_minus_tau + tau**2) / squared_one_minus_tau
+            c = torch.nan_to_num((1 - tau) / tau, posinf=max_guidance_weight)
+            guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+            guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+            guided_flow_pred_cond_action = flow_pred_cond_action - guidance_weight * correction
+            flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+
+        return flow_pred.detach(), guided_flow_pred_cond_action.detach()
+
+    def lazy_joint_video_action(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        latent_video: torch.Tensor | None = None,
+        prev_chunk_left_over: torch.Tensor | None = None,
+        inference_delay: int = 0,
+        use_rtc: bool = False,
+        rtc_execution_horizon: int = 10,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "EXP",
+        rtc_guidance_max_steps: int = 4,
+        rtc_guidance_step_stride: int = 1,
+    ) -> BatchFeature:
         start_time = time.perf_counter()
 
         # Tracking time taken on GPU for various operations.
@@ -1032,13 +1374,7 @@ class WANPolicyHead(ActionHead):
         videos = videos.to(dtype=torch.bfloat16)
 
         # Wan 5B: same as training — resize to target resolution so latent matches DiT
-        target_h = getattr(self.config, "target_video_height", None)
-        target_w = getattr(self.config, "target_video_width", None)
-        if target_h is None or target_w is None:
-            if getattr(self.model, "frame_seqlen", None) in (50, 55):
-                target_h, target_w = 176, 320
-            else:
-                target_h, target_w = None, None
+        target_h, target_w = infer_target_video_resolution(self.config, self.model)
         if target_h is not None and target_w is not None:
             _, _, _, h, w = videos.shape
             if (h, w) != (target_h, target_w):
@@ -1213,6 +1549,14 @@ class WANPolicyHead(ActionHead):
 
         end_kv_event.record()
 
+        freeze_masked_droid_right_view = self._should_freeze_masked_droid_right_view(videos)
+        masked_right_reference_latents = None
+        if freeze_masked_droid_right_view:
+            if self.current_start_frame == 1:
+                masked_right_reference_latents = image[:, :1]
+            else:
+                masked_right_reference_latents = current_ref_latents
+
         noisy_input = noise_obs
         noisy_input_action = noise_action
 
@@ -1248,6 +1592,9 @@ class WANPolicyHead(ActionHead):
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
+        rtc_total_steps = len(sample_scheduler.timesteps)
+        rtc_guidance_max_steps = max(int(rtc_guidance_max_steps), 0)
+        rtc_guidance_step_stride = max(int(rtc_guidance_step_stride), 1)
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
@@ -1275,28 +1622,34 @@ class WANPolicyHead(ActionHead):
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
-                predictions = self._run_diffusion_steps(
+                rtc_prev_chunk_left_over = prev_chunk_left_over if use_rtc else None
+                rtc_guidance_start_idx = max(rtc_total_steps - rtc_guidance_max_steps, 0)
+                apply_rtc_guidance = (
+                    rtc_prev_chunk_left_over is not None
+                    and rtc_guidance_max_steps > 0
+                    and index >= rtc_guidance_start_idx
+                    and ((index - rtc_guidance_start_idx) % rtc_guidance_step_stride == 0)
+                )
+                flow_pred, flow_pred_cond_action = self._run_diffusion_steps_with_rtc(
                     noisy_input=noisy_input.transpose(1, 2),
                     timestep=timestep,
-                    action=noisy_input_action,
+                    noisy_input_action=noisy_input_action,
                     timestep_action=timestep_action,
-                    state=state_features,
+                    state_features=state_features,
                     embodiment_id=embodiment_id,
-                    context=prompt_embs,
+                    prompt_embs=prompt_embs,
                     seq_len=seq_len,
                     y=y,
-                    clip_feature=self.clip_feas,
                     kv_caches=kv_caches,
                     crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
+                    start_frame=self.current_start_frame,
+                    prev_chunk_left_over=rtc_prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    rtc_execution_horizon=rtc_execution_horizon,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
+                    apply_rtc_guidance=apply_rtc_guidance,
                 )
-                flow_pred_cond, flow_pred_cond_action = predictions[0]
-                flow_pred_uncond, flow_pred_uncond_action = predictions[1]
-
-                flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
                 prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
                 max_cache_size = 2
                 if len(prev_predictions) > max_cache_size:
@@ -1316,6 +1669,11 @@ class WANPolicyHead(ActionHead):
                 step_index=index,
                 return_dict=False,
             )[0]
+            if freeze_masked_droid_right_view:
+                noisy_input = self._freeze_droid_right_view_latents(
+                    noisy_input,
+                    masked_right_reference_latents,
+                )
             
             # Action: always fully denoises with standard schedule (1000->0)
             noisy_input_action = sample_scheduler_action.step(
@@ -1329,6 +1687,11 @@ class WANPolicyHead(ActionHead):
         latents = noisy_input
         latents_action = noisy_input_action
         output = latents
+        if freeze_masked_droid_right_view:
+            output = self._freeze_droid_right_view_latents(
+                output,
+                masked_right_reference_latents,
+            )
 
         if self.current_start_frame == 1:
             output = torch.cat([image, output], dim=1)
@@ -1382,10 +1745,20 @@ class WANPolicyHead(ActionHead):
         DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "true").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
-        # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
-        # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
-        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
-            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
+        # Keep compile enabled for the rest of the model (for example the scheduler's
+        # module-level @torch.compile wrappers), but leave these large frontend modules
+        # in eager mode by default. On H200 + torch 2.8 they crash Inductor during the
+        # first real inference request, which takes the whole server down.
+        #
+        # Set ENABLE_FRONTEND_TORCH_COMPILE=true to restore the previous behaviour.
+        enable_frontend_torch_compile = os.getenv(
+            "ENABLE_FRONTEND_TORCH_COMPILE", "false"
+        ).lower() == "true"
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and enable_frontend_torch_compile:
+            print(
+                "Torch compiling the TextEncoder, ImageEncoder, and VAE modules "
+                "(Wan _forward_blocks not compiled)."
+            )
 
             self.text_encoder.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
@@ -1398,6 +1771,11 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
+        elif not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
+            print(
+                "Skipping torch.compile for TextEncoder/ImageEncoder/VAE frontend modules; "
+                "keeping other compile paths enabled."
+            )
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:

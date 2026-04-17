@@ -116,7 +116,7 @@ def resize_camera_frames(
     return resized_frames
 
 
-def build_frame_schedule(total_frames: int, num_chunks: int) -> list[list[int]]:
+def build_frame_schedule(total_frames: int, num_chunks: int, step_stride: int) -> list[list[int]]:
     """Build the frame index schedule for multi-frame chunks.
 
     Returns a list of frame-index lists. Each inner list has 4 indices.
@@ -131,7 +131,7 @@ def build_frame_schedule(total_frames: int, num_chunks: int) -> list[list[int]]:
             )
             break
         chunks.append(indices)
-        current_frame += ACTION_HORIZON
+        current_frame += step_stride
     return chunks
 
 
@@ -140,6 +140,8 @@ def _make_obs_from_video(
     frame_indices: list[int],
     prompt: str,
     session_id: str,
+    rtc_step_idx: int | None = None,
+    rtc_inference_delay_steps: int | None = None,
 ) -> dict:
     """Build an observation dict from real video frames.
 
@@ -158,6 +160,10 @@ def _make_obs_from_video(
     obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
     obs["prompt"] = prompt
     obs["session_id"] = session_id
+    if rtc_step_idx is not None:
+        obs["rtc_step_idx"] = np.int32(rtc_step_idx)
+    if rtc_inference_delay_steps is not None:
+        obs["rtc_inference_delay_steps"] = np.int32(rtc_inference_delay_steps)
     return obs
 
 
@@ -165,6 +171,8 @@ def _make_zero_observation(
     server_config: policy_server.PolicyServerConfig,
     prompt: str = "pick up the object",
     session_id: str | None = None,
+    rtc_step_idx: int | None = None,
+    rtc_inference_delay_steps: int | None = None,
 ) -> dict:
     """Create a dummy observation matching AR_droid expectations.
     
@@ -209,6 +217,11 @@ def _make_zero_observation(
     
     # Language prompt
     obs["prompt"] = prompt
+
+    if rtc_step_idx is not None:
+        obs["rtc_step_idx"] = np.int32(rtc_step_idx)
+    if rtc_inference_delay_steps is not None:
+        obs["rtc_inference_delay_steps"] = np.int32(rtc_inference_delay_steps)
     
     return obs
 
@@ -219,6 +232,9 @@ def test_ar_droid_policy_server(
     num_chunks: int = 15,
     prompt: str = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan",
     use_zero_images: bool = False,
+    use_rtc: bool = False,
+    rtc_open_loop_horizon: int = 8,
+    rtc_inference_delay_steps: int = 0,
 ):
     """Test the AR_droid policy server with roboarena interface.
 
@@ -256,13 +272,22 @@ def test_ar_droid_policy_server(
     # ── Zero-image fallback mode ──────────────────────────────────────
     if use_zero_images:
         logging.info("Using ZERO dummy images (legacy mode)")
+        rtc_step_idx = 0
+        step_stride = rtc_open_loop_horizon if use_rtc else ACTION_HORIZON
         for i in range(num_chunks):
-            obs = _make_zero_observation(server_config, prompt=prompt, session_id=session_id)
+            obs = _make_zero_observation(
+                server_config,
+                prompt=prompt,
+                session_id=session_id,
+                rtc_step_idx=rtc_step_idx if use_rtc else None,
+                rtc_inference_delay_steps=rtc_inference_delay_steps if use_rtc else None,
+            )
             logging.info(f"Inference {i + 1}/{num_chunks}: prompt='{prompt}'")
             t0 = time.time()
             actions = client.infer(obs)
             dt = time.time() - t0
             _log_action(actions, dt)
+            rtc_step_idx += step_stride
 
         logging.info("Sending reset...")
         client.reset({})
@@ -278,7 +303,8 @@ def test_ar_droid_policy_server(
     logging.info(f"Total frames available: {total_frames}")
 
     # Build frame schedule
-    chunks = build_frame_schedule(total_frames, num_chunks)
+    step_stride = rtc_open_loop_horizon if use_rtc else ACTION_HORIZON
+    chunks = build_frame_schedule(total_frames, num_chunks, step_stride=step_stride)
 
     logging.info("Frame schedule:")
     logging.info("  Initial: [0]")
@@ -287,7 +313,15 @@ def test_ar_droid_policy_server(
 
     # Step 0: initial single frame
     logging.info("=== Initial: frame [0] ===")
-    obs = _make_obs_from_video(camera_frames, [0], prompt, session_id)
+    rtc_step_idx = 0
+    obs = _make_obs_from_video(
+        camera_frames,
+        [0],
+        prompt,
+        session_id,
+        rtc_step_idx=rtc_step_idx if use_rtc else None,
+        rtc_inference_delay_steps=rtc_inference_delay_steps if use_rtc else None,
+    )
     t0 = time.time()
     actions = client.infer(obs)
     dt = time.time() - t0
@@ -296,7 +330,15 @@ def test_ar_droid_policy_server(
     # Subsequent chunks: send 4 frames at a time
     for chunk_idx, frame_indices in enumerate(chunks):
         logging.info(f"=== Chunk {chunk_idx}: frames {frame_indices} ===")
-        obs = _make_obs_from_video(camera_frames, frame_indices, prompt, session_id)
+        rtc_step_idx += step_stride
+        obs = _make_obs_from_video(
+            camera_frames,
+            frame_indices,
+            prompt,
+            session_id,
+            rtc_step_idx=rtc_step_idx if use_rtc else None,
+            rtc_inference_delay_steps=rtc_inference_delay_steps if use_rtc else None,
+        )
         t0 = time.time()
         actions = client.infer(obs)
         dt = time.time() - t0
@@ -345,6 +387,23 @@ def main():
         action="store_true",
         help="Use zero dummy images instead of real video frames (legacy mode)",
     )
+    parser.add_argument(
+        "--use-rtc",
+        action="store_true",
+        help="Send RTC runtime fields (rtc_step_idx / rtc_inference_delay_steps) for inference-time RTC smoke testing.",
+    )
+    parser.add_argument(
+        "--rtc-open-loop-horizon",
+        type=int,
+        default=8,
+        help="Client-side step increment used between RTC requests (default: 8). Ignored when --use-rtc is off.",
+    )
+    parser.add_argument(
+        "--rtc-inference-delay-steps",
+        type=int,
+        default=0,
+        help="Runtime inference delay steps to send with each RTC request (default: 0). Ignored when --use-rtc is off.",
+    )
 
     args = parser.parse_args()
 
@@ -359,6 +418,9 @@ def main():
         num_chunks=args.num_chunks,
         prompt=args.prompt,
         use_zero_images=args.use_zero_images,
+        use_rtc=args.use_rtc,
+        rtc_open_loop_horizon=args.rtc_open_loop_horizon,
+        rtc_inference_delay_steps=args.rtc_inference_delay_steps,
     )
 
 

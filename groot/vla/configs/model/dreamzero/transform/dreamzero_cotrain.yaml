@@ -8,6 +8,9 @@ defaults:
 max_length: 512
 num_views: 1
 tokenizer_path: "google/umt5-xxl"
+use_recap_prompt: false
+recap_positive_token: positive
+recap_negative_token: negative
 ################################################################################
 # Data Collator
 ################################################################################
@@ -18,6 +21,9 @@ data_collator:
   max_length : ${max_length}
   num_views: ${num_views}
   embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
+  use_recap_prompt: ${use_recap_prompt}
+  recap_positive_token: ${recap_positive_token}
+  recap_negative_token: ${recap_negative_token}
 
 ################################################################################
 # Model-Specific Transform
@@ -35,6 +41,9 @@ model_specific_transform:
   default_instruction: "Perform the default behavior."
   language_dropout_prob: ${language_dropout_prob}
   always_use_default_instruction: false
+  use_recap_prompt: ${use_recap_prompt}
+  recap_positive_token: ${recap_positive_token}
+  recap_negative_token: ${recap_negative_token}
   max_state_dim: ${max_state_dim}
   max_action_dim: ${max_action_dim}
   max_length: ${max_length}

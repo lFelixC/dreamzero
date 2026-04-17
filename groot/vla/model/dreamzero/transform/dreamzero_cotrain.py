@@ -119,7 +119,57 @@ def _build_prefix_mask(lengths: List[int]) -> np.ndarray:
     return mask
 
 
-def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
+RECAP_INSTRUCTION_KEY = "annotation.recap_instruction"
+
+
+def _coerce_text_item(item: Any) -> str:
+    """Convert serialized text payloads to a plain string."""
+    try:
+        parsed_item = ast.literal_eval(item)
+        if isinstance(parsed_item, (list, tuple)):
+            return str(parsed_item[0]) if len(parsed_item) > 0 else ""
+        return str(parsed_item)
+    except (ValueError, SyntaxError, TypeError):
+        return str(item)
+
+
+def _has_recap_prompt(text: str, positive_token: str = "positive", negative_token: str = "negative") -> bool:
+    stripped_text = text.strip()
+    return stripped_text.endswith(f", Advantage: {positive_token}") or stripped_text.endswith(
+        f", Advantage: {negative_token}"
+    )
+
+
+def _apply_embodiment_prompt(item: str, elem: dict, num_views=3, embodiment_tag_mapping=None) -> str:
+    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+        return "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
+    if elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+        return (
+            "A multi-view video shows that a robot "
+            + str(item).lower()
+            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
+            + str(item).lower()
+        )
+    if elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+        return "A single view video shows that a human " + str(item).lower()
+    if elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+        return "A single view video shows that a human " + str(item).lower()
+    if elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+        return "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
+    if elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+        return "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+    raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
+
+
+def collate(
+    features: List[dict],
+    tokenizer: AutoTokenizer,
+    num_views=3,
+    embodiment_tag_mapping=None,
+    use_recap_prompt: bool = False,
+    recap_positive_token: str = "positive",
+    recap_negative_token: str = "negative",
+) -> dict:
     batch = {}
     keys = features[0].keys()
 
@@ -127,66 +177,29 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
         if key == "text":
             output_values = []
             for elem in features:
-                item = elem[key]
-                try:
-                    parsed_item = ast.literal_eval(item)
-                    # Handle different return types from ast.literal_eval
-                    if isinstance(parsed_item, (list, tuple)):
-                        processed_item = str(parsed_item[0])
-                    else:
-                        # If it's already a scalar (string, float, int, etc.), convert to string
-                        processed_item = str(parsed_item)
-                    
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
-                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
-                        processed_item = (
-                            "A multi-view video shows that a robot "
-                            + processed_item.lower()
-                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
-                            + processed_item.lower()
+                processed_item = _coerce_text_item(elem[key])
+                if use_recap_prompt and _has_recap_prompt(
+                    processed_item,
+                    positive_token=recap_positive_token,
+                    negative_token=recap_negative_token,
+                ):
+                    output_values.append(processed_item)
+                else:
+                    output_values.append(
+                        _apply_embodiment_prompt(
+                            processed_item,
+                            elem,
+                            num_views=num_views,
+                            embodiment_tag_mapping=embodiment_tag_mapping,
                         )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
-                        processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
-                        processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
-                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
-                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
-                    else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
-                    output_values.append(processed_item)  
-                except (ValueError, SyntaxError, TypeError):
-                    # If parsing fails or item is already a string, use it directly
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
-                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
-                        item = (
-                            "A multi-view video shows that a robot "
-                            + str(item).lower()
-                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
-                            + str(item).lower()
-                        )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
-                        item = "A single view video shows that a human " + str(item).lower() 
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
-                        item = "A single view video shows that a human " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
-                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
-                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
-                    else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
-                    output_values.append(item)
-            # print("output_values", output_values)
+                    )
             ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
-            batch[key] = ids 
+            batch[key] = ids
             batch['text_attention_mask'] = mask
         elif key == "text_negative":
             values = [elem[key] for elem in features]
             ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
-            batch[key] = ids 
+            batch[key] = ids
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
@@ -203,14 +216,34 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
 
 
 class DefaultDataCollator(DataCollatorMixin):
-    def __init__(self, tokenizer_path: str="google/umt5-xxl", max_length: int=512, num_views: int=1, embodiment_tag_mapping=None):
+    def __init__(
+        self,
+        tokenizer_path: str = "google/umt5-xxl",
+        max_length: int = 512,
+        num_views: int = 1,
+        embodiment_tag_mapping=None,
+        use_recap_prompt: bool = False,
+        recap_positive_token: str = "positive",
+        recap_negative_token: str = "negative",
+    ):
         super().__init__()
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=max_length, clean='whitespace')
         self.num_views = num_views
         self.embodiment_tag_mapping = embodiment_tag_mapping
+        self.use_recap_prompt = use_recap_prompt
+        self.recap_positive_token = recap_positive_token
+        self.recap_negative_token = recap_negative_token
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        return collate(
+            features,
+            self.tokenizer,
+            self.num_views,
+            self.embodiment_tag_mapping,
+            use_recap_prompt=self.use_recap_prompt,
+            recap_positive_token=self.recap_positive_token,
+            recap_negative_token=self.recap_negative_token,
+        )
 
 
 class DreamTransform(InvertibleModalityTransform):
@@ -237,6 +270,18 @@ class DreamTransform(InvertibleModalityTransform):
     always_use_default_instruction: bool = Field(
         default=False,
         description="Whether to always use the default instruction. For studying how much the language helps.",
+    )
+    use_recap_prompt: bool = Field(
+        default=False,
+        description="Whether to use the RECAP-formatted prompt when available.",
+    )
+    recap_positive_token: str = Field(
+        default="positive",
+        description="Positive token appended in RECAP prompts.",
+    )
+    recap_negative_token: str = Field(
+        default="negative",
+        description="Negative token appended in RECAP prompts.",
     )
 
     # Private attributes to keep track of shapes/dimensions across apply/unapply
@@ -417,20 +462,34 @@ class DreamTransform(InvertibleModalityTransform):
         
         return images
 
+    def _select_language_key(self, data: dict) -> Optional[str]:
+        language_keys = self._language_keys or []
+
+        if self.use_recap_prompt and RECAP_INSTRUCTION_KEY in language_keys and RECAP_INSTRUCTION_KEY in data:
+            return RECAP_INSTRUCTION_KEY
+
+        candidate_keys = [key for key in language_keys if key != RECAP_INSTRUCTION_KEY]
+        selected_key = self._language_key if self._language_key != RECAP_INSTRUCTION_KEY else None
+
+        # For DROID embodiment during training, randomly select from available language keys
+        if (
+            len(candidate_keys) > 1
+            and self.training
+            and self.embodiment_tag == EmbodimentTag.OXE_DROID
+        ):
+            return random.choice(candidate_keys)
+        if selected_key in candidate_keys:
+            return selected_key
+        if len(candidate_keys) > 0:
+            return candidate_keys[0]
+        if self.use_recap_prompt and RECAP_INSTRUCTION_KEY in language_keys and RECAP_INSTRUCTION_KEY in data:
+            return RECAP_INSTRUCTION_KEY
+        return None
+
     def _prepare_language(self, data: dict):
         """Tokenize data['language'] (or default_instruction if missing)."""
-        # Determine which language key to use
-        selected_key = self._language_key
-        
-        # For DROID embodiment during training, randomly select from available language keys
-        if (self._language_keys is not None and 
-            len(self._language_keys) > 1 and 
-            self.training and 
-            self.embodiment_tag == EmbodimentTag.OXE_DROID):
-            selected_key = random.choice(self._language_keys)
-        elif self._language_keys is not None and len(self._language_keys) > 0 and selected_key is None:
-            selected_key = self._language_keys[0]
-        
+        selected_key = self._select_language_key(data)
+
         if selected_key is not None:
             raw_language = data[selected_key]
             if isinstance(raw_language, np.ndarray):
@@ -457,7 +516,7 @@ class DreamTransform(InvertibleModalityTransform):
             is_dream_instance = True
         else:
             is_dream_instance = False
-        
+
         if "<COTRAIN>" in raw_language:
             raw_language = raw_language.replace("<COTRAIN>", "")
             is_cotrain_instance = True
@@ -466,11 +525,12 @@ class DreamTransform(InvertibleModalityTransform):
 
         if self.always_use_default_instruction:
             raw_language = self.default_instruction
-        
-        # print("raw_language", raw_language)
 
-        # Formalize language
-        if self.formalize_language:
+        if self.formalize_language and not _has_recap_prompt(
+            raw_language,
+            positive_token=self.recap_positive_token,
+            negative_token=self.recap_negative_token,
+        ):
             formalized_language = formalize_language(raw_language)
             return formalized_language, is_lapa_instance, is_dream_instance, is_cotrain_instance
         else:
@@ -647,7 +707,15 @@ class DreamTransform(InvertibleModalityTransform):
         data_split = [tree.map_structure(lambda x: x[i], data) for i in range(batch_size)]
         # Process each element.
         data_split_processed = [self.apply_single(elem) for elem in data_split]
-        return collate(data_split_processed, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        return collate(
+            data_split_processed,
+            self.tokenizer,
+            self.num_views,
+            self.embodiment_tag_mapping,
+            use_recap_prompt=self.use_recap_prompt,
+            recap_positive_token=self.recap_positive_token,
+            recap_negative_token=self.recap_negative_token,
+        )
 
     def apply(self, data: dict) -> dict:
         if not self.training and data["video"].ndim == 5:

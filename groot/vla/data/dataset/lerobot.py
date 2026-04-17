@@ -45,6 +45,8 @@ LEROBOT_RELATIVE_HORIZON_STATS_FILE_NAME = "meta/relative_horizon_stats_dreamzer
 
 # Special language keys that load from metadata files instead of parquet columns
 METADATA_LANG_KEYS = ["detailed_global_instruction_medium", "detailed_global_instruction_concise"]
+RECAP_INSTRUCTION_LANG_KEY = "recap_instruction"
+VIRTUAL_LANG_KEYS = [*METADATA_LANG_KEYS, RECAP_INSTRUCTION_LANG_KEY]
 
 
 def calculate_dataset_statistics(
@@ -135,6 +137,10 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        use_recap_prompt: bool = False,
+        recap_advantage_field: str = "annotation.recap_advantage",
+        recap_positive_token: str = "positive",
+        recap_negative_token: str = "negative",
     ):
         """
         Initialize the dataset.
@@ -173,6 +179,10 @@ class LeRobotSingleDataset(Dataset):
         self.discard_bad_trajectories = discard_bad_trajectories
         self.relative_action = relative_action
         self.relative_action_per_horizon = relative_action_per_horizon
+        self.use_recap_prompt = use_recap_prompt
+        self.recap_advantage_field = recap_advantage_field
+        self.recap_positive_token = recap_positive_token
+        self.recap_negative_token = recap_negative_token
         # Determine which action keys should use relative action
         if relative_action_keys is not None:
             self.relative_action_keys = relative_action_keys
@@ -1238,7 +1248,7 @@ class LeRobotSingleDataset(Dataset):
                 # Skip metadata-based language keys (they don't need modality metadata)
                 if modality == "language" and key.startswith("annotation."):
                     lang_subkey = key.replace("annotation.", "")
-                    if lang_subkey in METADATA_LANG_KEYS:
+                    if lang_subkey in VIRTUAL_LANG_KEYS:
                         continue
                 # Check if the key is valid
                 try:
@@ -1673,13 +1683,35 @@ class LeRobotSingleDataset(Dataset):
             "annotation."
         ), f"Language key must start with 'annotation.', got {key}"
         subkey = key.replace("annotation.", "")
-        # print("subkey", subkey)
-        
+
+        if subkey == RECAP_INSTRUCTION_LANG_KEY:
+            source_key = self._get_recap_source_language_key(key)
+            if source_key is None:
+                return [""] * len(step_indices)
+            base_prompts = self._get_language_from_source_key(trajectory_id, source_key, step_indices)
+            if not self.use_recap_prompt:
+                return base_prompts
+            advantage_values = self._get_recap_advantage_values(step_indices)
+            return [
+                self._format_recap_prompt(task_text, advantage_value)
+                for task_text, advantage_value in zip(base_prompts, advantage_values)
+            ]
+
+        return self._get_language_from_source_key(trajectory_id, key, step_indices)
+
+    def _get_language_from_source_key(
+        self,
+        trajectory_id: int,
+        key: str,
+        step_indices: np.ndarray,
+    ) -> list[str]:
+        """Resolve a concrete language key to strings."""
+        subkey = key.replace("annotation.", "")
+
         # Check if this is a metadata-based language key (detailed_global_instruction_medium/concise)
         if subkey in METADATA_LANG_KEYS:
-            # print("return metadata language")
             return self._get_language_from_metadata(trajectory_id, subkey, len(step_indices))
-        
+
         # Otherwise, load from parquet columns (original behavior)
         annotation_meta = self.lerobot_modality_meta.annotation
         assert annotation_meta is not None, f"Annotation metadata is None for {subkey}"
@@ -1697,6 +1729,101 @@ class LeRobotSingleDataset(Dataset):
         else:
             # Stored as list of strings
             return self.curr_traj_data[original_key].iloc[step_indices].astype(str).tolist()
+
+    def _get_recap_source_language_key(self, current_key: str) -> str | None:
+        """Pick the first non-virtual language key as the base prompt source."""
+        language_config = self.modality_configs.get("language")
+        if language_config is None:
+            return None
+
+        for candidate_key in language_config.modality_keys:
+            if candidate_key == current_key:
+                continue
+            if not candidate_key.startswith("annotation."):
+                return candidate_key
+            candidate_subkey = candidate_key.replace("annotation.", "")
+            if candidate_subkey in VIRTUAL_LANG_KEYS:
+                continue
+            return candidate_key
+        return None
+
+    def _resolve_recap_advantage_column(self) -> str | None:
+        """Resolve the configured advantage field to a dataframe column."""
+        assert self.curr_traj_data is not None, "Current trajectory data is required."
+
+        candidate = self.recap_advantage_field
+        if candidate in self.curr_traj_data.columns:
+            return candidate
+
+        if candidate.startswith("annotation."):
+            subkey = candidate.replace("annotation.", "")
+            annotation_meta = self.lerobot_modality_meta.annotation
+            if annotation_meta is not None and subkey in annotation_meta:
+                original_key = annotation_meta[subkey].original_key or candidate
+                if original_key in self.curr_traj_data.columns:
+                    return original_key
+
+        return None
+
+    def _get_recap_advantage_values(self, step_indices: np.ndarray) -> list:
+        """Load raw advantage labels for RECAP prompt formatting."""
+        column_name = self._resolve_recap_advantage_column()
+        if column_name is None:
+            return [None] * len(step_indices)
+        return self.curr_traj_data[column_name].iloc[step_indices].tolist()
+
+    def _normalize_recap_advantage(self, advantage_value) -> str | None:
+        """Normalize supported advantage labels to the configured RECAP tokens."""
+        if isinstance(advantage_value, np.ndarray):
+            if advantage_value.size == 0:
+                return None
+            advantage_value = advantage_value.item() if advantage_value.size == 1 else advantage_value.reshape(-1)[0]
+        if isinstance(advantage_value, (list, tuple)):
+            if len(advantage_value) == 0:
+                return None
+            advantage_value = advantage_value[0]
+        if pd.isna(advantage_value):
+            return None
+
+        if isinstance(advantage_value, (bool, np.bool_)):
+            return self.recap_positive_token if advantage_value else self.recap_negative_token
+
+        if isinstance(advantage_value, (int, float, np.integer, np.floating)):
+            if advantage_value > 0:
+                return self.recap_positive_token
+            if advantage_value < 0:
+                return self.recap_negative_token
+            return None
+
+        if isinstance(advantage_value, str):
+            normalized_value = advantage_value.strip().lower()
+            if normalized_value in {
+                self.recap_positive_token.lower(),
+                "positive",
+                "pos",
+                "1",
+                "true",
+                "yes",
+            }:
+                return self.recap_positive_token
+            if normalized_value in {
+                self.recap_negative_token.lower(),
+                "negative",
+                "neg",
+                "-1",
+                "false",
+                "no",
+            }:
+                return self.recap_negative_token
+
+        return None
+
+    def _format_recap_prompt(self, task_text: str, advantage_value) -> str:
+        """Format the RECAP prompt with exact wording or fall back to the original task."""
+        normalized_advantage = self._normalize_recap_advantage(advantage_value)
+        if normalized_advantage is None or task_text == "":
+            return task_text
+        return f"{task_text}, Advantage: {normalized_advantage}"
 
     def _get_language_from_metadata(
         self,

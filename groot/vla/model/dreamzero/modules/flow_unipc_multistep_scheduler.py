@@ -17,6 +17,12 @@ from diffusers.schedulers.scheduling_utils import (
 
 
 DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "true").lower() == "true"
+ENABLE_FLOW_SCHEDULER_TORCH_COMPILE = os.getenv(
+    "ENABLE_FLOW_SCHEDULER_TORCH_COMPILE", "false"
+).lower() == "true"
+DISABLE_FLOW_SCHEDULER_TORCH_COMPILE = (
+    DISABLE_TORCH_COMPILE or not ENABLE_FLOW_SCHEDULER_TORCH_COMPILE
+)
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
@@ -297,7 +303,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
             return epsilon
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False, disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(
+        mode="reduce-overhead",
+        fullgraph=True,
+        dynamic=False,
+        disable=DISABLE_FLOW_SCHEDULER_TORCH_COMPILE,
+    )
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -409,7 +420,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         x_t = x_t.to(x.dtype)
         return x_t
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False, disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(
+        mode="reduce-overhead",
+        fullgraph=True,
+        dynamic=False,
+        disable=DISABLE_FLOW_SCHEDULER_TORCH_COMPILE,
+    )
     def multistep_uni_c_bh_update(
         self,
         this_model_output: torch.Tensor,
