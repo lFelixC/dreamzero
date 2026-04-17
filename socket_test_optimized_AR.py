@@ -986,18 +986,6 @@ def main(args: Args) -> None:
     # Use TE cuDNN backend for attention.
     os.environ["ATTENTION_BACKEND"] = "TE"
 
-    # Avoid FailOnRecompileLimitHit when serving with compile enabled: the
-    # autoregressive scheduler recompiles under varying shapes/inputs.
-    _dynamo = torch._dynamo.config
-    if hasattr(_dynamo, "cache_size_limit"):
-        _dynamo.cache_size_limit = 1000
-    if hasattr(_dynamo, "recompile_limit"):
-        _dynamo.recompile_limit = 800
-    if hasattr(_dynamo, "accumulated_cache_size_limit"):
-        _dynamo.accumulated_cache_size_limit = 1000
-    if hasattr(_dynamo, "accumulated_recompile_limit"):
-        _dynamo.accumulated_recompile_limit = 2000
-
     embodiment_tag = "oxe_droid"
     model_path = args.model_path
     policy_metadata = {

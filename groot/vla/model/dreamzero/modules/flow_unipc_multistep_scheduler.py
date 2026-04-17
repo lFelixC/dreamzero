@@ -15,14 +15,7 @@ from diffusers.schedulers.scheduling_utils import (
     SchedulerOutput,
 )
 
-
 DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "true").lower() == "true"
-ENABLE_FLOW_SCHEDULER_TORCH_COMPILE = os.getenv(
-    "ENABLE_FLOW_SCHEDULER_TORCH_COMPILE", "false"
-).lower() == "true"
-DISABLE_FLOW_SCHEDULER_TORCH_COMPILE = (
-    DISABLE_TORCH_COMPILE or not ENABLE_FLOW_SCHEDULER_TORCH_COMPILE
-)
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
@@ -307,7 +300,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         mode="reduce-overhead",
         fullgraph=True,
         dynamic=False,
-        disable=DISABLE_FLOW_SCHEDULER_TORCH_COMPILE,
+        disable=DISABLE_TORCH_COMPILE,
     )
     def multistep_uni_p_bh_update(
         self,
@@ -424,7 +417,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         mode="reduce-overhead",
         fullgraph=True,
         dynamic=False,
-        disable=DISABLE_FLOW_SCHEDULER_TORCH_COMPILE,
+        disable=DISABLE_TORCH_COMPILE,
     )
     def multistep_uni_c_bh_update(
         self,

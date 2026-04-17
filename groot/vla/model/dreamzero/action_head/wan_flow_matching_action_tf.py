@@ -1744,17 +1744,7 @@ class WANPolicyHead(ActionHead):
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "true").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
-
-        # Keep compile enabled for the rest of the model (for example the scheduler's
-        # module-level @torch.compile wrappers), but leave these large frontend modules
-        # in eager mode by default. On H200 + torch 2.8 they crash Inductor during the
-        # first real inference request, which takes the whole server down.
-        #
-        # Set ENABLE_FRONTEND_TORCH_COMPILE=true to restore the previous behaviour.
-        enable_frontend_torch_compile = os.getenv(
-            "ENABLE_FRONTEND_TORCH_COMPILE", "false"
-        ).lower() == "true"
-        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE and enable_frontend_torch_compile:
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
             print(
                 "Torch compiling the TextEncoder, ImageEncoder, and VAE modules "
                 "(Wan _forward_blocks not compiled)."
@@ -1771,11 +1761,6 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
-        elif not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
-            print(
-                "Skipping torch.compile for TextEncoder/ImageEncoder/VAE frontend modules; "
-                "keeping other compile paths enabled."
-            )
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
