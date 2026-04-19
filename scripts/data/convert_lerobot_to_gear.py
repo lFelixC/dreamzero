@@ -62,7 +62,7 @@ VALID_EMBODIMENT_TAGS = [
     "real_panda_single_arm", "hot3d_hands_only",
     "gr1_unified", "robocasa_gr1_arms_waist_fourier_hands",
     "agibot", "lapa", "oxe_mutex", "oxe_roboset", "oxe_plex",
-    "dream", "yam", "xdof",
+    "dream", "yam", "aloha_x5lite_bimanual", "xdof",
     "gr1_unified_segmentation", "language_table_sim", "gr1_isaac",
     "sim_behavior_r1_pro", "mecka_hands", "real_r1_pro_sharpa",
 ]
@@ -136,6 +136,7 @@ def build_modality_json(
     state_mapping: dict[str, list[int]] | None,
     action_mapping: dict[str, list[int]] | None,
     task_key: str | None,
+    task_alias: str | None,
 ) -> dict:
     """Build the modality.json structure expected by GEAR/DreamZero."""
     features = detected["features"]
@@ -204,7 +205,7 @@ def build_modality_json(
 
     # --- Annotation ---
     if task_key:
-        short = task_key.replace("annotation.", "")
+        short = task_alias if task_alias else task_key.replace("annotation.", "")
         modality["annotation"][short] = {"original_key": task_key}
     else:
         for ak in detected["annotation"]:
@@ -346,9 +347,51 @@ def build_tasks(parquet_paths: list[Path], task_key: str | None) -> list[dict]:
     return [{"task_index": idx, "task": text} for text, idx in sorted(task_set.items(), key=lambda x: x[1])]
 
 
-def build_episodes(parquet_paths: list[Path], info: dict, task_key: str | None, tasks: list[dict]) -> list[dict]:
+def read_jsonl_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def is_numeric_task_column(parquet_paths: list[Path], task_key: str | None) -> bool:
+    if task_key is None or not parquet_paths:
+        return False
+
+    for pp in parquet_paths:
+        df = pd.read_parquet(pp, columns=[task_key])
+        if task_key not in df.columns or len(df) == 0:
+            continue
+        return bool(pd.api.types.is_numeric_dtype(df[task_key]))
+
+    return False
+
+
+def tasks_are_placeholder_or_numeric(tasks: list[dict]) -> bool:
+    if not tasks:
+        return True
+
+    texts = [str(task.get("task", "")).strip() for task in tasks]
+    if all(not text for text in texts):
+        return True
+    return all(text.isdigit() for text in texts)
+
+
+def build_episodes(
+    parquet_paths: list[Path],
+    info: dict,
+    task_key: str | None,
+    tasks: list[dict],
+    numeric_task_key: bool = False,
+) -> list[dict]:
     """Build episodes.jsonl entries."""
     task_text_to_idx = {t["task"]: t["task_index"] for t in tasks}
+    task_idx_to_text = {int(t["task_index"]): t["task"] for t in tasks}
     episodes = []
     for ep_idx, pp in enumerate(tqdm(parquet_paths, desc="Building episodes")):
         df = pd.read_parquet(pp)
@@ -358,7 +401,10 @@ def build_episodes(parquet_paths: list[Path], info: dict, task_key: str | None, 
         if task_key and task_key in df.columns:
             unique_tasks = df[task_key].unique()
             for t in unique_tasks:
-                text = str(t) if not isinstance(t, str) else t
+                if numeric_task_key and isinstance(t, (int, float, np.integer, np.floating)):
+                    text = task_idx_to_text.get(int(t), "")
+                else:
+                    text = str(t) if not isinstance(t, str) else t
                 if text and text in task_text_to_idx:
                     ep_tasks.append(text)
         if not ep_tasks:
@@ -438,6 +484,12 @@ def main():
              "Each key must also exist in --state-keys. If omitted, skips relative stats."
     )
     parser.add_argument("--task-key", type=str, default=None, help="Column name for language annotations (auto-detected if not set)")
+    parser.add_argument(
+        "--task-alias",
+        type=str,
+        default=None,
+        help="Annotation key name written into modality.json when --task-key is provided (e.g. task).",
+    )
     parser.add_argument("--fps", type=float, default=None, help="Override FPS (default: use dataset FPS from info.json)")
     parser.add_argument("--action-horizon", type=int, default=24, help="Action horizon for relative stats (default: 24)")
     parser.add_argument("--force", action="store_true", help="Overwrite existing GEAR metadata files")
@@ -510,7 +562,7 @@ def main():
         log.info("  Auto-detected task key: %s", task_key)
 
     # 2. Build modality.json
-    modality = build_modality_json(info, detected, state_mapping, action_mapping, task_key)
+    modality = build_modality_json(info, detected, state_mapping, action_mapping, task_key, args.task_alias)
 
     modality_path = meta_dir / "modality.json"
     if modality_path.exists() and not args.force:
@@ -537,6 +589,9 @@ def main():
         log.error("No parquet files found. Check dataset structure.")
         sys.exit(1)
     log.info("  Found %d parquet files", len(parquet_paths))
+    numeric_task_key = is_numeric_task_column(parquet_paths, task_key)
+    if task_key is not None:
+        log.info("  Task key '%s' numeric=%s", task_key, numeric_task_key)
 
     # 5. Compute stats.json
     stats_path = meta_dir / "stats.json"
@@ -575,10 +630,18 @@ def main():
 
     # 7. Build tasks.jsonl
     tasks_path = meta_dir / "tasks.jsonl"
+    existing_tasks = read_jsonl_records(tasks_path)
     if tasks_path.exists() and not args.force:
         log.info("  tasks.jsonl already exists, skipping")
     else:
-        tasks = build_tasks(parquet_paths, task_key)
+        if numeric_task_key and existing_tasks and not tasks_are_placeholder_or_numeric(existing_tasks):
+            tasks = existing_tasks
+            log.info(
+                "  Preserving existing natural-language tasks.jsonl because task key '%s' is numeric",
+                task_key,
+            )
+        else:
+            tasks = build_tasks(parquet_paths, task_key)
         with open(tasks_path, "w") as f:
             for t in tasks:
                 f.write(json.dumps(t) + "\n")
@@ -589,14 +652,10 @@ def main():
     if episodes_path.exists() and not args.force:
         log.info("  episodes.jsonl already exists, skipping")
     else:
-        tasks = []
-        if tasks_path.exists():
-            with open(tasks_path) as f:
-                for line in f:
-                    tasks.append(json.loads(line.strip()))
+        tasks = read_jsonl_records(tasks_path)
         if not tasks:
             tasks = [{"task_index": 0, "task": ""}]
-        episodes = build_episodes(parquet_paths, info, task_key, tasks)
+        episodes = build_episodes(parquet_paths, info, task_key, tasks, numeric_task_key=numeric_task_key)
         with open(episodes_path, "w") as f:
             for ep in episodes:
                 f.write(json.dumps(ep) + "\n")

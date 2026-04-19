@@ -17,6 +17,7 @@
 
 from abc import ABC
 import contextlib
+import gc
 import json
 import logging
 import os
@@ -507,6 +508,11 @@ class BaseTrainer(transformers.Trainer):
         return self.optimizer
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
+        # Only the saving rank should materialize a full state_dict. Under ZeRO-2,
+        # doing this on every rank creates a large transient CPU-memory spike and can
+        # cause the OS to kill dataloader workers during checkpoint save.
+        if not self.args.should_save:
+            return
 
         ## save tuned model separately
         if self.is_deepspeed_enabled:
@@ -520,25 +526,30 @@ class BaseTrainer(transformers.Trainer):
             lora_state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
             state_dict = lora_state_dict
 
-        if self.args.should_save:
-            ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
-            sidecars = materialize_component_sidecars(self.model, output_dir)
-            if sidecars:
-                mprint(f"Materialized local component sidecars into {output_dir}: {sidecars}")
+        ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
+        sidecars = materialize_component_sidecars(self.model, output_dir)
+        if sidecars:
+            mprint(f"Materialized local component sidecars into {output_dir}: {sidecars}")
 
-            # can separately save the VLM model for downstream evalualtion
-            if self.base_cfg.save_llm:
-                llm_output_dir = os.path.join(output_dir, "llm")
-                self.model.backbone.model.save_pretrained(llm_output_dir)
+        # can separately save the VLM model for downstream evalualtion
+        if self.base_cfg.save_llm:
+            llm_output_dir = os.path.join(output_dir, "llm")
+            self.model.backbone.model.save_pretrained(llm_output_dir)
 
-            if self.base_cfg.save_value_model:
-                assert hasattr(
-                    self.model.action_head, "value_model"
-                ), f"Value model not found in action head: {type(self.model.action_head)}"
-                value_model_output_dir = os.path.join(output_dir, "value_model")
-                self.model.action_head.value_model.save_pretrained(value_model_output_dir)
+        if self.base_cfg.save_value_model:
+            assert hasattr(
+                self.model.action_head, "value_model"
+            ), f"Value model not found in action head: {type(self.model.action_head)}"
+            value_model_output_dir = os.path.join(output_dir, "value_model")
+            self.model.action_head.value_model.save_pretrained(value_model_output_dir)
 
-            return ret
+        # Free the temporary consolidated weights immediately after checkpoint save.
+        del state_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return ret
 
     def train(
         self,

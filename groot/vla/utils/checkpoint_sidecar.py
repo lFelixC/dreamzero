@@ -174,13 +174,19 @@ def materialize_component_sidecars(model: Any, output_dir: str | os.PathLike[str
     if action_head is None:
         return {}
 
+    output_dir = Path(output_dir)
+
+    # Full checkpoints already contain text/image/VAE weights inside model.safetensors
+    # shards. In that case, writing sidecar files is redundant and wastes inode / disk.
+    if checkpoint_has_required_prefixes(output_dir):
+        return {}
+
     component_sources = {
         "text_encoder_pretrained_path": getattr(getattr(action_head, "text_encoder", None), "text_encoder_pretrained_path", None),
         "image_encoder_pretrained_path": getattr(getattr(action_head, "image_encoder", None), "image_encoder_pretrained_path", None),
         "vae_pretrained_path": getattr(getattr(action_head, "vae", None), "vae_pretrained_path", None),
     }
 
-    output_dir = Path(output_dir)
     sidecars: dict[str, str] = {}
     for field, source in component_sources.items():
         if not source:

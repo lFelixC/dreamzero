@@ -155,6 +155,8 @@ class EmbodimentTag(Enum):
 
     YAM = "yam"
 
+    ALOHA_X5LITE_BIMANUAL = "aloha_x5lite_bimanual"
+
     DREAM = "dream"
     """
     The datasets with DREAM actions.
