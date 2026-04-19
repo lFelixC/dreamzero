@@ -239,29 +239,35 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
-        text_enc_path = ensure_file(
-            self.text_encoder.text_encoder_pretrained_path,
-            "models_t5_umt5-xxl-enc-bf16.pth",
-        )
-        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
-
-        img_enc_path = ensure_file(
-            self.image_encoder.image_encoder_pretrained_path,
-            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-        )
-        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
-
-        # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
-        vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
-        vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
-        vae_path = ensure_file(
-            self.vae.vae_pretrained_path,
-            vae_hf_filename,
-            repo_id=vae_repo_id,
-        )
-        self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
-
         if not config.skip_component_loading:
+            text_enc_path = ensure_file(
+                self.text_encoder.text_encoder_pretrained_path,
+                "models_t5_umt5-xxl-enc-bf16.pth",
+            )
+            self.text_encoder.text_encoder_pretrained_path = text_enc_path
+            self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location="cpu"))
+
+            img_enc_path = ensure_file(
+                self.image_encoder.image_encoder_pretrained_path,
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            )
+            self.image_encoder.image_encoder_pretrained_path = img_enc_path
+            self.image_encoder.model.load_state_dict(
+                torch.load(img_enc_path, map_location="cpu"),
+                strict=False,
+            )
+
+            # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
+            vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
+            vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
+            vae_path = ensure_file(
+                self.vae.vae_pretrained_path,
+                vae_hf_filename,
+                repo_id=vae_repo_id,
+            )
+            self.vae.vae_pretrained_path = vae_path
+            self.vae.model.load_state_dict(torch.load(vae_path, map_location="cpu"))
+
             dit_dir = self.model.diffusion_model_pretrained_path
             # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
             dit_repo_id = WAN22_HF_REPO_ID if getattr(self.model, "in_dim", 16) == 48 else WAN_HF_REPO_ID
@@ -274,6 +280,7 @@ class WANPolicyHead(ActionHead):
                     hf_hub_download(repo_id=dit_repo_id, filename=shard_file)
 
             if dit_dir is not None:
+                self.model.diffusion_model_pretrained_path = dit_dir
                 safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
                 safetensors_index_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors.index.json")
                 state_dict = {}
@@ -309,7 +316,7 @@ class WANPolicyHead(ActionHead):
 
                 print("Successfully loaded pretrained weights")
         else:
-            print("Skipping individual component loading (loading from full pretrained model)")
+            print("Skipping external component loading (expecting checkpoint state_dict to provide full weights)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         # Video noise Beta distribution (biased towards high noise levels when enabled)
         self.video_beta_dist = Beta(config.video_noise_beta_alpha, config.video_noise_beta_beta)
