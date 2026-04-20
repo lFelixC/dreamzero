@@ -56,20 +56,26 @@ your_dataset/
 - `action` 还是原始 14D
 - 左右臂顺序不在 parquet 里改写
 
+对于当前这份已经 shuffle 好的数据集：
+
+- `/data/datasets/dreamzero/1k_demo_lerobot_merged_v4_shuffle_only`
+- `meta/info.json` 里的 `features.*.names` 已经是 `left_*` 在前、`right_*` 在后
+- 所以后续 `convert_lerobot_to_gear.py` 的切片范围也要按 left-first 来写
+
 ### 2.2 DreamZero 暴露成 left-first 四个子键
 
 DreamZero 训练时，通过 `modality.json` 把 packed vector 映射成 canonical 的四个子键：
 
 | DreamZero key | original_key | start:end | 含义 |
 |---|---|---:|---|
-| `state.left_joint_pos` | `observation.state` | `7:13` | 左臂 6 维关节 |
-| `state.left_gripper_pos` | `observation.state` | `13:14` | 左夹爪 1 维 |
-| `state.right_joint_pos` | `observation.state` | `0:6` | 右臂 6 维关节 |
-| `state.right_gripper_pos` | `observation.state` | `6:7` | 右夹爪 1 维 |
-| `action.left_joint_pos` | `action` | `7:13` | 左臂动作 |
-| `action.left_gripper_pos` | `action` | `13:14` | 左夹爪动作 |
-| `action.right_joint_pos` | `action` | `0:6` | 右臂动作 |
-| `action.right_gripper_pos` | `action` | `6:7` | 右夹爪动作 |
+| `state.left_joint_pos` | `observation.state` | `0:6` | 左臂 6 维关节 |
+| `state.left_gripper_pos` | `observation.state` | `6:7` | 左夹爪 1 维 |
+| `state.right_joint_pos` | `observation.state` | `7:13` | 右臂 6 维关节 |
+| `state.right_gripper_pos` | `observation.state` | `13:14` | 右夹爪 1 维 |
+| `action.left_joint_pos` | `action` | `0:6` | 左臂动作 |
+| `action.left_gripper_pos` | `action` | `6:7` | 左夹爪动作 |
+| `action.right_joint_pos` | `action` | `7:13` | 右臂动作 |
+| `action.right_gripper_pos` | `action` | `13:14` | 右夹爪动作 |
 
 ### 2.3 视频和语言键映射
 
@@ -122,55 +128,44 @@ DreamZero 训练时，通过 `modality.json` 把 packed vector 映射成 canonic
 
 ---
 
-## 4. 路径一：原始数据还是多子任务 LeRobot，先合并再转换
+## 4. 路径一：输入已经是单个 LeRobot root，先重写再转换
 
 如果你的输入目录类似这样：
 
 ```text
 /data/datasets/dreamzero/my_new_aloha_dataset/
-├── task_a/
-│   └── lerobot_data/
-├── task_b/
-│   └── lerobot_data/
-└── ...
+├── data/
+├── videos/
+└── meta/
 ```
 
-那么先跑 merge/build 脚本，把多个子任务合成一个大 LeRobot root。
+那么可以先跑 build 脚本，把这个单根 LeRobot 数据集按目标 fps、视频编码和 episode 顺序重写一遍。
 
 ### 4.1 合并并重写原始数据
 
 这一步会做真正需要改原始数据的部分：
 
-- 多子任务合并成一个大 LeRobot
-- 按当前 `sources` 顺序先展平全部 episode，再做一次全局 episode-level shuffle 后写出
-- `50 fps -> 30 fps` 重采样
+- 对单个 LeRobot root 做一次全局 episode-level shuffle 后写出
+- 按 `timestamp` 和 `target_fps` 重采样；如果输入已经是 `30 fps` 且目标也是 `30 fps`，效果基本等价于直通
 - 视频转成 `H.264 mp4`
 - 重建 `timestamp / frame_index / index / episode_index / task_index`
 - 裁剪 gripper 到 `[0, 1]`
+
+当前默认推荐用新增的快版脚本：
+
+- `scripts/data/build_aloha_x5lite_bimanual_lerobot_fast.py`
+- 这版去掉了 PNG 中转，改成流式 video stats 计算，默认数据量下通常会明显快于旧脚本
+- 按当前经验值，默认数据量下可以把整体耗时从约 `3 小时` 压到约 `30-40 分钟`
+- 旧脚本 `scripts/data/build_aloha_x5lite_bimanual_lerobot.py` 仍然保留，作为兼容回退路径
 
 命令：
 
 ```bash
 cd /data/dreamzero
 
-/data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot.py \
+/data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot_fast.py \
   --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
   --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
-  --shuffle-seed 42 \
-  --target-fps 30 \
-  --video-codec h264 \
-  --force
-```
-
-如果你只想合并部分 task，可以显式指定：
-
-```bash
-cd /data/dreamzero
-
-/data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot.py \
-  --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
-  --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
-  --task-dirs task_a task_b task_c \
   --shuffle-seed 42 \
   --target-fps 30 \
   --video-codec h264 \
@@ -186,15 +181,41 @@ cd /data/dreamzero
 补充说明：
 
 - `--shuffle-seed` 默认就是 `42`，也就是默认开启全局 episode shuffle。
-- 如果输入数据不变，并且 `--shuffle-seed` 固定，那么输出 episode 顺序可复现；多 task 合并场景下，输出里的数值 `task_index` 分配顺序也可复现。
-- 改 `--shuffle-seed` 不会改单个 episode 内部的帧、状态、动作和视频内容，但会改变写出顺序；如果输入包含多个 task，还可能连带改变输出数据集里数值化的 `task_index` 分配顺序。
-- 输出里的 `episode_index` 仍然是连续的 `0..N-1`，只是不会再按 task 分块连续排列。
-- `tasks.jsonl` 会和新的 `task_index` 保持一致，所以训练语义不变；只是不要在下游硬编码某个 task 对应的整数 id。
+- 如果输入数据不变，并且 `--shuffle-seed` 固定，那么输出 episode 顺序可复现。
+- 改 `--shuffle-seed` 不会改单个 episode 内部的帧、状态、动作和视频内容，但会改变写出顺序。
+- 输出里的 `episode_index` 会被重写成连续的 `0..N-1`。
+- `tasks.jsonl` 会被原样保留，所以训练语义不变；只是不要在下游硬编码某个 task 对应的整数 id。
 - 启动日志会打印 shuffled preview，方便你快速检查顺序是否被打散。
-- 如果你省略 `--output-root`，当前 build 脚本默认会写到 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
+- 如果你省略 `--output-root`，当前推荐的 fast build 脚本默认会写到 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
 - 但当前训练脚本 `scripts/train/aloha_x5lite_bimanual_training_local.sh` 里默认写死的 `ALOHA_DATA_ROOT` 还是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`，两边要手动对齐。
 
 注意：这一步还没有生成 `modality.json` 等 DreamZero metadata。
+
+### 4.2 如果你只想先打散 episode 顺序，不重编码视频
+
+如果你的目标只是把相同 task 的轨迹提前打散，减轻后续 shard 中“单一 task 过于集中”的问题，那么不需要跑重编码版 build。
+
+可以直接用 shuffle-only 脚本：
+
+```bash
+cd /data/dreamzero
+
+/data/openpi/.venv/bin/python scripts/data/shuffle_lerobot_dataset.py \
+  --input-root /data/datasets/dreamzero/1k_demo_lerobot_merged_v4 \
+  --output-root /data/datasets/dreamzero/1k_demo_lerobot_merged_v4_shuffle_only \
+  --shuffle-seed 42 \
+  --strategy task_round_robin \
+  --video-mode hardlink \
+  --force
+```
+
+这条脚本会：
+
+- 只重写 parquet 和 episode 级 metadata
+- 保留每个 episode 内部的帧、时间戳、状态、动作不变
+- 重写 `episode_index / index / episodes.jsonl / episodes_stats.jsonl`
+- 默认用 `hardlink` 复用视频文件，不做重新编码
+- 默认按 task 分桶后交错输出，比单纯全局随机 shuffle 更适合改善 shard 内任务混合度
 
 ---
 
@@ -225,8 +246,24 @@ cd /data/dreamzero
 /data/dreamzero/.venv/bin/python scripts/data/convert_lerobot_to_gear.py \
   --dataset-path /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
   --embodiment-tag aloha_x5lite_bimanual \
-  --state-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
-  --action-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
+  --state-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
+  --action-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
+  --relative-action-keys left_joint_pos left_gripper_pos right_joint_pos right_gripper_pos \
+  --task-key task_index \
+  --task-alias task \
+  --force
+```
+
+如果你现在处理的就是这份已经打散好的数据集，可以直接用：
+
+```bash
+cd /data/dreamzero
+
+/data/dreamzero/.venv/bin/python scripts/data/convert_lerobot_to_gear.py \
+  --dataset-path /data/datasets/dreamzero/1k_demo_lerobot_merged_v4_shuffle_only \
+  --embodiment-tag aloha_x5lite_bimanual \
+  --state-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
+  --action-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
   --relative-action-keys left_joint_pos left_gripper_pos right_joint_pos right_gripper_pos \
   --task-key task_index \
   --task-alias task \
@@ -356,12 +393,12 @@ GLOBAL_BATCH_SIZE = NUM_GPUS * PER_DEVICE_BS
 
 ## 9. 从新数据集到训练的最短命令清单
 
-### 9.1 如果输入是多子任务 ALOHA
+### 9.1 如果输入已经是单个 LeRobot root
 
 ```bash
 cd /data/dreamzero
 
-/data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot.py \
+/data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot_fast.py \
   --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
   --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
   --shuffle-seed 42 \
@@ -372,8 +409,8 @@ cd /data/dreamzero
 /data/dreamzero/.venv/bin/python scripts/data/convert_lerobot_to_gear.py \
   --dataset-path /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
   --embodiment-tag aloha_x5lite_bimanual \
-  --state-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
-  --action-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
+  --state-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
+  --action-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
   --relative-action-keys left_joint_pos left_gripper_pos right_joint_pos right_gripper_pos \
   --task-key task_index \
   --task-alias task \
@@ -384,10 +421,11 @@ bash scripts/train/aloha_x5lite_bimanual_training_local.sh
 
 这里要特别注意路径对齐：
 
-- 当前 build 脚本默认 `--output-root` 是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
+- 当前推荐的 fast build 脚本默认 `--output-root` 是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
 - 当前训练脚本默认 `ALOHA_DATA_ROOT` 是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`。
 - 所以如果你想直接复用训练脚本而不改它，就在 build / convert 时显式传 `--output-root` 和 `--dataset-path` 为 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`。
 - 如果你用了别的输出目录，包括脚本默认的 `..._30fps_shuffle`，就需要同步修改 `scripts/train/aloha_x5lite_bimanual_training_local.sh` 里的 `ALOHA_DATA_ROOT`。
+- 如果你需要回退到旧行为，直接把命令里的 `build_aloha_x5lite_bimanual_lerobot_fast.py` 换回 `build_aloha_x5lite_bimanual_lerobot.py` 即可，只是速度会更慢。
 
 ### 9.2 如果输入已经是单个 LeRobot root
 
@@ -397,8 +435,8 @@ cd /data/dreamzero
 /data/dreamzero/.venv/bin/python scripts/data/convert_lerobot_to_gear.py \
   --dataset-path /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
   --embodiment-tag aloha_x5lite_bimanual \
-  --state-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
-  --action-keys '{"left_joint_pos":[7,13],"left_gripper_pos":[13,14],"right_joint_pos":[0,6],"right_gripper_pos":[6,7]}' \
+  --state-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
+  --action-keys '{"left_joint_pos":[0,6],"left_gripper_pos":[6,7],"right_joint_pos":[7,13],"right_gripper_pos":[13,14]}' \
   --relative-action-keys left_joint_pos left_gripper_pos right_joint_pos right_gripper_pos \
   --task-key task_index \
   --task-alias task \
@@ -437,7 +475,8 @@ bash scripts/train/aloha_x5lite_bimanual_training_local.sh
 
 ## 11. 当前仓库中和这条流程相关的文件
 
-- `scripts/data/build_aloha_x5lite_bimanual_lerobot.py`
+- `scripts/data/build_aloha_x5lite_bimanual_lerobot_fast.py`
+- `scripts/data/build_aloha_x5lite_bimanual_lerobot.py`（兼容回退，速度更慢）
 - `scripts/data/convert_lerobot_to_gear.py`
 - `groot/vla/configs/data/dreamzero/aloha_x5lite_bimanual_relative.yaml`
 - `groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml`

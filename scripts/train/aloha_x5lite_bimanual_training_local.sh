@@ -4,16 +4,16 @@ set -euo pipefail
 # Fixed local setup. Edit only these lines if your paths, GPU selection, or batch size change.
 DREAMZERO_ROOT="/data/dreamzero"
 CHECKPOINT_ROOT="/data/checkpoints/dreamzero"
-ALOHA_DATA_ROOT="/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps"
+ALOHA_DATA_ROOT="/data/datasets/dreamzero/1k_demo_lerobot_merged_v4_shuffle_only_clipped"
 PRETRAINED_MODEL_PATH="${CHECKPOINT_ROOT}/DreamZero-AgiBot"
 WAN21_CKPT_DIR="${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P"
 TOKENIZER_DIR="${CHECKPOINT_ROOT}/umt5-xxl"
-OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_full_finetune"
+OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_full_finetune_shuffle"
 
 PYTHON_BIN="${DREAMZERO_ROOT}/.venv/bin/python"
 EXPERIMENT_PY="${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py"
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export CUDA_VISIBLE_DEVICES="4,5,6,7"
 export CUDA_HOME="/usr/local/cuda-12.9"
 export PATH="${DREAMZERO_ROOT}/.venv/bin:${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
@@ -22,7 +22,7 @@ export SWANLAB_SYNC_WANDB=1      # 让 wandb 日志同时同步到 SwanLab
 export WANDB_MODE=offline        # wandb 本地离线落盘；SwanLab 通过 sync_wandb 接管展示
 
 PER_DEVICE_BS=2                  # 每张 GPU 的 micro-batch；若 OOM，手动改成 16
-GRAD_ACCUM_STEPS=4               # 梯度累积步数；>1 时会增大全局 batch 而不增加单卡显存
+GRAD_ACCUM_STEPS=1               # 梯度累积步数；>1 时会增大全局 batch 而不增加单卡显存
 DEEPSPEED_CFG="zero2"            # ALOHA + DreamZero-AgiBot 更稳的默认值
 MAX_STEPS=50000                  # 总训练步数
 SAVE_STEPS=1000                  # 每多少步保存一次 checkpoint；减少保存频率更稳

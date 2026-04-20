@@ -37,6 +37,8 @@ torchrun --standalone --nproc_per_node 8 \
 - 接收三路图像：`video.cam_high / video.cam_left / video.cam_right`
 - 接收双臂状态：`state.left_* / state.right_*`
 - 输出和 ALOHA client 对齐的 `14D absolute action`
+- 默认把生成视频保存到 `{model_path}` 同级目录下的 `real_world_eval_gen_{YYYYMMDD}_{index}/{checkpoint_name}/`
+- 如果想改保存根目录，可额外传 `--output_root /path/to/save_root`；如果想区分多次运行，可传 `--index N`
 
 ## 1. 再做 SSH 端口转发
 
