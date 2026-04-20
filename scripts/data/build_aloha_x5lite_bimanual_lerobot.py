@@ -10,19 +10,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import imageio.v2 as imageio
-import imageio_ffmpeg
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-
 LEROBOT_ROOT = Path("/data/openpi/third_party/lerobot")
 if str(LEROBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(LEROBOT_ROOT))
-
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
-from lerobot.common.datasets.compute_stats import sample_indices
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 SOURCE_FPS = 50
 STATE_GRIPPER_INDICES = (6, 13)
@@ -61,6 +51,9 @@ class SourceDataset:
         )
 
 
+EpisodeRef = tuple[SourceDataset, int]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a merged ALOHA X5lite bimanual LeRobot dataset at 30 fps for DreamZero.",
@@ -74,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps"),
+        default=Path("/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle"),
         help="Path for the merged output LeRobot root.",
     )
     parser.add_argument(
@@ -102,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_REPO_ID,
         help="Synthetic repo_id recorded in the output dataset metadata.",
+    )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=42,
+        help="Random seed for the global episode-level shuffle (default: 42).",
     )
     parser.add_argument(
         "--force",
@@ -178,6 +177,9 @@ def build_features(info: dict) -> dict:
 
 
 def patch_video_encoder(video_codec: str) -> None:
+    import imageio_ffmpeg
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
+
     ffmpeg_executable = imageio_ffmpeg.get_ffmpeg_exe()
 
     def _encode_with_codec(imgs_dir, video_path, fps, overwrite=False):
@@ -214,10 +216,14 @@ def patch_video_encoder(video_codec: str) -> None:
 
 
 def read_episode_dataframe(parquet_path: Path) -> pd.DataFrame:
+    import pandas as pd
+
     return pd.read_parquet(parquet_path)
 
 
 def compute_resample_indices(source_timestamps: np.ndarray, target_fps: int) -> tuple[np.ndarray, np.ndarray]:
+    import numpy as np
+
     if source_timestamps.ndim != 1:
         raise ValueError("Expected source timestamps to be a 1D array.")
 
@@ -235,10 +241,14 @@ def compute_resample_indices(source_timestamps: np.ndarray, target_fps: int) -> 
 
 
 def stack_column(df: pd.DataFrame, key: str) -> np.ndarray:
+    import numpy as np
+
     return np.stack(df[key].to_numpy())
 
 
 def clip_grippers(values: np.ndarray, indices: tuple[int, int]) -> tuple[np.ndarray, tuple[int, int]]:
+    import numpy as np
+
     clipped = values.copy()
     clip_counts: list[int] = []
     for idx in indices:
@@ -332,6 +342,8 @@ def build_episode_buffer(
     velocity: np.ndarray,
     effort: np.ndarray,
 ) -> dict:
+    import numpy as np
+
     episode_buffer = dataset.create_episode_buffer()
     episode_buffer["size"] = len(target_timestamps)
     episode_buffer["task"] = task_strings
@@ -352,6 +364,10 @@ def prepare_video_stats_images(
     selected_source_frame_indices: np.ndarray,
     target_length: int,
 ) -> dict[str, list[str]]:
+    import imageio.v2 as imageio
+    import numpy as np
+    from lerobot.common.datasets.compute_stats import sample_indices
+
     sample_positions = sample_indices(target_length)
     image_entries: dict[str, list[str]] = {}
 
@@ -390,13 +406,55 @@ def prepare_video_stats_images(
     return image_entries
 
 
+def build_episode_plan(sources: list[SourceDataset]) -> list[EpisodeRef]:
+    episode_plan: list[EpisodeRef] = []
+    for source in sources:
+        source_fps = int(source.info["fps"])
+        if source_fps != SOURCE_FPS:
+            raise ValueError(f"Expected {SOURCE_FPS} fps, got {source_fps} in {source.root}")
+        episode_plan.extend((source, source_episode_index) for source_episode_index in range(source.total_episodes))
+    return episode_plan
+
+
+def shuffle_episode_plan(episode_plan: list[EpisodeRef], shuffle_seed: int) -> list[EpisodeRef]:
+    import numpy as np
+
+    permutation = np.random.default_rng(shuffle_seed).permutation(len(episode_plan))
+    return [episode_plan[idx] for idx in permutation.tolist()]
+
+
+def format_episode_plan_preview(episode_plan: list[EpisodeRef], limit: int = 10) -> str:
+    if not episode_plan:
+        return "<empty>"
+
+    preview = [
+        f"{source.task_dir.name}/{source_episode_index:06d}"
+        for source, source_episode_index in episode_plan[:limit]
+    ]
+    suffix = "" if len(episode_plan) <= limit else f" ... (+{len(episode_plan) - limit} more)"
+    return ", ".join(preview) + suffix
+
+
 def build_dataset(args: argparse.Namespace) -> None:
+    import imageio_ffmpeg
+    import numpy as np
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from tqdm import tqdm
+
     logger = logging.getLogger("build_aloha_x5lite_bimanual_lerobot")
     task_dirs = discover_task_dirs(args.input_root, args.task_dirs)
     sources = build_source_datasets(task_dirs)
+    episode_plan = build_episode_plan(sources)
+    shuffled_plan = shuffle_episode_plan(episode_plan, args.shuffle_seed)
 
-    total_episodes = sum(source.total_episodes for source in sources)
+    total_episodes = len(episode_plan)
     logger.info("Building merged dataset from %d task folders and %d episodes.", len(sources), total_episodes)
+    logger.info(
+        "Global episode shuffle | seed=%d total_episodes=%d preview=%s",
+        args.shuffle_seed,
+        total_episodes,
+        format_episode_plan_preview(shuffled_plan),
+    )
 
     if args.output_root.exists():
         if not args.force:
@@ -417,88 +475,77 @@ def build_dataset(args: argparse.Namespace) -> None:
         tolerance_s=1e-4,
     )
 
-    merged_episode_index = 0
     total_state_clip = np.zeros(2, dtype=np.int64)
     total_action_clip = np.zeros(2, dtype=np.int64)
 
-    for source in sources:
-        source_fps = int(source.info["fps"])
-        if source_fps != SOURCE_FPS:
-            raise ValueError(f"Expected {SOURCE_FPS} fps, got {source_fps} in {source.root}")
+    for merged_episode_index, (source, source_episode_index) in enumerate(
+        tqdm(shuffled_plan, desc="merge:shuffled", unit="episode")
+    ):
+        parquet_path = source.parquet_path(source_episode_index)
+        df = read_episode_dataframe(parquet_path)
+        source_timestamps = df["timestamp"].to_numpy(dtype=np.float64, copy=True)
+        selected_indices, target_timestamps = compute_resample_indices(source_timestamps, args.target_fps)
 
-        for source_episode_index in tqdm(
-            range(source.total_episodes),
-            desc=f"merge:{source.task_dir.name}",
-            unit="episode",
-        ):
-            parquet_path = source.parquet_path(source_episode_index)
-            df = read_episode_dataframe(parquet_path)
-            source_timestamps = df["timestamp"].to_numpy(dtype=np.float64, copy=True)
-            selected_indices, target_timestamps = compute_resample_indices(source_timestamps, args.target_fps)
+        state = stack_column(df, "observation.state")[selected_indices].astype(np.float32, copy=False)
+        action = stack_column(df, "action")[selected_indices].astype(np.float32, copy=False)
+        velocity = stack_column(df, "observation.velocity")[selected_indices].astype(np.float32, copy=False)
+        effort = stack_column(df, "observation.effort")[selected_indices].astype(np.float32, copy=False)
+        task_indices = df["task_index"].to_numpy(dtype=np.int64, copy=True)[selected_indices]
 
-            state = stack_column(df, "observation.state")[selected_indices].astype(np.float32, copy=False)
-            action = stack_column(df, "action")[selected_indices].astype(np.float32, copy=False)
-            velocity = stack_column(df, "observation.velocity")[selected_indices].astype(np.float32, copy=False)
-            effort = stack_column(df, "observation.effort")[selected_indices].astype(np.float32, copy=False)
-            task_indices = df["task_index"].to_numpy(dtype=np.int64, copy=True)[selected_indices]
+        state, state_clip_counts = clip_grippers(state, STATE_GRIPPER_INDICES)
+        action, action_clip_counts = clip_grippers(action, ACTION_GRIPPER_INDICES)
+        total_state_clip += np.array(state_clip_counts, dtype=np.int64)
+        total_action_clip += np.array(action_clip_counts, dtype=np.int64)
 
-            state, state_clip_counts = clip_grippers(state, STATE_GRIPPER_INDICES)
-            action, action_clip_counts = clip_grippers(action, ACTION_GRIPPER_INDICES)
-            total_state_clip += np.array(state_clip_counts, dtype=np.int64)
-            total_action_clip += np.array(action_clip_counts, dtype=np.int64)
+        task_strings = get_task_strings(source, task_indices)
+        episode_buffer = build_episode_buffer(
+            dataset=dataset,
+            target_timestamps=target_timestamps,
+            task_strings=task_strings,
+            state=state,
+            action=action,
+            velocity=velocity,
+            effort=effort,
+        )
+        selected_source_frame_indices = df["frame_index"].to_numpy(dtype=np.int64, copy=True)[selected_indices]
 
-            task_strings = get_task_strings(source, task_indices)
-            episode_buffer = build_episode_buffer(
+        for video_key in VIDEO_KEYS:
+            source_video_path = source.video_path(source_episode_index, video_key)
+            output_video_path = dataset.root / dataset.meta.get_video_file_path(
+                merged_episode_index,
+                video_key,
+            )
+            transcode_episode_video(
+                ffmpeg_executable=imageio_ffmpeg.get_ffmpeg_exe(),
+                source_video_path=source_video_path,
+                output_video_path=output_video_path,
+                target_fps=args.target_fps,
+                video_codec=args.video_codec,
+            )
+
+        episode_buffer.update(
+            prepare_video_stats_images(
                 dataset=dataset,
-                target_timestamps=target_timestamps,
-                task_strings=task_strings,
-                state=state,
-                action=action,
-                velocity=velocity,
-                effort=effort,
-            )
-            selected_source_frame_indices = (
-                df["frame_index"].to_numpy(dtype=np.int64, copy=True)[selected_indices]
-            )
-
-            for video_key in VIDEO_KEYS:
-                source_video_path = source.video_path(source_episode_index, video_key)
-                output_video_path = dataset.root / dataset.meta.get_video_file_path(
-                    merged_episode_index,
-                    video_key,
-                )
-                transcode_episode_video(
-                    ffmpeg_executable=imageio_ffmpeg.get_ffmpeg_exe(),
-                    source_video_path=source_video_path,
-                    output_video_path=output_video_path,
-                    target_fps=args.target_fps,
-                    video_codec=args.video_codec,
-                )
-
-            episode_buffer.update(
-                prepare_video_stats_images(
-                    dataset=dataset,
-                    source=source,
-                    source_episode_index=source_episode_index,
-                    target_episode_index=merged_episode_index,
-                    selected_source_frame_indices=selected_source_frame_indices,
-                    target_length=len(target_timestamps),
-                )
-            )
-            dataset.episode_buffer = episode_buffer
-            dataset.save_episode()
-            log_episode_summary(
-                logger=logger,
-                merged_episode_index=merged_episode_index,
                 source=source,
                 source_episode_index=source_episode_index,
-                source_length=len(df),
+                target_episode_index=merged_episode_index,
+                selected_source_frame_indices=selected_source_frame_indices,
                 target_length=len(target_timestamps),
-                timestamps=target_timestamps,
-                state_clip_counts=state_clip_counts,
-                action_clip_counts=action_clip_counts,
             )
-            merged_episode_index += 1
+        )
+        dataset.episode_buffer = episode_buffer
+        dataset.save_episode()
+        log_episode_summary(
+            logger=logger,
+            merged_episode_index=merged_episode_index,
+            source=source,
+            source_episode_index=source_episode_index,
+            source_length=len(df),
+            target_length=len(target_timestamps),
+            timestamps=target_timestamps,
+            state_clip_counts=state_clip_counts,
+            action_clip_counts=action_clip_counts,
+        )
 
     info_path = args.output_root / "meta" / "info.json"
     with info_path.open("r", encoding="utf-8") as handle:

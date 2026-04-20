@@ -142,6 +142,7 @@ DreamZero 训练时，通过 `modality.json` 把 packed vector 映射成 canonic
 这一步会做真正需要改原始数据的部分：
 
 - 多子任务合并成一个大 LeRobot
+- 按当前 `sources` 顺序先展平全部 episode，再做一次全局 episode-level shuffle 后写出
 - `50 fps -> 30 fps` 重采样
 - 视频转成 `H.264 mp4`
 - 重建 `timestamp / frame_index / index / episode_index / task_index`
@@ -155,6 +156,7 @@ cd /data/dreamzero
 /data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot.py \
   --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
   --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
+  --shuffle-seed 42 \
   --target-fps 30 \
   --video-codec h264 \
   --force
@@ -169,6 +171,7 @@ cd /data/dreamzero
   --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
   --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
   --task-dirs task_a task_b task_c \
+  --shuffle-seed 42 \
   --target-fps 30 \
   --video-codec h264 \
   --force
@@ -179,6 +182,17 @@ cd /data/dreamzero
 ```text
 /data/datasets/dreamzero/my_new_aloha_dataset_30fps
 ```
+
+补充说明：
+
+- `--shuffle-seed` 默认就是 `42`，也就是默认开启全局 episode shuffle。
+- 如果输入数据不变，并且 `--shuffle-seed` 固定，那么输出 episode 顺序可复现；多 task 合并场景下，输出里的数值 `task_index` 分配顺序也可复现。
+- 改 `--shuffle-seed` 不会改单个 episode 内部的帧、状态、动作和视频内容，但会改变写出顺序；如果输入包含多个 task，还可能连带改变输出数据集里数值化的 `task_index` 分配顺序。
+- 输出里的 `episode_index` 仍然是连续的 `0..N-1`，只是不会再按 task 分块连续排列。
+- `tasks.jsonl` 会和新的 `task_index` 保持一致，所以训练语义不变；只是不要在下游硬编码某个 task 对应的整数 id。
+- 启动日志会打印 shuffled preview，方便你快速检查顺序是否被打散。
+- 如果你省略 `--output-root`，当前 build 脚本默认会写到 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
+- 但当前训练脚本 `scripts/train/aloha_x5lite_bimanual_training_local.sh` 里默认写死的 `ALOHA_DATA_ROOT` 还是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`，两边要手动对齐。
 
 注意：这一步还没有生成 `modality.json` 等 DreamZero metadata。
 
@@ -350,6 +364,7 @@ cd /data/dreamzero
 /data/openpi/.venv/bin/python scripts/data/build_aloha_x5lite_bimanual_lerobot.py \
   --input-root /data/datasets/dreamzero/my_new_aloha_dataset \
   --output-root /data/datasets/dreamzero/my_new_aloha_dataset_30fps \
+  --shuffle-seed 42 \
   --target-fps 30 \
   --video-codec h264 \
   --force
@@ -366,6 +381,13 @@ cd /data/dreamzero
 
 bash scripts/train/aloha_x5lite_bimanual_training_local.sh
 ```
+
+这里要特别注意路径对齐：
+
+- 当前 build 脚本默认 `--output-root` 是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps_shuffle`。
+- 当前训练脚本默认 `ALOHA_DATA_ROOT` 是 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`。
+- 所以如果你想直接复用训练脚本而不改它，就在 build / convert 时显式传 `--output-root` 和 `--dataset-path` 为 `/data/datasets/dreamzero/aloha_x5lite_bimanual_lerobot_30fps`。
+- 如果你用了别的输出目录，包括脚本默认的 `..._30fps_shuffle`，就需要同步修改 `scripts/train/aloha_x5lite_bimanual_training_local.sh` 里的 `ALOHA_DATA_ROOT`。
 
 ### 9.2 如果输入已经是单个 LeRobot root
 
@@ -421,4 +443,3 @@ bash scripts/train/aloha_x5lite_bimanual_training_local.sh
 - `groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml`
 - `groot/vla/configs/model/dreamzero/transform/base.yaml`
 - `scripts/train/aloha_x5lite_bimanual_training_local.sh`
-
