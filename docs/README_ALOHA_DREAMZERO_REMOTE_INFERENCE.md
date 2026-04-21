@@ -7,6 +7,10 @@
 - shell: `/data/aloha_agilex_arx5/tools/inference_dreamzero_aloha_sync.sh`
 - python: `/data/aloha_agilex_arx5/python/examples/X5lite_old/inference_dreamzero_aloha_sync.py`
 
+后端切换和 `torch.compile` 启动 recipe 见：
+
+- `/data/dreamzero/docs/README_INFERENCE_BACKENDS.md`
+
 ## 0. 先起 DreamZero server
 
 单卡最简单的启动方式：
@@ -30,6 +34,61 @@ torchrun --standalone --nproc_per_node 8 \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000
 ```
+
+如果你需要显式切换后端，最常用的是下面三种模式。
+
+`FA2 + 不使用 torch.compile`：
+
+```bash
+cd /data/dreamzero
+
+CUDA_VISIBLE_DEVICES=0,1 \
+ATTENTION_BACKEND=FA2 \
+DISABLE_TORCH_COMPILE=true \
+torchrun --standalone --nproc_per_node 2 \
+  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  --model_path /path/to/your/checkpoint_dir \
+  --port 8000 \
+  --enable-dit-cache
+```
+
+`TE + 不使用 torch.compile`：
+
+```bash
+cd /data/dreamzero
+
+CUDA_VISIBLE_DEVICES=0,1 \
+ATTENTION_BACKEND=TE \
+DISABLE_TORCH_COMPILE=true \
+LD_LIBRARY_PATH=/data/dreamzero/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-} \
+torchrun --standalone --nproc_per_node 2 \
+  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  --model_path /path/to/your/checkpoint_dir \
+  --port 8000 \
+  --enable-dit-cache
+```
+
+`开启 torch.compile`：
+
+```bash
+cd /data/dreamzero
+
+CUDA_VISIBLE_DEVICES=0,1 \
+ATTENTION_BACKEND=FA2 \
+DISABLE_TORCH_COMPILE=false \
+TORCH_COMPILE_BACKEND=cudagraphs \
+torchrun --standalone --nproc_per_node 2 \
+  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  --model_path /path/to/your/checkpoint_dir \
+  --port 8000 \
+  --enable-dit-cache
+```
+
+说明：
+
+- `DISABLE_TORCH_COMPILE=true` 时，即使日志里打印了 `Using torch.compile backend=...`，实际也不会启用模型里的 compile 包装。
+- 当前机器上如果要开 compile，建议显式写 `TORCH_COMPILE_BACKEND=cudagraphs`。
+- 如果只是想先把 server 稳定跑起来，优先从 `FA2 + DISABLE_TORCH_COMPILE=true` 开始。
 
 这个 server 会：
 

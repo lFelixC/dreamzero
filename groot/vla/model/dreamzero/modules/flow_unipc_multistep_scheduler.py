@@ -17,6 +17,18 @@ from diffusers.schedulers.scheduling_utils import (
 
 
 DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "true").lower() == "true"
+TORCH_COMPILE_BACKEND = os.getenv("TORCH_COMPILE_BACKEND", "").strip().lower()
+_disable_scheduler_compile = os.getenv("DREAMZERO_DISABLE_SCHEDULER_COMPILE", "auto").strip().lower()
+if _disable_scheduler_compile == "auto":
+    # The scheduler state changes rank/shape across sampling steps, which causes
+    # repeated recompiles under one-graph backends such as cudagraphs.
+    DISABLE_SCHEDULER_TORCH_COMPILE = DISABLE_TORCH_COMPILE or (
+        TORCH_COMPILE_BACKEND not in ("", "inductor")
+    )
+else:
+    DISABLE_SCHEDULER_TORCH_COMPILE = DISABLE_TORCH_COMPILE or (
+        _disable_scheduler_compile == "true"
+    )
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
@@ -297,7 +309,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
             return epsilon
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False, disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(
+        mode="reduce-overhead",
+        fullgraph=True,
+        dynamic=False,
+        disable=DISABLE_SCHEDULER_TORCH_COMPILE,
+    )
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -409,7 +426,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         x_t = x_t.to(x.dtype)
         return x_t
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False, disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(
+        mode="reduce-overhead",
+        fullgraph=True,
+        dynamic=False,
+        disable=DISABLE_SCHEDULER_TORCH_COMPILE,
+    )
     def multistep_uni_c_bh_update(
         self,
         this_model_output: torch.Tensor,

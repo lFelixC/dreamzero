@@ -17,10 +17,13 @@ import tyro
 from tianshou.data import Batch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from eval_utils.torch_compile_backend import configure_torch_compile_backend
 from eval_utils.policy_server import PolicyServerConfig, WebsocketPolicyServer
 from eval_utils.serve_dreamzero_wan22 import _get_expected_video_resolution, _resize_frames_to_resolution
 from groot.vla.data.schema import EmbodimentTag
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
+
+DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +496,8 @@ def main(args: Args) -> None:
         torch._dynamo.config.recompile_limit = 800
 
     logging.basicConfig(level=logging.INFO, force=True)
+    if DEFAULT_TORCH_COMPILE_BACKEND is not None:
+        logger.info("Using torch.compile backend=%s for this entrypoint", DEFAULT_TORCH_COMPILE_BACKEND)
 
     device_mesh = init_mesh()
     rank = dist.get_rank()

@@ -268,53 +268,87 @@ def fused_attn(
     k = k.contiguous()
     v = v.contiguous()
 
-    args = (
-        max_seqlen_q,
-        max_seqlen_kv,
-        is_training,
-        attn_scale,
-        dropout,
-        fast_zero_fill,
-        QKVLayout[qkv_layout],
-        AttnBiasType[attn_bias_type],
-        AttnMaskType[attn_mask_type],
-    )
+    if _TE_VER >= (2, 13):
+        args = (
+            max_seqlen_q,
+            max_seqlen_kv,
+            is_training,
+            attn_scale,
+            dropout,
+            fast_zero_fill,
+            QKVLayout[qkv_layout],
+            AttnBiasType[attn_bias_type],
+            AttnMaskType[attn_mask_type],
+            SoftmaxType[softmax_type],
+            tuple(window_size),
+            False,  # bottom_right_diagonal
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q,
+            k,
+            v,
+            fake_dtype,
+            cu_seqlens_q_padded,
+            cu_seqlens_kv_padded,
+            page_table_k,
+            page_table_v,
+            s_quantizer,
+            o_quantizer,
+            attn_bias,
+            softmax_offset,
+            rng_gen,
+            rng_elts_per_thread,
+            False,  # return_max_logit
+            False,  # is_cuda_graph
+        )
+    else:
+        args = (
+            max_seqlen_q,
+            max_seqlen_kv,
+            is_training,
+            attn_scale,
+            dropout,
+            fast_zero_fill,
+            QKVLayout[qkv_layout],
+            AttnBiasType[attn_bias_type],
+            AttnMaskType[attn_mask_type],
+        )
 
-    if _TE_VER >= (2, 8):
-        args += (SoftmaxType[softmax_type],)
+        if _TE_VER >= (2, 8):
+            args += (SoftmaxType[softmax_type],)
 
-    args += (
-        tuple(window_size),
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        q,
-        k,
-        v,
-        fake_dtype,
-        cu_seqlens_q_padded,
-        cu_seqlens_kv_padded,
-        page_table_k,
-        page_table_v,
-        s_quantizer,
-        o_quantizer,
-        attn_bias,
-    )
+        args += (
+            tuple(window_size),
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q,
+            k,
+            v,
+            fake_dtype,
+            cu_seqlens_q_padded,
+            cu_seqlens_kv_padded,
+            page_table_k,
+            page_table_v,
+            s_quantizer,
+            o_quantizer,
+            attn_bias,
+        )
 
-    if _TE_VER >= (2, 8):
-        args += (softmax_offset,)
+        if _TE_VER >= (2, 8):
+            args += (softmax_offset,)
 
-    args += (
-        rng_gen,
-        rng_elts_per_thread,
-    )
+        args += (
+            rng_gen,
+            rng_elts_per_thread,
+        )
 
-    if _TE_VER >= (2, 9):
-        # return_max_logit
-        args += (False,)
+        if _TE_VER >= (2, 9):
+            # return_max_logit
+            args += (False,)
 
-    if _TE_VER >= (2, 10):
-        # is_cuda_graph
-        args += (False,)
+        if _TE_VER >= (2, 10):
+            # is_cuda_graph
+            args += (False,)
 
     output_tensors = tex.fused_attn_fwd(*args)
     return output_tensors

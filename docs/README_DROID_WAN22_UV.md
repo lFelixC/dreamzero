@@ -141,13 +141,40 @@ MAX_JOBS=8 CUDA_HOME=/usr/local/cuda-12.9 uv pip install --no-build-isolation fl
 
 ### 3.5 Optional: Transformer Engine
 
-The upstream README marks this as **GB200 only**. For normal H100 training, you can skip it.
+For training, Transformer Engine is still optional.
+
+For inference on Hopper / H200, this repo has been validated with:
+
+- `transformer_engine==2.13.0`
+- `torch==2.8.0`
+- CUDA `12.9`
 
 ```bash
 cd /data/dreamzero
 source .venv/bin/activate
 
-uv pip install --no-build-isolation "transformer_engine[pytorch]"
+export CUDA_HOME=/usr/local/cuda-12.9
+export NVTE_CUDA_INCLUDE_PATH=$CUDA_HOME/include
+
+uv pip install --no-build-isolation "transformer_engine[pytorch]==2.13.0"
+```
+
+If you plan to use `ATTENTION_BACKEND=TE` at runtime, also export the cuDNN path from the venv:
+
+```bash
+export LD_LIBRARY_PATH=/data/dreamzero/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}
+```
+
+For server startup recipes covering:
+
+- `FA2` vs `TE`
+- `DISABLE_TORCH_COMPILE=true|false`
+- `TORCH_COMPILE_BACKEND=cudagraphs`
+
+see:
+
+```text
+docs/README_INFERENCE_BACKENDS.md
 ```
 
 ## 4. Quick Sanity Check

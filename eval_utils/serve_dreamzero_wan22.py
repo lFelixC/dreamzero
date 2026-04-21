@@ -59,6 +59,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from eval_utils.torch_compile_backend import configure_torch_compile_backend
+
+DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
+
 from openpi_client.base_policy import BasePolicy
 
 from eval_utils.policy_server import WebsocketPolicyServer, PolicyServerConfig
@@ -344,6 +348,8 @@ def main(
     video_output_dir: str = "./video_pred_output",
 ) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
+    if DEFAULT_TORCH_COMPILE_BACKEND is not None:
+        logger.info("Using torch.compile backend=%s for this entrypoint", DEFAULT_TORCH_COMPILE_BACKEND)
 
     _maybe_init_distributed()
     device_mesh = init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
