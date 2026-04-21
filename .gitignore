@@ -206,6 +206,7 @@ gear_working_dir/
 episode_data/
 
 # third party packages
+third_party/
 third_parties/
 
 # redis related
@@ -247,3 +248,7 @@ groot/control/envs/yam/data/eval/*
 
 checkpoints/
 video_pred_output*/
+
+.codex
+example/libero/
+example/remote_infer/rtc_trace.jsonl

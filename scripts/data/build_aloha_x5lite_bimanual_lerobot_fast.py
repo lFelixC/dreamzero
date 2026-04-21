@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import logging
 import shutil
@@ -14,7 +15,6 @@ LEROBOT_ROOT = Path("/data/openpi/third_party/lerobot")
 if str(LEROBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(LEROBOT_ROOT))
 
-SOURCE_FPS = 50
 STATE_GRIPPER_INDICES = (6, 13)
 ACTION_GRIPPER_INDICES = (6, 13)
 VIDEO_KEYS = (
@@ -54,15 +54,21 @@ class SourceDataset:
 EpisodeRef = tuple[SourceDataset, int]
 
 
+@dataclass(frozen=True)
+class StreamVideoStatsSource:
+    source_video_path: Path
+    sampled_source_frame_indices: tuple[int, ...]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a merged ALOHA X5lite bimanual LeRobot dataset at 30 fps for DreamZero.",
+        description="Build a merged ALOHA X5lite bimanual LeRobot dataset at 30 fps for DreamZero with fast streaming video stats.",
     )
     parser.add_argument(
         "--input-root",
         type=Path,
         default=Path("/data/datasets/dreamzero/1k_demo_lerobot"),
-        help="Directory containing the 15 first-level ALOHA task folders.",
+        help="Path to a single LeRobot dataset root, or a directory containing lerobot_data/.",
     )
     parser.add_argument(
         "--output-root",
@@ -88,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=None,
-        help="Optional list of task directory names under input-root. Defaults to all first-level dirs.",
+        help="Deprecated and ignored. The script now treats input-root as a single merged LeRobot dataset.",
     )
     parser.add_argument(
         "--repo-id",
@@ -110,20 +116,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_dataset_root(input_root: Path) -> Path:
+    candidates = (
+        input_root,
+        input_root / "lerobot_data",
+    )
+    for candidate in candidates:
+        if (candidate / "meta" / "info.json").is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"{input_root} is not a LeRobot dataset root. "
+        "Expected meta/info.json under input-root or input-root/lerobot_data."
+    )
+
+
 def discover_task_dirs(input_root: Path, requested: list[str] | None) -> list[Path]:
     if requested:
-        task_dirs = [input_root / name for name in requested]
-    else:
-        task_dirs = sorted(path for path in input_root.iterdir() if path.is_dir())
-
-    valid = []
-    for task_dir in task_dirs:
-        dataset_root = task_dir / "lerobot_data"
-        if (dataset_root / "meta" / "info.json").is_file():
-            valid.append(task_dir)
-    if not valid:
-        raise FileNotFoundError(f"No LeRobot task directories found under {input_root}")
-    return valid
+        logging.getLogger("build_aloha_x5lite_bimanual_lerobot_fast").warning(
+            "--task-dirs is ignored. input-root is treated as a single merged LeRobot dataset root."
+        )
+    resolve_dataset_root(input_root)
+    return [input_root]
 
 
 def load_task_map(dataset_root: Path) -> dict[int, str]:
@@ -141,7 +154,7 @@ def load_task_map(dataset_root: Path) -> dict[int, str]:
 def build_source_datasets(task_dirs: list[Path]) -> list[SourceDataset]:
     datasets: list[SourceDataset] = []
     for task_dir in task_dirs:
-        root = task_dir / "lerobot_data"
+        root = resolve_dataset_root(task_dir)
         with (root / "meta" / "info.json").open("r", encoding="utf-8") as handle:
             info = json.load(handle)
         datasets.append(
@@ -356,62 +369,161 @@ def build_episode_buffer(
     return episode_buffer
 
 
-def prepare_video_stats_images(
-    dataset: LeRobotDataset,
+def build_streaming_video_stats_sources(
     source: SourceDataset,
     source_episode_index: int,
-    target_episode_index: int,
     selected_source_frame_indices: np.ndarray,
     target_length: int,
-) -> dict[str, list[str]]:
-    import imageio.v2 as imageio
+) -> dict[str, StreamVideoStatsSource]:
     import numpy as np
     from lerobot.common.datasets.compute_stats import sample_indices
 
     sample_positions = sample_indices(target_length)
-    image_entries: dict[str, list[str]] = {}
+    sampled_source_frame_indices = selected_source_frame_indices[np.array(sample_positions, dtype=np.int64)]
 
-    for video_key in VIDEO_KEYS:
-        reader = imageio.get_reader(str(source.video_path(source_episode_index, video_key)))
-        sample_paths: dict[int, str] = {}
-        try:
-            for sample_position in sample_positions:
-                output_path = dataset._get_image_file_path(
-                    episode_index=target_episode_index,
-                    image_key=video_key,
-                    frame_index=sample_position,
+    return {
+        video_key: StreamVideoStatsSource(
+            source_video_path=source.video_path(source_episode_index, video_key),
+            sampled_source_frame_indices=tuple(int(idx) for idx in sampled_source_frame_indices.tolist()),
+        )
+        for video_key in VIDEO_KEYS
+    }
+
+
+def compute_streaming_video_feature_stats(video_source: StreamVideoStatsSource) -> dict[str, np.ndarray]:
+    import imageio_ffmpeg
+    import numpy as np
+    from lerobot.common.datasets.compute_stats import auto_downsample_height_width
+
+    if not video_source.sampled_source_frame_indices:
+        raise ValueError(f"No sampled frame indices provided for {video_source.source_video_path}")
+
+    frame_multiplicity = Counter(video_source.sampled_source_frame_indices)
+    unique_frame_indices = sorted(frame_multiplicity)
+    select_expr = "+".join(f"eq(n\\,{frame_index})" for frame_index in unique_frame_indices)
+    frame_generator = imageio_ffmpeg.read_frames(
+        video_source.source_video_path,
+        pix_fmt="rgb24",
+        output_params=["-vf", f"select={select_expr}", "-vsync", "0"],
+    )
+
+    channel_min = None
+    channel_max = None
+    channel_sum = np.zeros(3, dtype=np.float64)
+    channel_sum_sq = np.zeros(3, dtype=np.float64)
+    total_pixels = 0
+    decoded_frames = 0
+
+    try:
+        metadata = next(frame_generator)
+        width, height = metadata["size"]
+        expected_frame_bytes = width * height * 3
+
+        for frame_index in unique_frame_indices:
+            frame_bytes = next(frame_generator, None)
+            if frame_bytes is None:
+                raise RuntimeError(
+                    f"Decoded {decoded_frames} sampled frames from {video_source.source_video_path}, "
+                    f"expected {len(unique_frame_indices)}."
                 )
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                frame = reader.get_data(int(selected_source_frame_indices[sample_position]))
-                imageio.imwrite(output_path, frame)
-                sample_paths[sample_position] = str(output_path)
-        finally:
-            reader.close()
+            if len(frame_bytes) != expected_frame_bytes:
+                raise RuntimeError(
+                    f"Unexpected frame byte size {len(frame_bytes)} for {video_source.source_video_path}, "
+                    f"expected {expected_frame_bytes}."
+                )
 
-        nearest_sample_paths: list[str] = []
-        sample_positions_arr = np.array(sample_positions, dtype=np.int64)
-        for frame_index in range(target_length):
-            insert_pos = int(np.searchsorted(sample_positions_arr, frame_index))
-            if insert_pos <= 0:
-                chosen = int(sample_positions_arr[0])
-            elif insert_pos >= len(sample_positions_arr):
-                chosen = int(sample_positions_arr[-1])
+            frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(height, width, 3)
+            frame = auto_downsample_height_width(frame.transpose(2, 0, 1))
+            frame_float = frame.astype(np.float64, copy=False)
+            multiplicity = frame_multiplicity[frame_index]
+
+            frame_min = frame_float.min(axis=(1, 2))
+            frame_max = frame_float.max(axis=(1, 2))
+            if channel_min is None:
+                channel_min = frame_min
+                channel_max = frame_max
             else:
-                left = int(sample_positions_arr[insert_pos - 1])
-                right = int(sample_positions_arr[insert_pos])
-                chosen = left if abs(frame_index - left) <= abs(right - frame_index) else right
-            nearest_sample_paths.append(sample_paths[chosen])
-        image_entries[video_key] = nearest_sample_paths
+                channel_min = np.minimum(channel_min, frame_min)
+                channel_max = np.maximum(channel_max, frame_max)
 
-    return image_entries
+            channel_sum += frame_float.sum(axis=(1, 2)) * multiplicity
+            channel_sum_sq += np.square(frame_float).sum(axis=(1, 2)) * multiplicity
+            total_pixels += frame.shape[1] * frame.shape[2] * multiplicity
+            decoded_frames += 1
+
+        extra_frame = next(frame_generator, None)
+        if extra_frame is not None:
+            raise RuntimeError(
+                f"Decoded more sampled frames than expected from {video_source.source_video_path}."
+            )
+    finally:
+        frame_generator.close()
+
+    if channel_min is None or channel_max is None or total_pixels == 0:
+        raise RuntimeError(f"Failed to compute video stats for {video_source.source_video_path}")
+
+    mean = channel_sum / total_pixels
+    variance = np.maximum(channel_sum_sq / total_pixels - np.square(mean), 0.0)
+    std = np.sqrt(variance)
+
+    return {
+        "min": (channel_min / 255.0).reshape(3, 1, 1),
+        "max": (channel_max / 255.0).reshape(3, 1, 1),
+        "mean": (mean / 255.0).reshape(3, 1, 1),
+        "std": (std / 255.0).reshape(3, 1, 1),
+        "count": np.array([len(video_source.sampled_source_frame_indices)], dtype=np.int64),
+    }
+
+
+def patch_compute_episode_stats() -> None:
+    import numpy as np
+    import lerobot.common.datasets.compute_stats as compute_stats_module
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
+
+    get_feature_stats = compute_stats_module.get_feature_stats
+    sample_images = compute_stats_module.sample_images
+
+    def _compute_episode_stats(
+        episode_data: dict[str, list[str] | np.ndarray | StreamVideoStatsSource],
+        features: dict,
+    ) -> dict:
+        ep_stats = {}
+        for key, data in episode_data.items():
+            if features[key]["dtype"] == "string":
+                continue
+            if features[key]["dtype"] in ["image", "video"]:
+                if isinstance(data, StreamVideoStatsSource):
+                    ep_stats[key] = compute_streaming_video_feature_stats(data)
+                    continue
+
+                ep_ft_array = sample_images(data)
+                axes_to_reduce = (0, 2, 3)
+                keepdims = True
+            else:
+                ep_ft_array = data
+                axes_to_reduce = 0
+                keepdims = data.ndim == 1
+
+            ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
+
+            if features[key]["dtype"] in ["image", "video"]:
+                ep_stats[key] = {
+                    stat_key: stat_value if stat_key == "count" else np.squeeze(stat_value / 255.0, axis=0)
+                    for stat_key, stat_value in ep_stats[key].items()
+                }
+
+        return ep_stats
+
+    compute_stats_module.compute_episode_stats = _compute_episode_stats
+    lerobot_dataset_module.compute_episode_stats = _compute_episode_stats
 
 
 def build_episode_plan(sources: list[SourceDataset]) -> list[EpisodeRef]:
     episode_plan: list[EpisodeRef] = []
     for source in sources:
         source_fps = int(source.info["fps"])
-        if source_fps != SOURCE_FPS:
-            raise ValueError(f"Expected {SOURCE_FPS} fps, got {source_fps} in {source.root}")
+        if source_fps <= 0:
+            raise ValueError(f"Expected a positive fps, got {source_fps} in {source.root}")
         episode_plan.extend((source, source_episode_index) for source_episode_index in range(source.total_episodes))
     return episode_plan
 
@@ -441,14 +553,21 @@ def build_dataset(args: argparse.Namespace) -> None:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     from tqdm import tqdm
 
-    logger = logging.getLogger("build_aloha_x5lite_bimanual_lerobot")
+    logger = logging.getLogger("build_aloha_x5lite_bimanual_lerobot_fast")
     task_dirs = discover_task_dirs(args.input_root, args.task_dirs)
     sources = build_source_datasets(task_dirs)
     episode_plan = build_episode_plan(sources)
     shuffled_plan = shuffle_episode_plan(episode_plan, args.shuffle_seed)
 
+    source = sources[0]
     total_episodes = len(episode_plan)
-    logger.info("Building merged dataset from %d task folders and %d episodes.", len(sources), total_episodes)
+    logger.info(
+        "Building dataset from %s | source_fps=%s target_fps=%s episodes=%d",
+        source.root,
+        source.info["fps"],
+        args.target_fps,
+        total_episodes,
+    )
     logger.info(
         "Global episode shuffle | seed=%d total_episodes=%d preview=%s",
         args.shuffle_seed,
@@ -462,8 +581,9 @@ def build_dataset(args: argparse.Namespace) -> None:
         shutil.rmtree(args.output_root)
 
     patch_video_encoder(args.video_codec)
-    features = build_features(sources[0].info)
-    robot_type = sources[0].info["robot_type"]
+    patch_compute_episode_stats()
+    features = build_features(source.info)
+    robot_type = source.info["robot_type"]
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -524,11 +644,9 @@ def build_dataset(args: argparse.Namespace) -> None:
             )
 
         episode_buffer.update(
-            prepare_video_stats_images(
-                dataset=dataset,
+            build_streaming_video_stats_sources(
                 source=source,
                 source_episode_index=source_episode_index,
-                target_episode_index=merged_episode_index,
                 selected_source_frame_indices=selected_source_frame_indices,
                 target_length=len(target_timestamps),
             )

@@ -42,6 +42,7 @@ class Args:
     enable_dit_cache: bool = False
     max_chunk_size: int | None = None
     output_root: str | None = None
+    index: int = 0
 
 
 def _normalize_image_array(data: Any, key: str) -> np.ndarray:
@@ -201,6 +202,8 @@ class AlohaBimanualPolicy:
         self._max_chunk_size = max_chunk_size
         self._current_session_id: str | None = None
         self._reset_next_infer = False
+        self._video_pred_latents: list[torch.Tensor] = []
+        self._current_prompt = ""
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
@@ -263,6 +266,8 @@ class AlohaBimanualPolicy:
         converted.update(self._extract_state(obs))
 
         prompt = _normalize_prompt(obs.get("prompt", obs.get("annotation.task", "")))
+        if prompt:
+            self._current_prompt = prompt
         converted["annotation.task"] = prompt
         return converted
 
@@ -337,8 +342,57 @@ class AlohaBimanualPolicy:
         worker_obs[RESET_FLAG_KEY] = bool(should_reset)
         return worker_obs
 
-    def _reset_local_state(self) -> None:
+    def _save_predicted_video(self) -> None:
+        if not self._output_dir or not self._video_pred_latents:
+            return
+
+        try:
+            import imageio
+            from einops import rearrange
+
+            action_head = self._policy.trained_model.action_head
+            latents = torch.cat(self._video_pred_latents, dim=2)
+            with torch.no_grad():
+                frames = action_head.vae.decode(
+                    latents,
+                    tiled=action_head.tiled,
+                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+                )
+
+            frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+            frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+            if len(frames) == 0:
+                return
+
+            os.makedirs(self._output_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+            existing = [f for f in os.listdir(self._output_dir) if f.endswith(".mp4")]
+            safe_prompt = self._current_prompt.replace(" ", "_")
+            safe_prompt = "".join(c for c in safe_prompt if c.isalnum() or c in "_-.")
+            if len(safe_prompt) > 80:
+                safe_prompt = safe_prompt[:80]
+            if not safe_prompt:
+                safe_prompt = "no_prompt"
+
+            output_path = os.path.join(
+                self._output_dir,
+                f"{len(existing):06}_{safe_prompt}_{timestamp}.mp4",
+            )
+            imageio.mimsave(output_path, list(frames), fps=5, codec="libx264")
+            logger.info("Saved video prediction (%d frames) to %s", len(frames), output_path)
+        except Exception as e:
+            logger.warning("Failed to save video prediction: %s", e)
+
+    def _reset_local_state(self, save_video: bool = False) -> None:
+        if save_video:
+            self._save_predicted_video()
+        self._video_pred_latents.clear()
+        self._current_prompt = ""
         _reset_model_temporal_state(self._policy)
+
+    def flush_pending_video(self) -> None:
+        self._reset_local_state(save_video=True)
 
     def infer(self, obs: dict[str, Any]) -> np.ndarray:
         session_id = obs.get("session_id")
@@ -346,7 +400,7 @@ class AlohaBimanualPolicy:
             session_id is not None and session_id != self._current_session_id
         )
         if should_reset:
-            self._reset_local_state()
+            self._reset_local_state(save_video=not self._reset_next_infer)
             self._reset_next_infer = False
         if session_id is not None:
             self._current_session_id = str(session_id)
@@ -361,8 +415,10 @@ class AlohaBimanualPolicy:
         batch = Batch(obs=converted_obs)
         dist.barrier()
         with torch.no_grad():
-            result_batch, _ = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
+        if video_pred is not None and self._output_dir:
+            self._video_pred_latents.append(video_pred.detach())
 
         action_dict = _extract_action_dict(result_batch.act)
         action = self._convert_action(action_dict)
@@ -375,7 +431,7 @@ class AlohaBimanualPolicy:
         return action
 
     def reset(self, reset_info: dict[str, Any]) -> None:
-        self._reset_local_state()
+        self._reset_local_state(save_video=True)
         self._reset_next_infer = True
         self._current_session_id = None
         logger.info("policy reset requested with keys=%s", sorted(reset_info.keys()))
@@ -420,12 +476,11 @@ class DistributedWorkerLoop:
             dist.barrier()
 
 
-def _build_output_dir(output_root: str | None, model_path: str) -> str | None:
-    if output_root is None:
-        return None
-    checkpoint_name = Path(model_path.rstrip("/")).name
+def _build_output_dir(output_root: str | None, model_path: str, index: int) -> str:
+    checkpoint_path = Path(model_path.rstrip("/"))
+    output_root_path = Path(output_root) if output_root is not None else checkpoint_path.parent
     timestamp = datetime.datetime.now().strftime("%Y%m%d")
-    output_dir = Path(output_root) / f"aloha_server_{timestamp}" / checkpoint_name
+    output_dir = output_root_path / f"real_world_eval_gen_{timestamp}_{index}" / checkpoint_path.name
     output_dir.mkdir(parents=True, exist_ok=True)
     return str(output_dir)
 
@@ -464,7 +519,7 @@ def main(args: Args) -> None:
         image_height, image_width = _get_expected_video_resolution(policy)
         logger.info("Using checkpoint image resolution %dx%d", image_height, image_width)
 
-    output_dir = _build_output_dir(args.output_root, args.model_path) if rank == 0 else None
+    output_dir = _build_output_dir(args.output_root, args.model_path, args.index) if rank == 0 else None
     if output_dir:
         logger.info("Server outputs will be written under %s", output_dir)
 
@@ -498,6 +553,7 @@ def main(args: Args) -> None:
         try:
             server.serve_forever()
         finally:
+            wrapper_policy.flush_pending_video()
             shutdown_signal = torch.tensor([SHUTDOWN_SIGNAL], dtype=torch.int32, device="cpu")
             dist.broadcast(shutdown_signal, src=0, group=signal_group)
     else:
