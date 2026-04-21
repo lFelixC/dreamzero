@@ -21,11 +21,11 @@ export HYDRA_FULL_ERROR=1
 export SWANLAB_SYNC_WANDB=1      # 让 wandb 日志同时同步到 SwanLab
 export WANDB_MODE=offline        # wandb 本地离线落盘；SwanLab 通过 sync_wandb 接管展示
 
-PER_DEVICE_BS=2                  # 每张 GPU 的 micro-batch；若 OOM，手动改成 16
+PER_DEVICE_BS=4                  # 每张 GPU 的 micro-batch；若 OOM，手动改成 16
 GRAD_ACCUM_STEPS=1               # 梯度累积步数；>1 时会增大全局 batch 而不增加单卡显存
-DEEPSPEED_CFG="zero2"            # ALOHA + DreamZero-AgiBot 更稳的默认值
+DEEPSPEED_CFG="zero2_offload"            # ALOHA + DreamZero-AgiBot 更稳的默认值
 MAX_STEPS=50000                  # 总训练步数
-SAVE_STEPS=1000                  # 每多少步保存一次 checkpoint；减少保存频率更稳
+SAVE_STEPS=500                  # 每多少步保存一次 checkpoint；减少保存频率更稳
 IMAGE_RESOLUTION_WIDTH=320       # 训练输入宽度
 IMAGE_RESOLUTION_HEIGHT=176      # 训练输入高度
 MAX_CHUNK_SIZE=4                 # 数据 chunk 上限
