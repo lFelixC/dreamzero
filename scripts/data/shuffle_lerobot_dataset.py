@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict, deque
+from collections import Counter
 import copy
 from dataclasses import dataclass
 import json
@@ -87,14 +87,14 @@ def parse_args() -> argparse.Namespace:
         "--shuffle-seed",
         type=int,
         default=42,
-        help="Random seed for per-task shuffling and interleaving order (default: 42).",
+        help="Random seed for global episode shuffling (default: 42).",
     )
     parser.add_argument(
         "--strategy",
         type=str,
-        default="task_round_robin",
-        choices=["task_round_robin", "random"],
-        help="Shuffle strategy. task_round_robin is designed to mix tasks across shards.",
+        default="random",
+        choices=["random"],
+        help="Shuffle strategy. Only global random shuffling is supported.",
     )
     parser.add_argument(
         "--video-mode",
@@ -363,37 +363,6 @@ def shuffle_random(episodes: list[EpisodeDescriptor], rng: np.random.Generator) 
     return [episodes[index] for index in permutation.tolist()]
 
 
-def shuffle_task_round_robin(
-    episodes: list[EpisodeDescriptor],
-    rng: np.random.Generator,
-) -> list[EpisodeDescriptor]:
-    buckets: dict[tuple[str, ...], deque[EpisodeDescriptor]] = defaultdict(deque)
-    for episode in episodes:
-        buckets[episode.tasks].append(episode)
-
-    for task_key, bucket in buckets.items():
-        shuffled = [bucket[index] for index in rng.permutation(len(bucket)).tolist()]
-        buckets[task_key] = deque(shuffled)
-
-    active_keys = sorted(buckets, key=lambda key: repr(key))
-    rng.shuffle(active_keys)
-
-    shuffled_plan: list[EpisodeDescriptor] = []
-    while active_keys:
-        round_keys = list(active_keys)
-        rng.shuffle(round_keys)
-        next_active_keys: list[tuple[str, ...]] = []
-        for task_key in round_keys:
-            bucket = buckets[task_key]
-            if not bucket:
-                continue
-            shuffled_plan.append(bucket.popleft())
-            if bucket:
-                next_active_keys.append(task_key)
-        active_keys = next_active_keys
-    return shuffled_plan
-
-
 def shuffle_split(
     episodes: list[EpisodeDescriptor],
     rng: np.random.Generator,
@@ -401,8 +370,6 @@ def shuffle_split(
 ) -> list[EpisodeDescriptor]:
     if strategy == "random":
         return shuffle_random(episodes, rng)
-    if strategy == "task_round_robin":
-        return shuffle_task_round_robin(episodes, rng)
     raise ValueError(f"Unsupported strategy: {strategy}")
 
 

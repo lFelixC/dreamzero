@@ -18,6 +18,13 @@ from tianshou.data import Batch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from eval_utils.torch_compile_backend import configure_torch_compile_backend
+from eval_utils.inference_rtc import (
+    RTCSessionState,
+    compute_prev_chunk_left_over,
+    extract_optional_int,
+    session_key,
+    trim_action_chunk_for_delay,
+)
 from eval_utils.policy_server import PolicyServerConfig, WebsocketPolicyServer
 from eval_utils.serve_dreamzero_wan22 import _get_expected_video_resolution, _resize_frames_to_resolution
 from groot.vla.data.schema import EmbodimentTag
@@ -46,6 +53,12 @@ class Args:
     max_chunk_size: int | None = None
     output_root: str | None = None
     index: int = 0
+    use_rtc: bool = False
+    rtc_execution_horizon: int = 20
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
+    rtc_guidance_max_steps: int = 2
+    rtc_guidance_step_stride: int = 1
 
 
 def _normalize_image_array(data: Any, key: str) -> np.ndarray:
@@ -152,6 +165,9 @@ def _align_rows(arr: np.ndarray, rows: int, key: str) -> np.ndarray:
 
 
 def _reset_model_temporal_state(policy: GrootSimPolicy) -> None:
+    if hasattr(policy, "reset_inference_state"):
+        policy.reset_inference_state()
+        return
     if hasattr(policy.trained_model, "action_head") and hasattr(
         policy.trained_model.action_head, "current_start_frame"
     ):
@@ -196,6 +212,12 @@ class AlohaBimanualPolicy:
         image_width: int,
         output_dir: str | None = None,
         max_chunk_size: int | None = None,
+        use_rtc: bool = False,
+        rtc_execution_horizon: int = 16,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "EXP",
+        rtc_guidance_max_steps: int = 4,
+        rtc_guidance_step_stride: int = 1,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
@@ -203,10 +225,17 @@ class AlohaBimanualPolicy:
         self._image_width = image_width
         self._output_dir = output_dir
         self._max_chunk_size = max_chunk_size
+        self._use_rtc = use_rtc
+        self._rtc_execution_horizon = rtc_execution_horizon
+        self._rtc_max_guidance_weight = rtc_max_guidance_weight
+        self._rtc_prefix_attention_schedule = rtc_prefix_attention_schedule
+        self._rtc_guidance_max_steps = rtc_guidance_max_steps
+        self._rtc_guidance_step_stride = rtc_guidance_step_stride
         self._current_session_id: str | None = None
         self._reset_next_infer = False
         self._video_pred_latents: list[torch.Tensor] = []
         self._current_prompt = ""
+        self._rtc_session_states: dict[str, RTCSessionState] = {}
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
@@ -330,8 +359,14 @@ class AlohaBimanualPolicy:
 
         return np.ascontiguousarray(packed_action.astype(np.float32))
 
-    def _broadcast_batch_to_workers(self, obs: dict[str, Any]) -> None:
-        serialized = pickle.dumps(obs)
+    def _get_session_state(self, session_id: str | None) -> RTCSessionState:
+        key = session_key(session_id)
+        if key not in self._rtc_session_states:
+            self._rtc_session_states[key] = RTCSessionState()
+        return self._rtc_session_states[key]
+
+    def _broadcast_payload_to_workers(self, payload: dict[str, Any]) -> None:
+        serialized = pickle.dumps(payload)
         data_size = len(serialized)
 
         size_tensor = torch.tensor([data_size], dtype=torch.int64, device="cuda")
@@ -392,6 +427,7 @@ class AlohaBimanualPolicy:
             self._save_predicted_video()
         self._video_pred_latents.clear()
         self._current_prompt = ""
+        self._rtc_session_states.clear()
         _reset_model_temporal_state(self._policy)
 
     def flush_pending_video(self) -> None:
@@ -408,23 +444,95 @@ class AlohaBimanualPolicy:
         if session_id is not None:
             self._current_session_id = str(session_id)
 
+        rtc_step_idx = extract_optional_int(obs.get("rtc_step_idx"))
+        rtc_inference_delay_steps = max(
+            extract_optional_int(obs.get("rtc_inference_delay_steps", 0), default=0) or 0,
+            0,
+        )
+        rtc_requested = rtc_step_idx is not None
+        if rtc_inference_delay_steps > 0 and not rtc_requested:
+            logger.warning(
+                "Received rtc_inference_delay_steps=%d without rtc_step_idx; ignoring RTC delay metadata for this call.",
+                rtc_inference_delay_steps,
+            )
+
         converted_obs = self._convert_observation(obs)
         worker_obs = self._set_reset_flag(converted_obs, should_reset)
+        session_state = self._get_session_state(session_id) if rtc_requested else None
+        prev_chunk_left_over_abs = None
+        had_previous_chunk = False
+        model_kwargs: dict[str, Any] = {}
+        if rtc_requested and session_state is not None:
+            had_previous_chunk = session_state.last_action_chunk_abs is not None
+            prev_chunk_left_over_abs = compute_prev_chunk_left_over(session_state, rtc_step_idx)
+            model_kwargs = {
+                "use_rtc": True,
+                "prev_chunk_left_over_abs": prev_chunk_left_over_abs,
+                "inference_delay": rtc_inference_delay_steps,
+                "rtc_execution_horizon": self._rtc_execution_horizon,
+                "rtc_max_guidance_weight": self._rtc_max_guidance_weight,
+                "rtc_prefix_attention_schedule": self._rtc_prefix_attention_schedule,
+                "rtc_guidance_max_steps": self._rtc_guidance_max_steps,
+                "rtc_guidance_step_stride": self._rtc_guidance_step_stride,
+            }
+            if had_previous_chunk:
+                left_over_len = 0 if prev_chunk_left_over_abs is None else int(prev_chunk_left_over_abs.shape[0])
+                logger.info(
+                    "RTC request session=%s step_idx=%d prev_left_over=%d delay=%d",
+                    session_id,
+                    rtc_step_idx,
+                    left_over_len,
+                    rtc_inference_delay_steps,
+                )
 
         signal_tensor = torch.tensor([CONTINUE_SIGNAL], dtype=torch.int32, device="cpu")
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        self._broadcast_batch_to_workers(worker_obs)
+        self._broadcast_payload_to_workers(
+            {
+                "obs": worker_obs,
+                "model_kwargs": model_kwargs,
+            }
+        )
 
         batch = Batch(obs=converted_obs)
         dist.barrier()
         with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
         dist.barrier()
         if video_pred is not None and self._output_dir:
             self._video_pred_latents.append(video_pred.detach())
 
         action_dict = _extract_action_dict(result_batch.act)
         action = self._convert_action(action_dict)
+        if rtc_requested and had_previous_chunk:
+            if rtc_inference_delay_steps >= action.shape[0]:
+                logger.warning(
+                    "RTC inference delay %d exceeds chunk length %d; keeping the final action only.",
+                    rtc_inference_delay_steps,
+                    action.shape[0],
+                )
+            action, applied_delay_steps = trim_action_chunk_for_delay(
+                action,
+                rtc_inference_delay_steps,
+            )
+        else:
+            applied_delay_steps = 0
+
+        if rtc_requested and session_state is not None:
+            session_state.last_action_chunk_abs = action.copy()
+            session_state.request_count += 1
+            session_state.consumed_steps = 0
+            if rtc_step_idx is not None:
+                session_state.chunk_start_step_idx = rtc_step_idx + applied_delay_steps
+            else:
+                session_state.chunk_start_step_idx = None
+            logger.info(
+                "RTC stored executable chunk session=%s len=%d chunk_start_step_idx=%s delay_trim=%d",
+                session_id,
+                action.shape[0],
+                session_state.chunk_start_step_idx,
+                applied_delay_steps,
+            )
         logger.info(
             "infer session_id=%s prompt=%r action_shape=%s",
             self._current_session_id,
@@ -445,15 +553,17 @@ class DistributedWorkerLoop:
         self._policy = policy
         self._signal_group = signal_group
 
-    def _receive_batch_from_rank0(self) -> Batch:
+    def _receive_payload_from_rank0(self) -> tuple[Batch, dict[str, Any]]:
         size_tensor = torch.zeros(1, dtype=torch.int64, device="cuda")
         dist.broadcast(size_tensor, src=0)
         data_size = size_tensor.item()
 
         data_tensor = torch.zeros(data_size, dtype=torch.uint8, device="cuda")
         dist.broadcast(data_tensor, src=0)
-        obs = pickle.loads(data_tensor.cpu().numpy().tobytes())
-        return Batch(obs=obs)
+        payload = pickle.loads(data_tensor.cpu().numpy().tobytes())
+        obs = payload["obs"]
+        model_kwargs = payload.get("model_kwargs", {})
+        return Batch(obs=obs), model_kwargs
 
     async def run_forever(self) -> None:
         logger.info("Worker loop started for rank %d", dist.get_rank())
@@ -468,14 +578,14 @@ class DistributedWorkerLoop:
                 logger.warning("Rank %d received unknown signal %s", dist.get_rank(), signal)
                 continue
 
-            batch = self._receive_batch_from_rank0()
+            batch, model_kwargs = self._receive_payload_from_rank0()
             reset_flag = bool(batch.obs.pop(RESET_FLAG_KEY, False))
             if reset_flag:
                 _reset_model_temporal_state(self._policy)
 
             dist.barrier()
             with torch.no_grad():
-                self._policy.lazy_joint_forward_causal(batch)
+                self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
             dist.barrier()
 
 
@@ -535,6 +645,12 @@ def main(args: Args) -> None:
         image_width=image_width,
         output_dir=output_dir,
         max_chunk_size=args.max_chunk_size,
+        use_rtc=args.use_rtc,
+        rtc_execution_horizon=args.rtc_execution_horizon,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+        rtc_guidance_max_steps=args.rtc_guidance_max_steps,
+        rtc_guidance_step_stride=args.rtc_guidance_step_stride,
     )
 
     server_config = PolicyServerConfig(

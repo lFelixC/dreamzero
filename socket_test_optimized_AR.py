@@ -13,6 +13,13 @@ from einops import rearrange
 import datetime
 
 from eval_utils.torch_compile_backend import configure_torch_compile_backend
+from eval_utils.inference_rtc import (
+    RTCSessionState,
+    compute_prev_chunk_left_over,
+    extract_optional_int,
+    session_key,
+    trim_action_chunk_for_delay,
+)
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema import EmbodimentTag
 import imageio
@@ -33,8 +40,10 @@ from eval_utils.serve_dreamzero_wan22 import (
     _get_expected_video_resolution,
     _resize_frames_to_resolution,
 )
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
+RESET_FLAG_KEY = "__reset_policy_state__"
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,12 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    use_rtc: bool = False
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
+    rtc_guidance_max_steps: int = 4
+    rtc_guidance_step_stride: int = 1
 
 
 class ARDroidRoboarenaPolicy:
@@ -69,12 +84,24 @@ class ARDroidRoboarenaPolicy:
         image_height: int,
         image_width: int,
         output_dir: str | None = None,
+        use_rtc: bool = False,
+        rtc_execution_horizon: int = 10,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "EXP",
+        rtc_guidance_max_steps: int = 4,
+        rtc_guidance_step_stride: int = 1,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._image_height = image_height
         self._image_width = image_width
         self._output_dir = output_dir
+        self._use_rtc = use_rtc
+        self._rtc_execution_horizon = rtc_execution_horizon
+        self._rtc_max_guidance_weight = rtc_max_guidance_weight
+        self._rtc_prefix_attention_schedule = rtc_prefix_attention_schedule
+        self._rtc_guidance_max_steps = rtc_guidance_max_steps
+        self._rtc_guidance_step_stride = rtc_guidance_step_stride
         
         # Frame buffers for accumulation (per camera view)
         self._frame_buffers: dict[str, list[np.ndarray]] = {
@@ -88,6 +115,7 @@ class ARDroidRoboarenaPolicy:
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
         self._warned_single_external_fallback = False
+        self._rtc_session_states: dict[str, RTCSessionState] = {}
         
         # Video across time for saving (similar to original server)
         self.video_across_time = []
@@ -96,6 +124,13 @@ class ARDroidRoboarenaPolicy:
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+
+    def _infer_phase(self, rtc_requested: bool, had_previous_chunk: bool) -> str:
+        if not rtc_requested:
+            return "rtc_off_first" if self._is_first_call else "rtc_off_steady"
+        if had_previous_chunk:
+            return "rtc_on_steady"
+        return "rtc_on_first_chunk"
 
     @staticmethod
     def _normalize_image_array(data: np.ndarray, key: str) -> np.ndarray:
@@ -149,6 +184,9 @@ class ARDroidRoboarenaPolicy:
             return action_dict
 
     def _reset_model_temporal_state(self) -> None:
+        if hasattr(self._policy, "reset_inference_state"):
+            self._policy.reset_inference_state()
+            return
         if hasattr(self._policy.trained_model, "action_head") and hasattr(
             self._policy.trained_model.action_head, "current_start_frame"
         ):
@@ -316,21 +354,32 @@ class ARDroidRoboarenaPolicy:
         
         return action
     
-    def _broadcast_batch_to_workers(self, obs: dict) -> None:
-        """Broadcast batch data from rank 0 to all other ranks."""
+    def _get_session_state(self, session_id: str | None) -> RTCSessionState:
+        key = session_key(session_id)
+        if key not in self._rtc_session_states:
+            self._rtc_session_states[key] = RTCSessionState()
+        return self._rtc_session_states[key]
+
+    def _broadcast_payload_to_workers(self, payload: dict, phase: str = "unknown") -> None:
+        """Broadcast batch data plus model kwargs from rank 0 to all other ranks."""
         import pickle
-        
-        # Serialize the obs
-        serialized = pickle.dumps(obs)
-        data_size = len(serialized)
-        
-        # Broadcast size first
-        size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
-        dist.broadcast(size_tensor, src=0)
-        
-        # Broadcast data
-        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
-        dist.broadcast(data_tensor, src=0)
+
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].pickle_payload"):
+            serialized = pickle.dumps(payload)
+            data_size = len(serialized)
+
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_broadcast.size"):
+            size_tensor = torch.tensor([data_size], dtype=torch.int64, device="cuda")
+            dist.broadcast(size_tensor, src=0)
+
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_broadcast.payload"):
+            data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
+            dist.broadcast(data_tensor, src=0)
+
+    def _set_reset_flag(self, converted_obs: dict, should_reset: bool) -> dict:
+        worker_obs = dict(converted_obs)
+        worker_obs[RESET_FLAG_KEY] = bool(should_reset)
+        return worker_obs
     
     def infer(self, obs: dict) -> np.ndarray:
         """Infer actions from observations.
@@ -343,43 +392,129 @@ class ARDroidRoboarenaPolicy:
         """
         # Check for session change - reset state if new session
         session_id = obs.get("session_id", None)
-        if session_id is not None and session_id != self._current_session_id:
+        should_reset = session_id is not None and session_id != self._current_session_id
+        if should_reset:
             if self._current_session_id is not None:
                 logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
                 # Reset state for new session
-                self._reset_state()
+                with nvtx_range("dreamzero.ar.reset.on_session_change"):
+                    self._reset_state()
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
+
+        rtc_step_idx = extract_optional_int(obs.get("rtc_step_idx", None))
+        rtc_inference_delay_steps = max(
+            extract_optional_int(obs.get("rtc_inference_delay_steps", 0), default=0) or 0,
+            0,
+        )
+        rtc_requested = rtc_step_idx is not None
+        if rtc_inference_delay_steps > 0 and not rtc_requested:
+            logger.warning(
+                "Received rtc_inference_delay_steps=%d without rtc_step_idx; ignoring RTC delay metadata for this call.",
+                rtc_inference_delay_steps,
+            )
         
         self._msg_index += 1
         self._call_count += 1
         
-        # Convert observation format
-        converted_obs = self._convert_observation(obs)
-        
-        # Signal workers to continue (0 = continue)
-        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
-        # Broadcast obs to workers
-        self._broadcast_batch_to_workers(converted_obs)
-        
-        # Create batch for policy
-        batch = Batch(obs=converted_obs)
-        
-        # Distributed forward pass
-        dist.barrier()
-        with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-        dist.barrier()
-        
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
-        
-        # Extract and convert action
-        action_dict = self._extract_action_dict(result_batch.act)
-        action = self._convert_action(action_dict)
+        session_state = self._get_session_state(session_id) if rtc_requested else None
+        had_previous_chunk = bool(
+            rtc_requested and session_state is not None and session_state.last_action_chunk_abs is not None
+        )
+        phase = self._infer_phase(rtc_requested, had_previous_chunk)
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].total"):
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].rtc_request_prepare"):
+                prev_chunk_left_over_abs = None
+                model_kwargs: dict[str, object] = {}
+                if rtc_requested and session_state is not None:
+                    prev_chunk_left_over_abs = compute_prev_chunk_left_over(session_state, rtc_step_idx)
+                    model_kwargs = {
+                        "use_rtc": True,
+                        "prev_chunk_left_over_abs": prev_chunk_left_over_abs,
+                        "inference_delay": rtc_inference_delay_steps,
+                        "rtc_execution_horizon": self._rtc_execution_horizon,
+                        "rtc_max_guidance_weight": self._rtc_max_guidance_weight,
+                        "rtc_prefix_attention_schedule": self._rtc_prefix_attention_schedule,
+                        "rtc_guidance_max_steps": self._rtc_guidance_max_steps,
+                        "rtc_guidance_step_stride": self._rtc_guidance_step_stride,
+                    }
+                    if had_previous_chunk:
+                        left_over_len = 0 if prev_chunk_left_over_abs is None else int(prev_chunk_left_over_abs.shape[0])
+                        logger.info(
+                            "RTC request session=%s step_idx=%d prev_left_over=%d delay=%d",
+                            session_id,
+                            rtc_step_idx,
+                            left_over_len,
+                            rtc_inference_delay_steps,
+                        )
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].convert_observation"):
+                converted_obs = self._convert_observation(obs)
+                worker_obs = self._set_reset_flag(converted_obs, should_reset)
+
+            # Signal workers to continue (0 = continue)
+            signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_broadcast.signal"):
+                dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+
+            # Broadcast obs and model kwargs to workers
+            self._broadcast_payload_to_workers(
+                {
+                    "obs": worker_obs,
+                    "model_kwargs": model_kwargs,
+                },
+                phase=phase,
+            )
+
+            # Create batch for policy
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].batch_build"):
+                batch = Batch(obs=converted_obs)
+
+            # Distributed forward pass
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_barrier.pre_forward"):
+                dist.barrier()
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].policy_forward"):
+                with torch.no_grad():
+                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_barrier.post_forward"):
+                dist.barrier()
+
+            # Store video predictions for potential saving
+            self.video_across_time.append(video_pred)
+
+            # Extract and convert action
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].action_postprocess"):
+                action_dict = self._extract_action_dict(result_batch.act)
+                action = self._convert_action(action_dict)
+                if rtc_requested and had_previous_chunk:
+                    if rtc_inference_delay_steps >= action.shape[0]:
+                        logger.warning(
+                            "RTC inference delay %d exceeds chunk length %d; keeping the final action only.",
+                            rtc_inference_delay_steps,
+                            action.shape[0],
+                        )
+                    action, applied_delay_steps = trim_action_chunk_for_delay(
+                        action,
+                        rtc_inference_delay_steps,
+                    )
+                else:
+                    applied_delay_steps = 0
+
+                if rtc_requested and session_state is not None:
+                    session_state.last_action_chunk_abs = action.copy()
+                    session_state.request_count += 1
+                    session_state.consumed_steps = 0
+                    if rtc_step_idx is not None:
+                        session_state.chunk_start_step_idx = rtc_step_idx + applied_delay_steps
+                    else:
+                        session_state.chunk_start_step_idx = None
+                    logger.info(
+                        "RTC stored executable chunk session=%s len=%d chunk_start_step_idx=%s delay_trim=%d",
+                        session_id,
+                        action.shape[0],
+                        session_state.chunk_start_step_idx,
+                        applied_delay_steps,
+                    )
         
         # Update first call flag
         if self._is_first_call:
@@ -393,47 +528,50 @@ class ARDroidRoboarenaPolicy:
         Args:
             save_video: Whether to save accumulated video before reset.
         """
-        # Optionally save accumulated video before reset
-        if save_video and len(self.video_across_time) > 0 and self._output_dir:
-            try:
-                frame_list = []
-                video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                frames = self._policy.trained_model.action_head.vae.decode(
-                    video_across_time_cat,
-                    tiled=self._policy.trained_model.action_head.tiled,
-                    tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                    tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                )
-                frames = rearrange(frames, "B C T H W -> B T H W C")
-                frames = frames[0]
-                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                for frame in frames:
-                    frame_list.append(frame)
-                
-                if len(frame_list) > 0:
-                    sample_frame = frame_list[0]
-                    if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                        save_dir = self._output_dir
-                        os.makedirs(save_dir, exist_ok=True)
-                        all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                        num_frames = len(frame_list)
-                        n = (num_frames - 1) // 8
-                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                        imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                        logger.info(f"Saved video on reset to: {output_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save video on reset: {e}")
-        
-        # Clear frame buffers
-        for key in self._frame_buffers:
-            self._frame_buffers[key] = []
-        
-        self._call_count = 0
-        self._is_first_call = True
-        self.video_across_time = []
-        self._warned_single_external_fallback = False
-        self._reset_model_temporal_state()
+        with nvtx_range("dreamzero.ar.reset.total"):
+            # Optionally save accumulated video before reset
+            if save_video and len(self.video_across_time) > 0 and self._output_dir:
+                with nvtx_range("dreamzero.ar.reset.video_decode_save"):
+                    try:
+                        frame_list = []
+                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
+                        frames = self._policy.trained_model.action_head.vae.decode(
+                            video_across_time_cat,
+                            tiled=self._policy.trained_model.action_head.tiled,
+                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
+                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                        )
+                        frames = rearrange(frames, "B C T H W -> B T H W C")
+                        frames = frames[0]
+                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                        for frame in frames:
+                            frame_list.append(frame)
+
+                        if len(frame_list) > 0:
+                            sample_frame = frame_list[0]
+                            if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
+                                save_dir = self._output_dir
+                                os.makedirs(save_dir, exist_ok=True)
+                                all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
+                                timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+                                num_frames = len(frame_list)
+                                n = (num_frames - 1) // 8
+                                output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
+                                imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
+                                logger.info(f"Saved video on reset to: {output_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save video on reset: {e}")
+
+            with nvtx_range("dreamzero.ar.reset.state_clear"):
+                for key in self._frame_buffers:
+                    self._frame_buffers[key] = []
+
+                self._call_count = 0
+                self._is_first_call = True
+                self.video_across_time = []
+                self._warned_single_external_fallback = False
+                self._rtc_session_states.clear()
+                self._reset_model_temporal_state()
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
@@ -470,6 +608,10 @@ class WebsocketPolicyServer:
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
             os.makedirs(os.path.join(self._output_dir, "inputs"), exist_ok=True)
+
+    def _reset_policy_temporal_state(self) -> None:
+        if hasattr(self._policy, "reset_inference_state"):
+            self._policy.reset_inference_state()
     
     def _save_input_obs(self, obs: dict) -> None:
         """Save incoming observation images per message.
@@ -569,7 +711,8 @@ class WebsocketPolicyServer:
                 # Create a dummy obs dict structure - will be filled by broadcast
                 # obs = {}
 
-                dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+                with nvtx_range("dreamzero.ar.worker.dist_broadcast.signal"):
+                    dist.broadcast(signal_tensor, src=0, group=self._signal_group)
 
                 signal = signal_tensor.item()
                 if signal == 1:
@@ -584,12 +727,20 @@ class WebsocketPolicyServer:
 
                 # Receive the batch data via broadcast/gather mechanism
                 # This is a simplified version - the actual obs structure needs to be broadcasted
-                batch = self._receive_batch_from_rank0()
+                with nvtx_range("dreamzero.ar.worker.receive_payload"):
+                    batch, model_kwargs = self._receive_batch_from_rank0()
+                reset_flag = bool(batch.obs.pop(RESET_FLAG_KEY, False))
+                if reset_flag:
+                    with nvtx_range("dreamzero.ar.worker.reset_state"):
+                        self._reset_policy_temporal_state()
                 # Participate in distributed forward pass
-                dist.barrier()
-                with torch.no_grad():
-                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-                dist.barrier()
+                with nvtx_range("dreamzero.ar.worker.dist_barrier.pre_forward"):
+                    dist.barrier()
+                with nvtx_range("dreamzero.ar.worker.policy_forward"):
+                    with torch.no_grad():
+                        result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
+                with nvtx_range("dreamzero.ar.worker.dist_barrier.post_forward"):
+                    dist.barrier()
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
@@ -597,28 +748,36 @@ class WebsocketPolicyServer:
                 break
 
     def _receive_batch_from_rank0(self):
-        """Receive batch data from rank 0 using torch.distributed primitives."""
+        """Receive batch data plus model kwargs from rank 0 using torch.distributed primitives."""
         import pickle
 
         # Receive the size of the pickled data first
-        size_tensor = torch.zeros(1, dtype=torch.int64, device='cuda')
-        dist.broadcast(size_tensor, src=0)
-        data_size = size_tensor.item()
+        with nvtx_range("dreamzero.ar.worker.dist_broadcast.size"):
+            size_tensor = torch.zeros(1, dtype=torch.int64, device='cuda')
+            dist.broadcast(size_tensor, src=0)
+            data_size = size_tensor.item()
 
         # Receive the actual data
-        data_tensor = torch.zeros(data_size, dtype=torch.uint8, device='cuda')
-        dist.broadcast(data_tensor, src=0)
+        with nvtx_range("dreamzero.ar.worker.dist_broadcast.payload"):
+            data_tensor = torch.zeros(data_size, dtype=torch.uint8, device='cuda')
+            dist.broadcast(data_tensor, src=0)
 
         # Deserialize
-        obs = pickle.loads(data_tensor.cpu().numpy().tobytes())
-        return Batch(obs=obs)
+        with nvtx_range("dreamzero.ar.worker.unpickle_payload"):
+            payload = pickle.loads(data_tensor.cpu().numpy().tobytes())
+        if isinstance(payload, dict) and "obs" in payload:
+            obs = payload["obs"]
+            model_kwargs = payload.get("model_kwargs", {})
+        else:
+            obs = payload
+            model_kwargs = {}
+        return Batch(obs=obs), model_kwargs
 
-    def _broadcast_batch_to_workers(self, obs):
+    def _broadcast_batch_to_workers(self, payload):
         """Broadcast batch data from rank 0 to all other ranks."""
         import pickle
 
-        # Serialize the obs
-        serialized = pickle.dumps(obs)
+        serialized = pickle.dumps(payload)
         data_size = len(serialized)
 
         # Broadcast size first
@@ -841,19 +1000,22 @@ def main(args: Args) -> None:
         "model_path": model_path,
     }
 
-    device_mesh = init_mesh()
+    with nvtx_range("dreamzero.ar.init.mesh"):
+        device_mesh = init_mesh()
     rank = dist.get_rank()
 
     timeout_delta = datetime.timedelta(seconds=args.timeout_seconds)
-    signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
+    with nvtx_range("dreamzero.ar.init.signal_group"):
+        signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
     logger.info(f"Rank {rank} initialized signal_group (gloo)")
 
-    policy = GrootSimPolicy(
-        embodiment_tag=EmbodimentTag(embodiment_tag),
-        model_path=model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        device_mesh=device_mesh,
-    )
+    with nvtx_range("dreamzero.ar.init.policy_load"):
+        policy = GrootSimPolicy(
+            embodiment_tag=EmbodimentTag(embodiment_tag),
+            model_path=model_path,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            device_mesh=device_mesh,
+        )
     image_height, image_width = _get_expected_video_resolution(policy)
     logger.info("Using checkpoint image resolution %dx%d", image_height, image_width)
 
@@ -876,13 +1038,20 @@ def main(args: Args) -> None:
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
     # Create wrapper policy that converts between roboarena and AR_droid formats
-    wrapper_policy = ARDroidRoboarenaPolicy(
-        groot_policy=policy,
-        signal_group=signal_group,
-        image_height=image_height,
-        image_width=image_width,
-        output_dir=output_dir,
-    )
+    with nvtx_range("dreamzero.ar.init.wrapper_policy"):
+        wrapper_policy = ARDroidRoboarenaPolicy(
+            groot_policy=policy,
+            signal_group=signal_group,
+            image_height=image_height,
+            image_width=image_width,
+            output_dir=output_dir,
+            use_rtc=args.use_rtc,
+            rtc_execution_horizon=args.rtc_execution_horizon,
+            rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+            rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+            rtc_guidance_max_steps=args.rtc_guidance_max_steps,
+            rtc_guidance_step_stride=args.rtc_guidance_step_stride,
+        )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
     server_config = PolicyServerConfig(

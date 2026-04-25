@@ -69,6 +69,7 @@ from eval_utils.policy_server import WebsocketPolicyServer, PolicyServerConfig
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema import EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 
 # DreamZero Wan 5B is trained with 160×320 (droid_relative_wan22). Fallback if we cannot read from policy.
@@ -176,6 +177,9 @@ class DreamZeroWan225BPolicy(BasePolicy):
         self._video_pred_latents: list[torch.Tensor] = []
         self._current_prompt: str = ""
 
+    def _request_phase(self) -> str:
+        return "first" if self._is_first_call else "steady"
+
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to model Batch format.
         Incoming frames are resized to the policy's expected (height, width) so
@@ -263,21 +267,28 @@ class DreamZeroWan225BPolicy(BasePolicy):
         session_id = obs.get("session_id")
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
-                self.reset({})
+                with nvtx_range("dreamzero.simple.reset.on_session_change"):
+                    self.reset({})
             self._current_session_id = session_id
-
-        converted_obs = self._convert_observation(obs)
-        batch = Batch(obs=converted_obs)
-        with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-        if self._save_video_pred and video_pred is not None:
-            self._video_pred_latents.append(video_pred.detach())
-        action_dict = {}
-        action_chunk_dict = result_batch.act
-        for k in dir(action_chunk_dict):
-            if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
-        action = self._convert_action(action_dict)
+        phase = self._request_phase()
+        with nvtx_range(f"dreamzero.simple.infer[{phase}].total"):
+            with nvtx_range(f"dreamzero.simple.infer[{phase}].observation_preprocess"):
+                converted_obs = self._convert_observation(obs)
+            with nvtx_range(f"dreamzero.simple.infer[{phase}].batch_build"):
+                batch = Batch(obs=converted_obs)
+            with nvtx_range(f"dreamzero.simple.infer[{phase}].policy_forward"):
+                with torch.no_grad():
+                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            if self._save_video_pred and video_pred is not None:
+                with nvtx_range(f"dreamzero.simple.infer[{phase}].video_pred_buffer"):
+                    self._video_pred_latents.append(video_pred.detach())
+            with nvtx_range(f"dreamzero.simple.infer[{phase}].action_postprocess"):
+                action_dict = {}
+                action_chunk_dict = result_batch.act
+                for k in dir(action_chunk_dict):
+                    if k.startswith("action."):
+                        action_dict[k] = getattr(action_chunk_dict, k)
+                action = self._convert_action(action_dict)
         if self._is_first_call:
             self._is_first_call = False
         return action
@@ -286,53 +297,56 @@ class DreamZeroWan225BPolicy(BasePolicy):
         """Decode accumulated video prediction latents through the VAE and save as mp4."""
         if not self._video_pred_latents:
             return
-        try:
-            from einops import rearrange
+        with nvtx_range("dreamzero.simple.reset.video_decode_save"):
+            try:
+                from einops import rearrange
 
-            action_head = self._policy.trained_model.action_head
-            latents = torch.cat(self._video_pred_latents, dim=2)
-            with torch.no_grad():
-                frames = action_head.vae.decode(
-                    latents,
-                    tiled=action_head.tiled,
-                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
-                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+                action_head = self._policy.trained_model.action_head
+                latents = torch.cat(self._video_pred_latents, dim=2)
+                with torch.no_grad():
+                    frames = action_head.vae.decode(
+                        latents,
+                        tiled=action_head.tiled,
+                        tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                        tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+                    )
+                frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+
+                os.makedirs(self._video_output_dir, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+                n_latent_frames = latents.shape[2]
+                existing = [f for f in os.listdir(self._video_output_dir) if f.endswith(".mp4")]
+                safe_prompt = self._current_prompt.replace(" ", "_")
+                safe_prompt = "".join(c for c in safe_prompt if c.isalnum() or c in "_-.")
+                if len(safe_prompt) > 80:
+                    safe_prompt = safe_prompt[:80]
+                if not safe_prompt:
+                    safe_prompt = "no_prompt"
+                output_path = os.path.join(
+                    self._video_output_dir,
+                    f"{len(existing):06}_{safe_prompt}_{timestamp}.mp4",
                 )
-            frames = rearrange(frames, "B C T H W -> B T H W C")[0]
-            frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-
-            os.makedirs(self._video_output_dir, exist_ok=True)
-            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-            n_latent_frames = latents.shape[2]
-            existing = [f for f in os.listdir(self._video_output_dir) if f.endswith(".mp4")]
-            safe_prompt = self._current_prompt.replace(" ", "_")
-            safe_prompt = "".join(c for c in safe_prompt if c.isalnum() or c in "_-.")
-            if len(safe_prompt) > 80:
-                safe_prompt = safe_prompt[:80]
-            if not safe_prompt:
-                safe_prompt = "no_prompt"
-            output_path = os.path.join(
-                self._video_output_dir,
-                f"{len(existing):06}_{safe_prompt}_{timestamp}.mp4",
-            )
-            imageio.mimsave(output_path, list(frames), fps=5, codec="libx264")
-            logger.info("Saved video prediction (%d frames) to %s", len(frames), output_path)
-        except Exception as e:
-            logger.warning("Failed to save video prediction: %s", e)
+                imageio.mimsave(output_path, list(frames), fps=5, codec="libx264")
+                logger.info("Saved video prediction (%d frames) to %s", len(frames), output_path)
+            except Exception as e:
+                logger.warning("Failed to save video prediction: %s", e)
 
     def reset(self, reset_info: dict) -> None:
-        if self._save_video_pred:
-            self._save_predicted_video()
-        self._video_pred_latents.clear()
-        self._current_prompt = ""
-        for key in self._frame_buffers:
-            self._frame_buffers[key] = []
-        self._is_first_call = True
-        self._current_session_id = None
-        if hasattr(self._policy.trained_model, "action_head") and hasattr(
-            self._policy.trained_model.action_head, "current_start_frame"
-        ):
-            self._policy.trained_model.action_head.current_start_frame = 0
+        with nvtx_range("dreamzero.simple.reset.total"):
+            if self._save_video_pred:
+                self._save_predicted_video()
+            with nvtx_range("dreamzero.simple.reset.state_clear"):
+                self._video_pred_latents.clear()
+                self._current_prompt = ""
+                for key in self._frame_buffers:
+                    self._frame_buffers[key] = []
+                self._is_first_call = True
+                self._current_session_id = None
+                if hasattr(self._policy.trained_model, "action_head") and hasattr(
+                    self._policy.trained_model.action_head, "current_start_frame"
+                ):
+                    self._policy.trained_model.action_head.current_start_frame = 0
 
 
 def main(
@@ -351,19 +365,21 @@ def main(
     if DEFAULT_TORCH_COMPILE_BACKEND is not None:
         logger.info("Using torch.compile backend=%s for this entrypoint", DEFAULT_TORCH_COMPILE_BACKEND)
 
-    _maybe_init_distributed()
-    device_mesh = init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
+    with nvtx_range("dreamzero.simple.init.distributed"):
+        _maybe_init_distributed()
+        device_mesh = init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
 
     logger.info("Loading DreamZero Wan22 policy from %s (embodiment=%s)", model_path, embodiment_tag)
     checkpoint_name = os.path.basename(model_path.rstrip("/"))
     video_output_dir = os.path.join(video_output_dir, checkpoint_name)
-    policy = GrootSimPolicy(
-        embodiment_tag=EmbodimentTag(embodiment_tag),
-        model_path=model_path,
-        tokenizer_path_override=tokenizer_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        device_mesh=device_mesh,
-    )
+    with nvtx_range("dreamzero.simple.init.policy_load"):
+        policy = GrootSimPolicy(
+            embodiment_tag=EmbodimentTag(embodiment_tag),
+            model_path=model_path,
+            tokenizer_path_override=tokenizer_path,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            device_mesh=device_mesh,
+        )
     if image_height is not None and image_width is not None:
         h, w = image_height, image_width
         logger.info("Using CLI video resolution: %dx%d", h, w)

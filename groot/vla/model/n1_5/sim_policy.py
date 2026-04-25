@@ -16,7 +16,13 @@ import tree
 import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
-from groot.vla.data.transform import ComposedModalityTransform
+from groot.vla.data.transform import (
+    ComposedModalityTransform,
+    ConcatTransform,
+    StateActionToTensor,
+    StateActionTransform,
+)
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 
 class ModelManager:
@@ -606,6 +612,202 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         batch.act = unnormalized_action
         return batch
 
+    def _get_eval_transform_step(
+        self,
+        step_type: type,
+        predicate: Callable[[Any], bool] | None = None,
+    ) -> Any | None:
+        for transform in self.eval_transform.transforms:
+            if not isinstance(transform, step_type):
+                continue
+            if predicate is None or predicate(transform):
+                return transform
+        return None
+
+    def _get_last_state_for_key(self, obs: dict, key: str) -> np.ndarray | None:
+        state_key = f"state.{key}"
+        last_state = None
+
+        if state_key in obs:
+            last_state = obs[state_key]
+        else:
+            for obs_key, obs_value in obs.items():
+                if "state" in obs_key and key in obs_key:
+                    last_state = obs_value
+                    break
+
+            if last_state is None and "state" in obs:
+                state_data = obs["state"]
+                if isinstance(state_data, (torch.Tensor, np.ndarray)) and state_data.shape[-1] >= 1:
+                    last_state = state_data
+
+        if last_state is None:
+            return None
+
+        if torch.is_tensor(last_state):
+            last_state = last_state.detach().cpu().numpy()
+        else:
+            last_state = np.asarray(last_state)
+
+        if last_state.ndim >= 2:
+            last_state = last_state[..., -1, :]
+
+        return np.asarray(last_state, dtype=np.float32)
+
+    def _prepare_rtc_prev_chunk_left_over(
+        self,
+        prev_chunk_left_over_abs: np.ndarray | torch.Tensor | None,
+        obs: dict,
+    ) -> torch.Tensor | None:
+        if prev_chunk_left_over_abs is None:
+            return None
+
+        left_over = prev_chunk_left_over_abs
+        if torch.is_tensor(left_over):
+            left_over = left_over.detach().cpu().numpy()
+        left_over = np.asarray(left_over, dtype=np.float32)
+
+        if left_over.size == 0:
+            return None
+        if left_over.ndim == 3:
+            if left_over.shape[0] != 1:
+                raise ValueError(
+                    "RTC prev_chunk_left_over currently only supports batch size 1 "
+                    f"for websocket inference, got shape {left_over.shape}."
+                )
+            left_over = left_over[0]
+        if left_over.ndim != 2:
+            raise ValueError(
+                "RTC prev_chunk_left_over must be a 2D or batch-1 3D array in absolute action space, "
+                f"got {left_over.shape}."
+            )
+
+        concat_transform = self._get_eval_transform_step(
+            ConcatTransform,
+            lambda transform: transform.action_concat_order is not None,
+        )
+        if concat_transform is None or concat_transform.action_concat_order is None:
+            raise ValueError("Failed to build RTC model-space prefix: missing action concat transform.")
+
+        action_specs: list[tuple[str, int]] = []
+        total_action_dim = 0
+        for action_key in concat_transform.action_concat_order:
+            action_dim = int(concat_transform.get_state_action_dims(action_key))
+            action_specs.append((action_key, action_dim))
+            total_action_dim += action_dim
+
+        if left_over.shape[1] < total_action_dim:
+            raise ValueError(
+                "RTC prev_chunk_left_over absolute action dim is smaller than the concat action dim: "
+                f"{left_over.shape[1]} < {total_action_dim}."
+            )
+
+        relative_action = bool(self.train_cfg.get("relative_action", False))
+        relative_action_per_horizon = bool(self.train_cfg.get("relative_action_per_horizon", False))
+        relative_action_keys = set(self.train_cfg.get("relative_action_keys", []))
+
+        action_dict: dict[str, Any] = {}
+        start_dim = 0
+        for action_key, action_dim in action_specs:
+            end_dim = start_dim + action_dim
+            action_value = left_over[:, start_dim:end_dim].copy()
+            start_dim = end_dim
+
+            subkey = action_key.split(".", 1)[-1]
+            if (relative_action or relative_action_per_horizon) and subkey in relative_action_keys:
+                last_state = self._get_last_state_for_key(obs, subkey)
+                if last_state is not None:
+                    last_state = np.asarray(last_state, dtype=np.float32).reshape(-1)
+                    if last_state.shape[0] != action_dim:
+                        raise ValueError(
+                            f"RTC state/action dim mismatch for {subkey}: "
+                            f"state {last_state.shape[0]} vs action {action_dim}."
+                        )
+                    action_value = action_value - last_state.reshape(1, -1)
+
+            action_dict[action_key] = action_value
+
+        action_to_tensor = self._get_eval_transform_step(
+            StateActionToTensor,
+            lambda transform: any(key.startswith("action.") for key in transform.apply_to),
+        )
+        action_transform = self._get_eval_transform_step(
+            StateActionTransform,
+            lambda transform: any(key.startswith("action.") for key in transform.apply_to),
+        )
+        dream_transform = next(
+            (transform for transform in self.eval_transform.transforms if hasattr(transform, "_prepare_action")),
+            None,
+        )
+
+        if action_to_tensor is not None:
+            action_dict = action_to_tensor.apply(action_dict)
+        if action_transform is not None:
+            action_dict = action_transform.apply(action_dict)
+        action_dict = concat_transform.apply(action_dict)
+
+        if "action" not in action_dict:
+            raise ValueError("Failed to build RTC model-space prefix: action concat transform did not produce 'action'.")
+
+        action = action_dict["action"]
+        if torch.is_tensor(action):
+            action_array = action.detach().cpu().numpy()
+        else:
+            action_array = np.asarray(action)
+
+        if action_array.ndim == 3:
+            if action_array.shape[0] != 1:
+                raise ValueError(
+                    "RTC model-space prefix currently only supports batch size 1 for websocket inference, "
+                    f"got action shape {action_array.shape}."
+                )
+            action_array = action_array[0]
+        if action_array.ndim != 2:
+            raise ValueError(
+                "RTC model-space prefix must be 2D after concat transform, "
+                f"got action shape {action_array.shape}."
+            )
+
+        target_action_dim = None
+        if dream_transform is not None and hasattr(dream_transform, "max_action_dim"):
+            target_action_dim = int(dream_transform.max_action_dim)
+        else:
+            action_head = getattr(self.trained_model, "action_head", None)
+            if action_head is not None:
+                target_action_dim = getattr(getattr(action_head, "config", None), "action_dim", None)
+                if target_action_dim is None and hasattr(action_head, "model"):
+                    target_action_dim = getattr(action_head.model, "action_dim", None)
+
+        action_array = np.asarray(action_array, dtype=np.float32)
+        if target_action_dim is not None:
+            target_action_dim = int(target_action_dim)
+            if action_array.shape[1] > target_action_dim:
+                raise ValueError(
+                    f"RTC model-space prefix dim {action_array.shape[1]} exceeds target action dim {target_action_dim}."
+                )
+            if action_array.shape[1] < target_action_dim:
+                action_array = np.pad(
+                    action_array,
+                    ((0, 0), (0, target_action_dim - action_array.shape[1])),
+                    mode="constant",
+                )
+
+        return torch.from_numpy(action_array)
+
+    def reset_inference_state(self) -> None:
+        action_head = getattr(self.trained_model, "action_head", None)
+        if action_head is None:
+            return
+
+        if hasattr(action_head, "reset_inference_state"):
+            action_head.reset_inference_state()
+            return
+
+        if hasattr(action_head, "current_start_frame"):
+            action_head.current_start_frame = 0
+        if hasattr(action_head, "language"):
+            action_head.language = None
+
     def forward(self, batch, state=None, **kwargs):
         
         # 1. Check if input is batched and add batch dimension if needed
@@ -692,8 +894,9 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             original_obs_for_relative = unsqueeze_dict_values(original_obs_for_relative)
 
         # 2. Apply transforms/normalization
-        batch = self.apply(batch)
-        normalized_input = batch.normalized_obs
+        with nvtx_range("dreamzero.policy.lazy_joint_forward_causal.transform"):
+            batch = self.apply(batch)
+            normalized_input = batch.normalized_obs
 
         transform_time = time.perf_counter() - transform_start_time
 
@@ -712,26 +915,48 @@ class GrootSimPolicy(BaseGrootSimPolicy):
 
         model_start_time = time.perf_counter()
 
+        model_kwargs = dict(kwargs)
+        prev_chunk_left_over_abs = model_kwargs.pop("prev_chunk_left_over_abs", None)
+        if model_kwargs.get("use_rtc", False):
+            prev_chunk_left_over = self._prepare_rtc_prev_chunk_left_over(
+                prev_chunk_left_over_abs,
+                original_obs_for_relative,
+            )
+            if prev_chunk_left_over is not None and not is_batched:
+                prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+            model_kwargs["prev_chunk_left_over"] = prev_chunk_left_over
+
+        use_rtc_grad_path = bool(
+            model_kwargs.get("use_rtc", False) and model_kwargs.get("prev_chunk_left_over") is not None
+        )
+        model_context = torch.no_grad if use_rtc_grad_path else torch.inference_mode
+
         # 3. Model inference
-        with torch.inference_mode():
-            # with maybe_autocast:
-            model_pred = self.trained_model.lazy_joint_video_action_causal(normalized_input, latent_video=latent_video)
-        normalized_action = model_pred["action_pred"].float()
-        video_pred = model_pred["video_pred"]
+        with nvtx_range("dreamzero.policy.lazy_joint_forward_causal.model"):
+            with model_context():
+                # with maybe_autocast:
+                model_pred = self.trained_model.lazy_joint_video_action_causal(
+                    normalized_input,
+                    latent_video=latent_video,
+                    **model_kwargs,
+                )
+            normalized_action = model_pred["action_pred"].float()
+            video_pred = model_pred["video_pred"]
 
         model_time = time.perf_counter() - model_start_time
 
         untransform_start_time = time.perf_counter()
 
         # 4. Unnormalize actions (pass obs for relative action conversion)
-        if not video_only:
-            batch = self.unapply(Batch(normalized_action=normalized_action), obs=original_obs_for_relative)
-        else:
-            batch = Batch(normalized_action=normalized_action)
+        with nvtx_range("dreamzero.policy.lazy_joint_forward_causal.untransform"):
+            if not video_only:
+                batch = self.unapply(Batch(normalized_action=normalized_action), obs=original_obs_for_relative)
+            else:
+                batch = Batch(normalized_action=normalized_action)
 
-        # 5. Remove batch dimension if we added it
-        if not is_batched:
-            batch.act = squeeze_dict_values(batch.act)
+            # 5. Remove batch dimension if we added it
+            if not is_batched:
+                batch.act = squeeze_dict_values(batch.act)
 
         untransform_time = time.perf_counter() - untransform_start_time
         total_time = transform_time + model_time + untransform_time

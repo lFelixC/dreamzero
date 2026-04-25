@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import logging
+import math
 import time
 from typing import TypeAlias, cast
 import os
@@ -896,46 +897,104 @@ class WANPolicyHead(ActionHead):
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         predictions = []
         for index, prompt_emb in enumerate(context):
-            kv_cache = kv_caches[index]
-            crossattn_cache = crossattn_caches[index]
-            if not kv_cache_metadata["update_kv_cache"] and self.trt_engine is not None:
-                obs_noise_pred, action_noise_pred = self.trt_engine(
-                    noisy_input,
-                    timestep,
-                    action=action,
-                    timestep_action=timestep_action,
-                    state=state,
-                    context=prompt_emb,
-                    y=y,
-                    clip_feature=clip_feature,
-                    kv_cache=kv_cache,
-                )
-            else:
-                obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
-                    noisy_input,
-                    timestep,
+            predictions.append(
+                self._run_local_diffusion_step(
+                    noisy_input=noisy_input,
+                    timestep=timestep,
                     action=action,
                     timestep_action=timestep_action,
                     state=state,
                     embodiment_id=embodiment_id,
-                    context=prompt_emb,
+                    prompt_emb=prompt_emb,
                     seq_len=seq_len,
                     y=y,
                     clip_feature=clip_feature,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start_frame=kv_cache_metadata["start_frame"],
+                    kv_cache=kv_caches[index],
+                    crossattn_cache=crossattn_caches[index],
+                    kv_cache_metadata=kv_cache_metadata,
                 )
-                if kv_cache_metadata["update_kv_cache"]:
-                    for block_index, updated_kv_cache in enumerate(updated_kv_caches):
-                        kv_cache[block_index] = updated_kv_cache.clone()
-            obs_noise_pred = obs_noise_pred.clone()
-            if action_noise_pred is not None:
-                action_noise_pred = action_noise_pred.clone()
-            else:
-                action_noise_pred = torch.tensor(0.0, device=obs_noise_pred.device) # dummy action noise prediction
-            predictions.append((obs_noise_pred, action_noise_pred))
+            )
         return self._exchange_predictions(predictions)
+
+    def _run_local_diffusion_step(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        seq_len: int,
+        y: torch.Tensor,
+        clip_feature: torch.Tensor,
+        kv_cache: KVCacheType,
+        crossattn_cache: KVCacheType,
+        kv_cache_metadata: dict[str, bool | int],
+        allow_trt: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if allow_trt and not kv_cache_metadata["update_kv_cache"] and self.trt_engine is not None:
+            obs_noise_pred, action_noise_pred = self.trt_engine(
+                noisy_input,
+                timestep,
+                action=action,
+                timestep_action=timestep_action,
+                state=state,
+                context=prompt_emb,
+                y=y,
+                clip_feature=clip_feature,
+                kv_cache=kv_cache,
+            )
+        else:
+            obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
+                noisy_input,
+                timestep,
+                action=action,
+                timestep_action=timestep_action,
+                state=state,
+                embodiment_id=embodiment_id,
+                context=prompt_emb,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=clip_feature,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_frame=kv_cache_metadata["start_frame"],
+            )
+            if kv_cache_metadata["update_kv_cache"]:
+                for block_index, updated_kv_cache in enumerate(updated_kv_caches):
+                    kv_cache[block_index] = updated_kv_cache.clone()
+
+        obs_noise_pred = obs_noise_pred.clone()
+        if action_noise_pred is not None:
+            action_noise_pred = action_noise_pred.clone()
+        else:
+            action_noise_pred = torch.tensor(0.0, device=obs_noise_pred.device)
+        return obs_noise_pred, action_noise_pred
+
+    def _combine_cfg_predictions(
+        self,
+        predictions: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(predictions) == 1:
+            return predictions[0]
+        if len(predictions) != 2:
+            raise ValueError(f"Expected 1 or 2 prediction branches, got {len(predictions)}.")
+
+        flow_pred_cond, flow_pred_cond_action = predictions[0]
+        flow_pred_uncond, _ = predictions[1]
+        flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+        return flow_pred, flow_pred_cond_action
+
+    def _broadcast_cond_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.ip_size == 1:
+            return tensor
+        if self.ip_group is None:
+            raise RuntimeError("Expected ip_group to be initialized when ip_size > 1.")
+
+        synced = tensor.detach().clone() if self.ip_rank == 0 else torch.empty_like(tensor)
+        dist.broadcast(synced, src=0, group=self.ip_group)
+        return synced
 
     def _exchange_predictions(
         self,
@@ -999,7 +1058,336 @@ class WANPolicyHead(ActionHead):
 
         return True
 
-    def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
+    def reset_inference_state(self) -> None:
+        self.current_start_frame = 0
+        self.language = None
+        self.clip_feas = None
+        self.ys = None
+        self.kv_cache1 = None
+        self.kv_cache_neg = None
+        self.crossattn_cache = None
+        self.crossattn_cache_neg = None
+        self.skip_countdown = 0
+
+    @staticmethod
+    def _rtc_linweights(start: int, end: int, total: int) -> torch.Tensor:
+        skip_steps_at_end = max(total - end, 0)
+        linspace_steps = total - skip_steps_at_end - start
+        if end <= start or linspace_steps <= 0:
+            return torch.tensor([])
+        return torch.linspace(1, 0, linspace_steps + 2)[1:-1]
+
+    @staticmethod
+    def _rtc_add_trailing_zeros(weights: torch.Tensor, total: int, end: int) -> torch.Tensor:
+        zeros_len = total - end
+        if zeros_len <= 0:
+            return weights
+        zeros = torch.zeros(zeros_len)
+        return torch.cat([weights, zeros])
+
+    @staticmethod
+    def _rtc_add_leading_ones(weights: torch.Tensor, start: int, total: int) -> torch.Tensor:
+        ones_len = min(start, total)
+        if ones_len <= 0:
+            return weights
+        ones = torch.ones(ones_len)
+        return torch.cat([ones, weights])
+
+    def _rtc_get_prefix_weights(
+        self,
+        start: int,
+        end: int,
+        total: int,
+        schedule: str,
+    ) -> torch.Tensor:
+        start = min(start, end)
+        schedule_name = schedule.upper()
+
+        if schedule_name == "ZEROS":
+            weights = torch.zeros(total)
+            weights[:start] = 1.0
+            return weights
+
+        if schedule_name == "ONES":
+            weights = torch.ones(total)
+            weights[end:] = 0.0
+            return weights
+
+        lin_weights = self._rtc_linweights(start, end, total)
+        if schedule_name == "EXP" and lin_weights.numel() > 0:
+            lin_weights = lin_weights * torch.expm1(lin_weights).div(math.e - 1)
+        elif schedule_name not in {"LINEAR", "EXP"}:
+            raise ValueError(f"Unsupported RTC prefix attention schedule: {schedule}")
+
+        weights = self._rtc_add_trailing_zeros(lin_weights, total, end)
+        weights = self._rtc_add_leading_ones(weights, start, total)
+        return weights
+
+    def _run_diffusion_steps_with_rtc(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        prompt_embs: list[torch.Tensor],
+        seq_len: int,
+        y: torch.Tensor,
+        kv_caches: list[KVCacheType],
+        crossattn_caches: list[KVCacheType],
+        start_frame: int,
+        prev_chunk_left_over: torch.Tensor | None,
+        inference_delay: int,
+        rtc_execution_horizon: int,
+        rtc_max_guidance_weight: float,
+        rtc_prefix_attention_schedule: str,
+        apply_rtc_guidance: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kv_cache_metadata = dict(
+            start_frame=start_frame,
+            update_kv_cache=False,
+        )
+        if prev_chunk_left_over is None or not apply_rtc_guidance:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=kv_cache_metadata,
+            )
+            return self._combine_cfg_predictions(predictions)
+
+        prefix = prev_chunk_left_over
+        if prefix.ndim == 2:
+            prefix = prefix.unsqueeze(0)
+        prefix = prefix.to(device=noisy_input_action.device, dtype=noisy_input_action.dtype)
+
+        batch_size, action_chunk_size, action_dim = noisy_input_action.shape
+        if prefix.shape[0] != batch_size:
+            if prefix.shape[0] == 1:
+                prefix = prefix.expand(batch_size, -1, -1)
+            else:
+                raise ValueError(
+                    "RTC prev_chunk_left_over batch dimension must match current batch size, "
+                    f"got prefix {prefix.shape[0]} and batch {batch_size}."
+                )
+
+        execution_horizon = max(
+            0,
+            min(
+                int(rtc_execution_horizon),
+                int(prefix.shape[1]),
+                int(action_chunk_size),
+            ),
+        )
+        if execution_horizon <= 0:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=kv_cache_metadata,
+            )
+            return self._combine_cfg_predictions(predictions)
+
+        if prefix.shape[1] < action_chunk_size or prefix.shape[2] < action_dim:
+            padded_prefix = torch.zeros(
+                batch_size,
+                action_chunk_size,
+                action_dim,
+                device=noisy_input_action.device,
+                dtype=noisy_input_action.dtype,
+            )
+            padded_prefix[:, : prefix.shape[1], : prefix.shape[2]] = prefix
+            prefix = padded_prefix
+        else:
+            prefix = prefix[:, :action_chunk_size, :action_dim]
+
+        weights = self._rtc_get_prefix_weights(
+            start=max(int(inference_delay), 0),
+            end=execution_horizon,
+            total=action_chunk_size,
+            schedule=rtc_prefix_attention_schedule,
+        ).to(device=noisy_input_action.device, dtype=noisy_input_action.dtype)
+        weights = weights.unsqueeze(0).unsqueeze(-1)
+        if torch.count_nonzero(weights).item() == 0:
+            predictions = self._run_diffusion_steps(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                action=noisy_input_action,
+                timestep_action=timestep_action,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=kv_cache_metadata,
+            )
+            return self._combine_cfg_predictions(predictions)
+
+        rtc_action: torch.Tensor | None = None
+        local_cond_branch = self.ip_size == 1 or self.ip_rank == 0
+
+        if self.ip_size == 1:
+            with torch.inference_mode(False), torch.enable_grad():
+                rtc_action = noisy_input_action.detach().clone().requires_grad_(True)
+                flow_pred_cond, flow_pred_cond_action = self._run_local_diffusion_step(
+                    noisy_input=noisy_input,
+                    timestep=timestep,
+                    action=rtc_action,
+                    timestep_action=timestep_action,
+                    state=state_features,
+                    embodiment_id=embodiment_id,
+                    prompt_emb=prompt_embs[0],
+                    seq_len=seq_len,
+                    y=y,
+                    clip_feature=self.clip_feas,
+                    kv_cache=kv_caches[0],
+                    crossattn_cache=crossattn_caches[0],
+                    kv_cache_metadata=kv_cache_metadata,
+                    allow_trt=False,
+                )
+            flow_pred_cond = flow_pred_cond.detach()
+
+            if len(prompt_embs) > 1:
+                with torch.inference_mode():
+                    flow_pred_uncond, _ = self._run_local_diffusion_step(
+                        noisy_input=noisy_input,
+                        timestep=timestep,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        prompt_emb=prompt_embs[1],
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_cache=kv_caches[1],
+                        crossattn_cache=crossattn_caches[1],
+                        kv_cache_metadata=kv_cache_metadata,
+                    )
+                flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+            else:
+                flow_pred = flow_pred_cond
+        else:
+            if len(prompt_embs) != 1 or len(kv_caches) != 1 or len(crossattn_caches) != 1:
+                raise ValueError(
+                    "RTC minimal-grad path expects one local prompt/cache branch per rank when ip_size > 1."
+                )
+
+            if local_cond_branch:
+                with torch.inference_mode(False), torch.enable_grad():
+                    rtc_action = noisy_input_action.detach().clone().requires_grad_(True)
+                    local_prediction = self._run_local_diffusion_step(
+                        noisy_input=noisy_input,
+                        timestep=timestep,
+                        action=rtc_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        prompt_emb=prompt_embs[0],
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_cache=kv_caches[0],
+                        crossattn_cache=crossattn_caches[0],
+                        kv_cache_metadata=kv_cache_metadata,
+                        allow_trt=False,
+                    )
+                local_prediction = (local_prediction[0].detach(), local_prediction[1])
+            else:
+                with torch.inference_mode():
+                    local_prediction = self._run_local_diffusion_step(
+                        noisy_input=noisy_input,
+                        timestep=timestep,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        prompt_emb=prompt_embs[0],
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_cache=kv_caches[0],
+                        crossattn_cache=crossattn_caches[0],
+                        kv_cache_metadata=kv_cache_metadata,
+                    )
+
+            predictions = self._exchange_predictions([local_prediction])
+            flow_pred_cond, flow_pred_cond_action = predictions[0]
+            flow_pred_uncond, _ = predictions[1]
+            flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+
+        if local_cond_branch:
+            if rtc_action is None:
+                raise RuntimeError("RTC guidance expected a differentiable conditional action branch.")
+            with torch.inference_mode(False), torch.enable_grad():
+                time = timestep_action[:, :1].to(dtype=rtc_action.dtype)
+                time = time / float(self.scheduler.num_train_timesteps)
+                time = time.unsqueeze(-1)
+                tau = 1 - time
+
+                x1_t = rtc_action - time * flow_pred_cond_action
+                err = (prefix - x1_t) * weights
+                correction = torch.autograd.grad(
+                    x1_t,
+                    rtc_action,
+                    grad_outputs=err.detach(),
+                    retain_graph=False,
+                )[0]
+
+                max_guidance_weight = torch.as_tensor(
+                    rtc_max_guidance_weight,
+                    device=rtc_action.device,
+                    dtype=rtc_action.dtype,
+                )
+                squared_one_minus_tau = (1 - tau) ** 2
+                inv_r2 = (squared_one_minus_tau + tau**2) / squared_one_minus_tau
+                c = torch.nan_to_num((1 - tau) / tau, posinf=max_guidance_weight)
+                guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+                guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+                guided_flow_pred_cond_action = flow_pred_cond_action - guidance_weight * correction
+        else:
+            guided_flow_pred_cond_action = torch.empty_like(flow_pred_cond_action)
+
+        guided_flow_pred_cond_action = self._broadcast_cond_tensor(guided_flow_pred_cond_action)
+        return flow_pred.detach(), guided_flow_pred_cond_action.detach()
+
+    def lazy_joint_video_action(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        latent_video: torch.Tensor | None = None,
+        prev_chunk_left_over: torch.Tensor | None = None,
+        inference_delay: int = 0,
+        use_rtc: bool = False,
+        rtc_execution_horizon: int = 10,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "EXP",
+        rtc_guidance_max_steps: int = 4,
+        rtc_guidance_step_stride: int = 1,
+    ) -> BatchFeature:
         start_time = time.perf_counter()
 
         # Tracking time taken on GPU for various operations.
@@ -1255,6 +1643,9 @@ class WANPolicyHead(ActionHead):
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
+        rtc_total_steps = len(sample_scheduler.timesteps)
+        rtc_guidance_max_steps = max(int(rtc_guidance_max_steps), 0)
+        rtc_guidance_step_stride = max(int(rtc_guidance_step_stride), 1)
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
@@ -1282,28 +1673,34 @@ class WANPolicyHead(ActionHead):
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
-                predictions = self._run_diffusion_steps(
+                rtc_prev_chunk_left_over = prev_chunk_left_over if use_rtc else None
+                rtc_guidance_start_idx = max(rtc_total_steps - rtc_guidance_max_steps, 0)
+                apply_rtc_guidance = (
+                    rtc_prev_chunk_left_over is not None
+                    and rtc_guidance_max_steps > 0
+                    and index >= rtc_guidance_start_idx
+                    and ((index - rtc_guidance_start_idx) % rtc_guidance_step_stride == 0)
+                )
+                flow_pred, flow_pred_cond_action = self._run_diffusion_steps_with_rtc(
                     noisy_input=noisy_input.transpose(1, 2),
                     timestep=timestep,
-                    action=noisy_input_action,
+                    noisy_input_action=noisy_input_action,
                     timestep_action=timestep_action,
-                    state=state_features,
+                    state_features=state_features,
                     embodiment_id=embodiment_id,
-                    context=prompt_embs,
+                    prompt_embs=prompt_embs,
                     seq_len=seq_len,
                     y=y,
-                    clip_feature=self.clip_feas,
                     kv_caches=kv_caches,
                     crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
+                    start_frame=self.current_start_frame,
+                    prev_chunk_left_over=rtc_prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    rtc_execution_horizon=rtc_execution_horizon,
+                    rtc_max_guidance_weight=rtc_max_guidance_weight,
+                    rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
+                    apply_rtc_guidance=apply_rtc_guidance,
                 )
-                flow_pred_cond, flow_pred_cond_action = predictions[0]
-                flow_pred_uncond, flow_pred_uncond_action = predictions[1]
-
-                flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
                 prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
                 max_cache_size = 2
                 if len(prev_predictions) > max_cache_size:

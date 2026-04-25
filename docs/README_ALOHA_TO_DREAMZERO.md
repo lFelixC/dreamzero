@@ -204,7 +204,6 @@ cd /data/dreamzero
   --input-root /data/datasets/dreamzero/1k_demo_lerobot_merged_v4 \
   --output-root /data/datasets/dreamzero/1k_demo_lerobot_merged_v4_shuffle_only \
   --shuffle-seed 42 \
-  --strategy task_round_robin \
   --video-mode hardlink \
   --force
 ```
@@ -215,7 +214,7 @@ cd /data/dreamzero
 - 保留每个 episode 内部的帧、时间戳、状态、动作不变
 - 重写 `episode_index / index / episodes.jsonl / episodes_stats.jsonl`
 - 默认用 `hardlink` 复用视频文件，不做重新编码
-- 默认按 task 分桶后交错输出，比单纯全局随机 shuffle 更适合改善 shard 内任务混合度
+- 默认做全局随机 episode shuffle，避免尾部因为 task 数量不平衡而重新塌成大段单任务
 
 ---
 

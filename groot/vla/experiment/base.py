@@ -60,6 +60,7 @@ from groot.vla.utils.checkpoint_sidecar import (
     materialize_component_sidecars,
     prepare_action_head_cfg_for_checkpoint,
 )
+from groot.vla.utils.nvtx_utils import nvtx_enabled, nvtx_range
 from groot.vla.utils.timer import ContextTimer
 
 # Fix resume: https://github.com/huggingface/transformers/pull/34632/files
@@ -101,6 +102,26 @@ class LossLoggerCallback(TrainerCallback):
         if len(entry) > 1:  # more than just "step"
             with open(self.output_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+
+
+class NVTXTrainerCallback(TrainerCallback):
+    """Adds light NVTX ranges around optimizer.step without touching Trainer internals."""
+
+    def __init__(self):
+        self._optimizer_step_active = False
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if not nvtx_enabled():
+            return control
+        torch.cuda.nvtx.range_push("dreamzero.train.optimizer_step")
+        self._optimizer_step_active = True
+        return control
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if self._optimizer_step_active:
+            torch.cuda.nvtx.range_pop()
+            self._optimizer_step_active = False
+        return control
 
 
 def maybe_enable_swanlab_sync():
@@ -390,9 +411,26 @@ class BaseTrainer(transformers.Trainer):
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
         super().__init__(**kwargs)
+        self._install_backward_nvtx_wrapper()
 
         self.loss_queues = {}
         self.loss_queue_size = 10
+
+    def _install_backward_nvtx_wrapper(self) -> None:
+        original_backward = self.accelerator.backward
+        if getattr(original_backward, "_dreamzero_nvtx_wrapped", False):
+            return
+
+        def wrapped_backward(loss, **kwargs):
+            with nvtx_range("dreamzero.train.backward"):
+                return original_backward(loss, **kwargs)
+
+        wrapped_backward._dreamzero_nvtx_wrapped = True
+        self.accelerator.backward = wrapped_backward
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        with nvtx_range("dreamzero.train.dataloader_wait"):
+            return super().get_batch_samples(epoch_iterator, num_batches, device)
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -413,7 +451,7 @@ class BaseTrainer(transformers.Trainer):
 
         start_time = time.time()
 
-        with self.timer.with_label("training_step"), profile_context as prof:
+        with self.timer.with_label("training_step"), nvtx_range("dreamzero.train.training_step"), profile_context as prof:
             output = super().training_step(model, inputs)
 
         time_taken = time.time() - start_time
@@ -434,7 +472,7 @@ class BaseTrainer(transformers.Trainer):
         return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        with self.timer.with_label("model_forward"):
+        with self.timer.with_label("model_forward"), nvtx_range("dreamzero.train.model_forward"):
             outputs = model(inputs)
         ### For additional losses, track and log their moving averages
         for key, value in outputs.items():
@@ -859,6 +897,7 @@ class BaseExperiment(ABC):
 
         loss_log_path = str(Path(training_args.output_dir) / "loss_log.jsonl")
         trainer.add_callback(LossLoggerCallback(output_path=loss_log_path))
+        trainer.add_callback(NVTXTrainerCallback())
 
 
         # Add profiling callback (local profiling only, no S3 upload)
