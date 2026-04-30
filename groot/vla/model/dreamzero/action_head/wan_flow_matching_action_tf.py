@@ -189,6 +189,9 @@ class WANPolicyHead(ActionHead):
         self.crossattn_cache_neg: KVCacheType | None = None
 
         self.global_step = 0
+        # Debug-video metadata: reset calls prepend condition latents that should not be
+        # decoded as predicted frames by the real-world server.
+        self.last_video_pred_condition_latent_frames = 0
         self.max_steps = 0
         self.lora_rank = config.lora_rank
         self.lora_alpha = config.lora_alpha
@@ -1347,8 +1350,12 @@ class WANPolicyHead(ActionHead):
         latents_action = noisy_input_action
         output = latents
 
+        condition_latent_frames = 0
         if self.current_start_frame == 1:
             output = torch.cat([image, output], dim=1)
+            # Tell the server how many leading latents are conditioning context, not generated video.
+            condition_latent_frames = image.shape[1]
+        self.last_video_pred_condition_latent_frames = condition_latent_frames
         self.current_start_frame += self.num_frame_per_block
 
         # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
