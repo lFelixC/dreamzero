@@ -26,8 +26,13 @@ from eval_utils.policy_server import PolicyServerConfig
 
 faulthandler.enable()
 
-FRAME_HISTORY_LENGTH = 24
-FRAME_SELECTION_INDICES = (0, 7, 15, 23)
+# DROID/Wan2.2 training samples each video block from a 24-step window:
+# [0, 3, 6, ..., 24]. The leading frame is the block boundary/anchor.
+DROID_VIDEO_BLOCK_STRIDE = 24
+DROID_VIDEO_SAMPLE_STRIDE = 3
+DROID_TRAINING_FPS = 15
+FRAME_HISTORY_LENGTH = DROID_VIDEO_BLOCK_STRIDE + 1
+FRAME_SELECTION_INDICES = tuple(range(0, FRAME_HISTORY_LENGTH, DROID_VIDEO_SAMPLE_STRIDE))
 DEFAULT_IMAGE_RESOLUTION = (180, 320)
 
 
@@ -41,8 +46,8 @@ class Args:
 
     # Rollout parameters
     max_timesteps: int = 6000
-    open_loop_horizon: int = 8
-    control_frequency: int = 15
+    open_loop_horizon: int = DROID_VIDEO_BLOCK_STRIDE
+    control_frequency: int = DROID_TRAINING_FPS
     use_rtc: bool = False
     enable_async_prefetch: bool = False
     rtc_inference_delay_steps: int = 0
@@ -86,7 +91,6 @@ def _resize_frames(frames: np.ndarray, height: int, width: int) -> np.ndarray:
     if frames.ndim == 3:
         return image_tools.resize_with_pad(frames, height, width)
     return np.stack([image_tools.resize_with_pad(frame, height, width) for frame in frames], axis=0)
-
 
 def _select_history_frames(history: deque[np.ndarray]) -> np.ndarray:
     if not history:
@@ -232,6 +236,18 @@ class DreamZeroRealPolicyClient:
         self._image_resolution = self._server_config.image_resolution or DEFAULT_IMAGE_RESOLUTION
         self._open_loop_horizon = open_loop_horizon
         self._control_frequency = control_frequency
+        if self._open_loop_horizon != DROID_VIDEO_BLOCK_STRIDE:
+            print(
+                "Warning: open_loop_horizon="
+                f"{self._open_loop_horizon} differs from DROID training block stride "
+                f"{DROID_VIDEO_BLOCK_STRIDE}; video history may be padded or off-stride."
+            )
+        if self._control_frequency != DROID_TRAINING_FPS:
+            print(
+                "Warning: control_frequency="
+                f"{self._control_frequency}Hz differs from DROID training fps "
+                f"{DROID_TRAINING_FPS}Hz; temporal duration will not match training."
+            )
         self._use_rtc = use_rtc
         self._enable_async_prefetch = bool(enable_async_prefetch)
         self._rtc_inference_delay_steps = max(int(rtc_inference_delay_steps), 0)
@@ -526,10 +542,12 @@ class DreamZeroRealPolicyClient:
             return False
         if self._base_chunk_size <= 0:
             return False
-        launch_threshold = min(self._open_loop_horizon, max(self._base_chunk_size - 1, 0))
-        if self._open_loop_horizon <= 0:
-            launch_threshold = max(self._base_chunk_size - 1, 0)
-        return self._base_actions_from_chunk_completed >= launch_threshold
+        launch_threshold = self._open_loop_horizon
+        if launch_threshold <= 0:
+            launch_threshold = self._base_chunk_size
+        if self._base_actions_from_chunk_completed < launch_threshold:
+            return False
+        return len(self._history["primary"]) >= FRAME_HISTORY_LENGTH
 
     def _should_activate_pending_prefetch(self) -> bool:
         if not self._use_rtc:
