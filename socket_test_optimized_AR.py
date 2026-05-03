@@ -869,7 +869,9 @@ def _patch_eval_transform_input_resolution(
     if transforms is None:
         return
 
-    expected_resolution = (int(image_width), int(image_height))
+    image_height = int(image_height)
+    image_width = int(image_width)
+    expected_resolution = (image_width, image_height)
     for transform in transforms:
         if not hasattr(transform, "original_resolutions"):
             continue
@@ -882,6 +884,12 @@ def _patch_eval_transform_input_resolution(
         transform.original_resolutions = {
             key: expected_resolution for key in original_resolutions
         }
+        transform_name = transform.__class__.__name__
+        if transform_name in {"VideoCrop", "VideoResize"}:
+            transform.height = image_height
+            transform.width = image_width
+            transform.train_transform = transform.get_transform(mode="train")
+            transform.eval_transform = transform.get_transform(mode="eval")
 
 
 def _override_max_chunk_size(policy: GrootSimPolicy, max_chunk_size: int) -> None:
