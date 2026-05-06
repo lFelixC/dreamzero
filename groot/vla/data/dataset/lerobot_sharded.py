@@ -11,6 +11,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 import yaml
 
 from groot.vla.common.utils import get_frames_by_timestamps
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 from .lerobot import LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset, LeRobotSingleDataset
 
@@ -181,7 +182,8 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
         for trajectory_id in trajectory_ids:
             trajectory_start_indices[trajectory_id] = curr_step_index
             parquet_path = parquet_paths[trajectory_id]
-            parquet_df = pd.read_parquet(parquet_path)
+            with nvtx_range("dreamzero.data.cache_shard.read_parquet"):
+                parquet_df = pd.read_parquet(parquet_path)
             # Check timestamps are in sync
             parquet_timestamps = parquet_df["timestamp"].to_numpy()
             trajectory_length = len(parquet_timestamps)
@@ -210,12 +212,13 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
                 curr_frame_index[key] += len(this_frames_to_load)
                 if key not in cached_frames:
                     cached_frames[key] = []
-                frames = get_frames_by_timestamps(
-                video_paths[trajectory_id][key].as_posix(),
-                    timestamps=load_timestamps,
-                    video_backend=video_backend,
-                    video_backend_kwargs=video_backend_kwargs or {},
-                )
+                with nvtx_range("dreamzero.data.cache_shard.video_decode"):
+                    frames = get_frames_by_timestamps(
+                        video_paths[trajectory_id][key].as_posix(),
+                        timestamps=load_timestamps,
+                        video_backend=video_backend,
+                        video_backend_kwargs=video_backend_kwargs or {},
+                    )
                 cached_frames[key].append(frames)
             if cached_df is None:
                 cached_df = parquet_df
@@ -224,8 +227,9 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
             curr_step_index += trajectory_length
 
         # Concatenate the frames
-        for key in cached_frames:
-            cached_frames[key] = np.concatenate(cached_frames[key], axis=0)
+        with nvtx_range("dreamzero.data.cache_shard.concat_frames"):
+            for key in cached_frames:
+                cached_frames[key] = np.concatenate(cached_frames[key], axis=0)
         end_time = time.time()
         print(f"Cached shard in {end_time - start_time:.2f} seconds")
         assert cached_df is not None, "Cached dataframe is None"
@@ -237,23 +241,25 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
 
     def start_cache_shard(self, shard_index: int) -> None:
         """Start caching a shard in a background thread."""
-        self._cache_job = self._executor.submit(
-            self.get_shard,
-            self.sharded_trajectories[shard_index],
-            self.modality_keys,
-            self.all_video_paths,
-            self.all_parquet_paths,
-            self.frames_to_load,
-            self.video_backend,
-            self.video_backend_kwargs,
-        )
+        with nvtx_range("dreamzero.data.start_cache_shard"):
+            self._cache_job = self._executor.submit(
+                self.get_shard,
+                self.sharded_trajectories[shard_index],
+                self.modality_keys,
+                self.all_video_paths,
+                self.all_parquet_paths,
+                self.frames_to_load,
+                self.video_backend,
+                self.video_backend_kwargs,
+            )
 
     def finish_cache_shard(self):
         """Get the cached shard."""
         assert self._cache_job is not None
-        self.cached_shard, self.shard_start_indices, self.cached_df, self.frame_indices_map = (
-            self._cache_job.result()
-        )
+        with nvtx_range("dreamzero.data.finish_cache_shard_wait"):
+            self.cached_shard, self.shard_start_indices, self.cached_df, self.frame_indices_map = (
+                self._cache_job.result()
+            )
         self._cache_job = None  # Clear the future to allow memory to be freed
 
     def delete_cached_shard(self):
@@ -468,7 +474,8 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         for trajectory_id in trajectory_ids:
             trajectory_start_indices[trajectory_id] = curr_step_index
             parquet_path = parquet_paths[trajectory_id]
-            parquet_df = pd.read_parquet(parquet_path)
+            with nvtx_range("dreamzero.data.cache_shard.read_parquet"):
+                parquet_df = pd.read_parquet(parquet_path)
             # Check timestamps are in sync
             parquet_timestamps = parquet_df["timestamp"].to_numpy()
             trajectory_length = len(parquet_timestamps)
@@ -481,13 +488,14 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
                 if key not in cached_frames:
                     cached_frames[key] = []
-                frames = get_frames_by_timestamps(
-                    video_paths[trajectory_id][key].as_posix(),
-                    timestamps=parquet_timestamps,
-                    video_backend=video_backend,
-                    video_backend_kwargs=video_backend_kwargs,
-                    fps=fps,
-                )
+                with nvtx_range("dreamzero.data.cache_shard.video_decode"):
+                    frames = get_frames_by_timestamps(
+                        video_paths[trajectory_id][key].as_posix(),
+                        timestamps=parquet_timestamps,
+                        video_backend=video_backend,
+                        video_backend_kwargs=video_backend_kwargs,
+                        fps=fps,
+                    )
                 cached_frames[key].append(frames)
             if cached_df is None:
                 cached_df = parquet_df
@@ -496,8 +504,9 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             curr_step_index += trajectory_length
 
         # Concatenate the frames
-        for key in cached_frames:
-            cached_frames[key] = np.concatenate(cached_frames[key], axis=0)
+        with nvtx_range("dreamzero.data.cache_shard.concat_frames"):
+            for key in cached_frames:
+                cached_frames[key] = np.concatenate(cached_frames[key], axis=0)
         end_time = time.time()
         print(f"Cached shard in {end_time - start_time:.2f} seconds")
         assert cached_df is not None, "Cached dataframe is None"
@@ -509,21 +518,23 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
 
     def start_cache_shard(self, shard_index: int) -> None:
         """Start caching a shard in a background thread."""
-        self._cache_job = self._executor.submit(
-            self.get_shard,
-            self.sharded_trajectories[shard_index],
-            self.modality_keys,
-            self.all_video_paths,
-            self.all_parquet_paths,
-            self.video_backend,
-            self.video_backend_kwargs,
-            self.fps,
-        )
+        with nvtx_range("dreamzero.data.start_cache_shard"):
+            self._cache_job = self._executor.submit(
+                self.get_shard,
+                self.sharded_trajectories[shard_index],
+                self.modality_keys,
+                self.all_video_paths,
+                self.all_parquet_paths,
+                self.video_backend,
+                self.video_backend_kwargs,
+                self.fps,
+            )
 
     def finish_cache_shard(self):
         """Get the cached shard."""
         assert self._cache_job is not None
-        self.cached_shard, self.shard_start_indices, self.cached_df = self._cache_job.result()
+        with nvtx_range("dreamzero.data.finish_cache_shard_wait"):
+            self.cached_shard, self.shard_start_indices, self.cached_df = self._cache_job.result()
         self._cache_job = None  # Clear the future to allow memory to be freed
 
     def delete_cached_shard(self):
@@ -1499,24 +1510,25 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
             )
             # Start caching the next shard immediately
             self.cache_next_shard()
-            all_steps: list[tuple[int, int]] = []
-            for trajectory_id in dataset.get_trajectories_in_shard():
-                trajectory_index = dataset.get_trajectory_index(trajectory_id)
-                if self.allow_padding_at_end:
-                    allowed_length = dataset.trajectory_lengths[trajectory_index]
-                else:
-                    max_delta_index = dataset.max_delta_index
-                    trajectory_length = dataset.trajectory_lengths[trajectory_index]
-                    allowed_length = trajectory_length - max_delta_index
-                # Get the allowed indices from the step filter
-                allowed_indices = dataset.step_filter[trajectory_id]
-                # Remove indices that are too large
-                allowed_indices = allowed_indices[allowed_indices <= allowed_length]
-                for i in allowed_indices:
-                    all_steps.append((trajectory_id, i))
-            if self.training:
-                rng.shuffle(all_steps)
-            sampled_steps = all_steps[: int(dataset.num_steps_per_shard * self.shard_sampling_rate)]
+            with nvtx_range("dreamzero.data.prepare_shard_steps"):
+                all_steps: list[tuple[int, int]] = []
+                for trajectory_id in dataset.get_trajectories_in_shard():
+                    trajectory_index = dataset.get_trajectory_index(trajectory_id)
+                    if self.allow_padding_at_end:
+                        allowed_length = dataset.trajectory_lengths[trajectory_index]
+                    else:
+                        max_delta_index = dataset.max_delta_index
+                        trajectory_length = dataset.trajectory_lengths[trajectory_index]
+                        allowed_length = trajectory_length - max_delta_index
+                    # Get the allowed indices from the step filter
+                    allowed_indices = dataset.step_filter[trajectory_id]
+                    # Remove indices that are too large
+                    allowed_indices = allowed_indices[allowed_indices <= allowed_length]
+                    for i in allowed_indices:
+                        all_steps.append((trajectory_id, i))
+                if self.training:
+                    rng.shuffle(all_steps)
+                sampled_steps = all_steps[: int(dataset.num_steps_per_shard * self.shard_sampling_rate)]
             for trajectory_id, step_index in sampled_steps:
                 # print(
                 #     f"Loading step data from rank {self.rank}, worker {self.worker_id}: {dataset_index} {trajectory_id}, {step_index}"
@@ -1525,10 +1537,13 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                     key: delta_indices + step_index
                     for key, delta_indices in dataset.delta_indices.items()
                 }
-                step_data = dataset.get_step_data(trajectory_id, indices)
+                with nvtx_range("dreamzero.data.get_step_data"):
+                    step_data = dataset.get_step_data(trajectory_id, indices)
                 # Skip samples where state or action would be empty
                 if step_data is not None:
-                    yield dataset.transforms(step_data)
+                    with nvtx_range("dreamzero.data.transforms"):
+                        transformed = dataset.transforms(step_data)
+                    yield transformed
 
             # Delete the cached shard and shard start indices to free up memory
             dataset.delete_cached_shard()

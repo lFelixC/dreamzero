@@ -22,6 +22,7 @@ from groot.vla.data.schema import (
 )
 from groot.vla.data.transform.base import InvertibleModalityTransform
 from groot.vla.model.dreamzero.transform.common import formalize_language
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 
 def basic_clean(text):
@@ -184,24 +185,27 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
             # print("output_values", output_values)
-            ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
+            with nvtx_range("dreamzero.data.collate.tokenize_text"):
+                ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
             batch[key] = ids 
             batch['text_attention_mask'] = mask
         elif key == "text_negative":
             values = [elem[key] for elem in features]
-            ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
+            with nvtx_range("dreamzero.data.collate.tokenize_text_negative"):
+                ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
             batch[key] = ids 
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            if all(isinstance(value, np.ndarray) for value in values):
-                batch[key] = torch.from_numpy(_pad_and_stack_numpy(values))
-                if key == "images":
-                    batch["images_mask"] = torch.from_numpy(
-                        _build_prefix_mask([value.shape[0] for value in values])
-                    )
-            else:
-                batch[key] = torch.from_numpy(np.stack(values))
+            with nvtx_range("dreamzero.data.collate.stack_values"):
+                if all(isinstance(value, np.ndarray) for value in values):
+                    batch[key] = torch.from_numpy(_pad_and_stack_numpy(values))
+                    if key == "images":
+                        batch["images_mask"] = torch.from_numpy(
+                            _build_prefix_mask([value.shape[0] for value in values])
+                        )
+                else:
+                    batch[key] = torch.from_numpy(np.stack(values))
     return batch
 
 
@@ -214,7 +218,8 @@ class DefaultDataCollator(DataCollatorMixin):
         self.embodiment_tag_mapping = embodiment_tag_mapping
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        with nvtx_range("dreamzero.data.collate"):
+            return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
 
 
 class DreamTransform(InvertibleModalityTransform):

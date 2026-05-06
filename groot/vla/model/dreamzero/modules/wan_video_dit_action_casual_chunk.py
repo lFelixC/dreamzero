@@ -25,6 +25,8 @@ import math
 import torch.distributed as dist
 import os
 
+from groot.vla.utils.nvtx_utils import nvtx_range
+
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 
 
@@ -2034,85 +2036,87 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.model_type == 'i2v':
             assert clip_feature is not None and y is not None
 
-        # Concat [x; y] only when pretrained that way (14B). 5B uses latent only, first-frame via CLIP.
-        if y is not None and self.concat_first_frame_latent:
-            x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
+        with nvtx_range("dreamzero.dit.patch_embedding"):
+            # Concat [x; y] only when pretrained that way (14B). 5B uses latent only, first-frame via CLIP.
+            if y is not None and self.concat_first_frame_latent:
+                x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
 
-        # embeddings
-        x = self.patch_embedding(x)
+            # embeddings
+            x = self.patch_embedding(x)
 
-        grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
-        freqs = self._create_freqs(
-            grid_size=grid_size,
-            start_frame=0,
-        )
+            grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
+            freqs = self._create_freqs(
+                grid_size=grid_size,
+                start_frame=0,
+            )
 
-        x = x.flatten(start_dim=2).transpose(1, 2)
-        assert x.shape[1] == seq_len
+            x = x.flatten(start_dim=2).transpose(1, 2)
+            assert x.shape[1] == seq_len
 
         B = x.shape[0]
         F = timestep.shape[1]
 
-        # time embeddings
-        if action is not None:
-            embodiment_id = torch.tensor([0]).repeat(x.shape[0]).to(device=embodiment_id.device)
-            action_features = self.action_encoder(action, timestep_action, embodiment_id)
-            action_length = action_features.shape[1]
-            state_features = self.state_encoder(state, embodiment_id)
-            action_register = torch.cat([action_features, state_features], dim=1)
-            action_register_length = action_register.shape[1]
-            x = torch.cat([x, action_register], dim=1)
-        else:
-            action_features = None
-            action_length = None
-            state_features = None
-            action_register = None
-            action_register_length = None
+        with nvtx_range("dreamzero.dit.action_state_encoding"):
+            if action is not None:
+                embodiment_id = torch.tensor([0]).repeat(x.shape[0]).to(device=embodiment_id.device)
+                action_features = self.action_encoder(action, timestep_action, embodiment_id)
+                action_length = action_features.shape[1]
+                state_features = self.state_encoder(state, embodiment_id)
+                action_register = torch.cat([action_features, state_features], dim=1)
+                action_register_length = action_register.shape[1]
+                x = torch.cat([x, action_register], dim=1)
+            else:
+                action_features = None
+                action_length = None
+                state_features = None
+                action_register = None
+                action_register_length = None
 
-        # time embeddings
-        timestep = timestep.unsqueeze(-1).expand(B, F, seq_len // F).reshape(B, -1)
-        timestep_original = timestep.clone()
+        with nvtx_range("dreamzero.dit.time_embedding"):
+            timestep = timestep.unsqueeze(-1).expand(B, F, seq_len // F).reshape(B, -1)
+            timestep_original = timestep.clone()
 
-        if action is not None:
-            assert timestep_action is not None
-            assert state_features is not None
-            stride = timestep_action.shape[1] // state_features.shape[1]
-            timestep_state = timestep_action[:, ::stride]
-            timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+            if action is not None:
+                assert timestep_action is not None
+                assert state_features is not None
+                stride = timestep_action.shape[1] // state_features.shape[1]
+                timestep_state = timestep_action[:, ::stride]
+                timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
 
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
-        e = e.unflatten(dim=0, sizes=(B, -1))
-        e0 = self.time_projection(e)
-        e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
+            e = e.unflatten(dim=0, sizes=(B, -1))
+            e0 = self.time_projection(e)
+            e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
 
-        # context
-        assert context.shape[1] == self.text_len
-        context = self.text_embedding(context)
+        with nvtx_range("dreamzero.dit.context_embedding"):
+            assert context.shape[1] == self.text_len
+            context = self.text_embedding(context)
 
-        if clip_feature is not None:
-            clip_embedding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embedding, context], dim=1)
+            if clip_feature is not None:
+                clip_embedding = self.img_emb(clip_feature)
+                context = torch.cat([clip_embedding, context], dim=1)
 
         if clean_x is not None:
-            if y is not None and self.concat_first_frame_latent:
-                clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
-            clean_x = self.patch_embedding(clean_x)
-            clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
-            assert clean_x.shape[1] == seq_len
+            with nvtx_range("dreamzero.dit.clean_x_embedding"):
+                if y is not None and self.concat_first_frame_latent:
+                    clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
+                clean_x = self.patch_embedding(clean_x)
+                clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
+                assert clean_x.shape[1] == seq_len
 
-            x = torch.cat([clean_x, x], dim=1)
+                x = torch.cat([clean_x, x], dim=1)
 
-            if aug_t is None:
-                aug_t = torch.zeros_like(timestep_original)
-            assert aug_t is not None
+                if aug_t is None:
+                    aug_t = torch.zeros_like(timestep_original)
+                assert aug_t is not None
 
-            e_clean = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
-            e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
-            e0_clean = self.time_projection(e_clean)
-            e0_clean = e0_clean.unflatten(dim=2, sizes=(6, self.dim))
-            e0 = torch.cat([e0_clean, e0], dim=1)
+                e_clean = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
+                e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
+                e0_clean = self.time_projection(e_clean)
+                e0_clean = e0_clean.unflatten(dim=2, sizes=(6, self.dim))
+                e0 = torch.cat([e0_clean, e0], dim=1)
 
         # arguments
         kwargs = dict(
@@ -2132,32 +2136,37 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return outputs
             return custom_forward
 
-        for block in self.blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
-            else:
-                x = block(x, **kwargs)
+        block_group_size = 10
+        for block_start in range(0, len(self.blocks), block_group_size):
+            block_end = min(block_start + block_group_size, len(self.blocks))
+            with nvtx_range(f"dreamzero.dit.blocks.{block_start:02d}_{block_end - 1:02d}"):
+                for block in self.blocks[block_start:block_end]:
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, **kwargs,
+                            use_reentrant=False,
+                        )
+                    else:
+                        x = block(x, **kwargs)
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]
 
-        if action is not None:
-            action_noise_pred = x[:, seq_len: seq_len + action_length]
-            action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
-        else:
-            action_noise_pred = None
+        with nvtx_range("dreamzero.dit.head_unpatchify"):
+            if action is not None:
+                action_noise_pred = x[:, seq_len: seq_len + action_length]
+                action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
+            else:
+                action_noise_pred = None
 
-        # Build a tensor that contains only video tokens per sample with length = max(video_lens)
-        x_video = x[:, :seq_len]
-        e_video = e[:, :seq_len]
+            # Build a tensor that contains only video tokens per sample with length = max(video_lens)
+            x_video = x[:, :seq_len]
+            e_video = e[:, :seq_len]
 
-        # Unpatchify video-only tokens
-        x_video = self.head(x_video, e_video.unsqueeze(2))
-        video_noise_pred = self.unpatchify(x_video, grid_size)
+            # Unpatchify video-only tokens
+            x_video = self.head(x_video, e_video.unsqueeze(2))
+            video_noise_pred = self.unpatchify(x_video, grid_size)
 
         return video_noise_pred, action_noise_pred
 

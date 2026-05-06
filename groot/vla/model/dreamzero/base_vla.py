@@ -11,6 +11,7 @@ from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedMode
 from transformers.feature_extraction_utils import BatchFeature
 import tree
 from groot.vla.utils.checkpoint_sidecar import prepare_action_head_cfg_for_checkpoint
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 BACKBONE_FEATURE_KEY = "backbone_features"
 ACTION_KEY = "action_pred"
@@ -142,9 +143,12 @@ class VLA(PreTrainedModel):
         inputs: dict,
     ) -> BatchFeature:
 
-        backbone_inputs, action_inputs = self.prepare_input(inputs)
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head(backbone_outputs, action_inputs)
+        with nvtx_range("dreamzero.vla.prepare_input"):
+            backbone_inputs, action_inputs = self.prepare_input(inputs)
+        with nvtx_range("dreamzero.vla.backbone"):
+            backbone_outputs = self.backbone(backbone_inputs)
+        with nvtx_range("dreamzero.vla.action_head"):
+            action_head_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_head_outputs
 
