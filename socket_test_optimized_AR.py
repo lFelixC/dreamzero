@@ -191,8 +191,12 @@ class ARDroidRoboarenaPolicy:
     - Distributed inference coordination
     """
     
-    # Number of frames to accumulate after the first call
-    FRAMES_PER_CHUNK = 4
+    # DROID/Wan2.2 training samples each raw-video block as
+    # [anchor, anchor+3, ..., anchor+24]. Wan VAE38 maps 9 raw frames to
+    # 3 latent frames, so after the anchor latent this yields exactly
+    # num_frame_per_block=2 latent frames for the causal block.
+    RAW_FRAMES_PER_BLOCK = 8
+    FRAMES_PER_CHUNK = RAW_FRAMES_PER_BLOCK + 1
     
     def __init__(
         self,
@@ -233,6 +237,7 @@ class ARDroidRoboarenaPolicy:
         
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
+        self._current_prompt: str | None = None
         self._warned_single_external_fallback = False
         self._rtc_session_states: dict[str, RTCSessionState] = {}
         
@@ -310,6 +315,21 @@ class ARDroidRoboarenaPolicy:
             self._policy.trained_model.action_head, "current_start_frame"
         ):
             self._policy.trained_model.action_head.current_start_frame = 0
+
+    def _should_start_new_sequence(self, prompt: str) -> bool:
+        if self._is_first_call:
+            return True
+        if self._current_prompt is not None and prompt != self._current_prompt:
+            return True
+
+        action_head = getattr(getattr(self._policy, "trained_model", None), "action_head", None)
+        if action_head is None:
+            return False
+
+        current_start_frame = getattr(action_head, "current_start_frame", 0)
+        model = getattr(action_head, "model", None)
+        local_attn_size = getattr(model, "local_attn_size", -1)
+        return local_attn_size != -1 and current_start_frame >= local_attn_size
     
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
@@ -331,6 +351,10 @@ class ARDroidRoboarenaPolicy:
             - annotation.language.action_text: str
         """
         converted = {}
+        prompt = obs.get("prompt", "")
+        if isinstance(prompt, np.ndarray):
+            prompt = prompt.item() if prompt.size == 1 else prompt.reshape(-1)[0]
+        prompt = str(prompt)
         
         # Keep the DROID ordering expected by DreamZero:
         # obs 0 -> left exterior, obs 1 -> right exterior.
@@ -369,12 +393,14 @@ class ARDroidRoboarenaPolicy:
                 self._warned_single_external_fallback = True
             self._append_frames_to_buffer("video.exterior_image_2_left", exterior_0)
 
-        # Determine how many frames to use
-        if self._is_first_call:
-            # First call: use only 1 frame
+        # Determine how many frames to use. At the beginning of a sequence
+        # (first call, language change, or local-attention window rollover),
+        # the action head should receive only the latest anchor frame.
+        if self._should_start_new_sequence(prompt):
             num_frames = 1
         else:
-            # Subsequent calls: use exactly FRAMES_PER_CHUNK frames
+            # Normal causal block: boundary/anchor frame plus 8 newly sampled
+            # raw frames, matching DROID training's [0,3,...,24] block.
             num_frames = self.FRAMES_PER_CHUNK
         
         # Build video tensors from accumulated frames
@@ -413,10 +439,8 @@ class ARDroidRoboarenaPolicy:
             converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
         
         # Convert prompt
-        prompt = obs.get("prompt", "")
-        if isinstance(prompt, np.ndarray):
-            prompt = prompt.item() if prompt.size == 1 else prompt.reshape(-1)[0]
-        converted["annotation.language.action_text"] = str(prompt)
+        converted["annotation.language.action_text"] = prompt
+        self._current_prompt = prompt
         
         return converted
     
@@ -690,6 +714,7 @@ class ARDroidRoboarenaPolicy:
                 self._call_count = 0
                 self._is_first_call = True
                 self.video_across_time = []
+                self._current_prompt = None
                 self._warned_single_external_fallback = False
                 self._rtc_session_states.clear()
                 self._reset_model_temporal_state()
@@ -737,7 +762,7 @@ class WebsocketPolicyServer:
     def _save_input_obs(self, obs: dict) -> None:
         """Save incoming observation images per message.
         
-        Expected format: THWC (Time, Height, Width, Channel) with 4 frames.
+        Expected format: THWC (Time, Height, Width, Channel).
         Saves each frame as a separate PNG image: HWC format (uint8).
         
         Directory structure:
@@ -1102,6 +1127,96 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
     return None
 
 
+def _get_training_view_resolution(policy: GrootSimPolicy) -> tuple[int, int] | None:
+    train_cfg = getattr(policy, "train_cfg", None)
+    if train_cfg is None:
+        return None
+
+    height = getattr(train_cfg, "image_resolution_height", None)
+    width = getattr(train_cfg, "image_resolution_width", None)
+    if height is None or width is None:
+        return None
+    return int(height), int(width)
+
+
+def _patch_eval_transform_input_resolution(
+    policy: GrootSimPolicy,
+    image_height: int,
+    image_width: int,
+) -> None:
+    eval_transform = getattr(policy, "eval_transform", None)
+    transforms = getattr(eval_transform, "transforms", None)
+    if transforms is None:
+        return
+
+    image_height = int(image_height)
+    image_width = int(image_width)
+    expected_resolution = (image_width, image_height)
+    for transform in transforms:
+        if not hasattr(transform, "original_resolutions"):
+            continue
+        try:
+            original_resolutions = getattr(transform, "original_resolutions")
+        except AssertionError:
+            continue
+        if not original_resolutions:
+            continue
+        transform.original_resolutions = {
+            key: expected_resolution for key in original_resolutions
+        }
+        if transform.__class__.__name__ != "VideoCrop":
+            continue
+
+        old_size = (getattr(transform, "height", None), getattr(transform, "width", None))
+        transform.height = image_height
+        transform.width = image_width
+
+        get_transform = getattr(transform, "get_transform", None)
+        if not callable(get_transform):
+            continue
+
+        if getattr(transform, "backend", None) == "albumentations":
+            import albumentations as A
+
+            transform.train_transform = A.ReplayCompose(
+                transforms=[get_transform(mode="train")]
+            )
+            eval_transform = get_transform(mode="eval")
+            transform.eval_transform = (
+                A.ReplayCompose(transforms=[eval_transform])
+                if eval_transform is not None
+                else None
+            )
+        else:
+            transform.train_transform = get_transform(mode="train")
+            transform.eval_transform = get_transform(mode="eval")
+
+        logger.info(
+            "Patched VideoCrop input resolution from %s to %s and rebuilt cached transforms",
+            old_size,
+            (image_height, image_width),
+        )
+
+
+def _override_max_chunk_size(policy: GrootSimPolicy, max_chunk_size: int) -> None:
+    action_head = getattr(getattr(policy, "trained_model", None), "action_head", None)
+    model = getattr(action_head, "model", None)
+    if model is None:
+        return
+
+    num_frame_per_block = int(getattr(model, "num_frame_per_block", 1))
+    model.local_attn_size = (
+        int(max_chunk_size) * num_frame_per_block + 1
+        if int(max_chunk_size) != -1
+        else -1
+    )
+    logger.info(
+        "Overrode inference max_chunk_size=%s -> local_attn_size=%s",
+        max_chunk_size,
+        model.local_attn_size,
+    )
+
+
 def main(args: Args) -> None:
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
@@ -1139,6 +1254,16 @@ def main(args: Args) -> None:
             device="cuda" if torch.cuda.is_available() else "cpu",
             device_mesh=device_mesh,
         )
+    if args.max_chunk_size is not None:
+        _override_max_chunk_size(policy, args.max_chunk_size)
+    training_view_resolution = _get_training_view_resolution(policy)
+    if training_view_resolution is not None:
+        _patch_eval_transform_input_resolution(policy, *training_view_resolution)
+        logger.info(
+            "Using training single-view resolution %dx%d for websocket inputs",
+            training_view_resolution[0],
+            training_view_resolution[1],
+        )
     loaded_architecture = getattr(getattr(policy.trained_model, "action_head", None), "config", None)
     loaded_architecture = getattr(loaded_architecture, "architecture", None)
     if loaded_architecture in ("joint", "mot") and loaded_architecture != effective_architecture:
@@ -1147,7 +1272,7 @@ def main(args: Args) -> None:
         )
     logger.info("DreamZero WAM architecture active: %s", loaded_architecture or effective_architecture)
     image_height, image_width = _get_expected_video_resolution(policy)
-    logger.info("Using checkpoint image resolution %dx%d", image_height, image_width)
+    logger.info("Using websocket image resolution %dx%d", image_height, image_width)
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
