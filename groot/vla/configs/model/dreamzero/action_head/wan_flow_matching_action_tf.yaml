@@ -11,6 +11,13 @@ text_encoder_pretrained_path: null
 image_encoder_pretrained_path: null
 vae_pretrained_path: null
 train_architecture: "lora"
+architecture: joint
+mot_action_hidden_dim: 1024
+mot_action_ffn_dim: null
+mot_action_num_layers: null
+mot_action_num_heads: 8
+mot_action_video_attention: first_frame
+mot_action_video_ki: false
 num_frame_per_block: 1
 num_action_per_block: 32
 num_state_per_block: 1
@@ -33,6 +40,13 @@ action_head_cfg:
     lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
     init_lora_weights: "kaiming"
     train_architecture: ${train_architecture}
+    architecture: ${architecture}
+    mot_action_hidden_dim: ${mot_action_hidden_dim}
+    mot_action_ffn_dim: ${mot_action_ffn_dim}
+    mot_action_num_layers: ${mot_action_num_layers}
+    mot_action_num_heads: ${mot_action_num_heads}
+    mot_action_video_attention: ${mot_action_video_attention}
+    mot_action_video_ki: ${mot_action_video_ki}
     use_gradient_checkpointing: true
     add_pos_embed: ${add_pos_embed}
     model_dtype: float32
@@ -94,15 +108,6 @@ action_head_cfg:
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
-
-    # ========== DECOUPLED NOISE SAMPLING CONFIG ==========
-    # When true: video uses Beta(alpha,beta) biased high, action uses independent uniform
-    # When false (default): original behavior - video and action share same timestep
-    decouple_video_action_noise: false
-    # Beta params (only used when decouple_video_action_noise=true)
-    # Beta(3,1): mean=0.75, Beta(5,1): mean=0.83 (higher alpha = more bias to high noise)
-    video_noise_beta_alpha: 3.0
-    video_noise_beta_beta: 1.0
 
     tune_projector: true
     tune_diffusion_model: true

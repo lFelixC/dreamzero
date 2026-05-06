@@ -11,6 +11,7 @@ model: ???
 
 # === Data Arguments ===
 train_dataset: ???
+val_dataset: null
 
 # ======== Trainer ========
 trainer:
@@ -68,6 +69,7 @@ max_steps: -1
 save_strategy: steps
 save_steps: 500
 eval_strategy: "no"  # there has to be a double quote; otherwise a bare `no` will be interpreted as False
+eval_steps: null
 save_total_limit: 8
 report_to: wandb
 seed: 42
@@ -118,6 +120,8 @@ training_args:
   save_strategy: ${save_strategy}
   save_steps: ${save_steps}
   save_total_limit: ${save_total_limit}
+  eval_strategy: ${eval_strategy}
+  eval_steps: ${eval_steps}
   report_to: ${report_to}
   seed: ${seed}
   do_eval: ${do_eval}

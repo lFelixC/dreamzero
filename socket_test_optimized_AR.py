@@ -1,16 +1,21 @@
 import dataclasses
+import json
 import logging
 import socket
 import asyncio
 import os
 import http
 import logging
+import shutil
+import tempfile
 import time
 import traceback
 import torch
 import tyro
 from einops import rearrange
 import datetime
+from pathlib import Path
+from typing import Literal
 
 from eval_utils.torch_compile_backend import configure_torch_compile_backend
 from eval_utils.inference_rtc import (
@@ -44,15 +49,20 @@ from groot.vla.utils.nvtx_utils import nvtx_range
 
 DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
 RESET_FLAG_KEY = "__reset_policy_state__"
+WAN_JOINT_MODEL_TARGET = "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel"
+WAN_MOT_MODEL_TARGET = "groot.vla.model.dreamzero.modules.dreamzero_mot.MoTCausalWanModel"
 
 logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class Args:
+    host: str = "0.0.0.0"
     port: int = 8000
     timeout_seconds: int = 604800  # 7 days default, configurable
     handshake_timeout_seconds: float | None = 0.0  # <= 0 disables the opening-handshake timeout.
     model_path: str = "./checkpoints/dreamzero"
+    architecture: Literal["auto", "joint", "mot"] = "auto"
+    allow_architecture_override: bool = False
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
@@ -62,6 +72,113 @@ class Args:
     rtc_prefix_attention_schedule: str = "EXP"
     rtc_guidance_max_steps: int = 4
     rtc_guidance_step_stride: int = 1
+
+
+def _action_head_inner_cfg(config: dict) -> dict | None:
+    action_head_cfg = config.get("action_head_cfg")
+    if not isinstance(action_head_cfg, dict):
+        return None
+    inner_cfg = action_head_cfg.get("config", action_head_cfg)
+    return inner_cfg if isinstance(inner_cfg, dict) else None
+
+
+def _read_checkpoint_architecture(model_path: str) -> str | None:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return None
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    inner_cfg = _action_head_inner_cfg(config)
+    if inner_cfg is None:
+        return None
+    architecture = inner_cfg.get("architecture")
+    return str(architecture) if architecture in ("joint", "mot") else None
+
+
+def _copy_checkpoint_with_architecture_override(
+    model_path: str,
+    architecture: Literal["joint", "mot"],
+) -> tuple[str, tempfile.TemporaryDirectory]:
+    """Create a temporary checkpoint view with only config.json patched.
+
+    This is intentionally opt-in. Joint and MoT checkpoints have different
+    parameter layouts, so overriding the architecture is mostly useful for
+    recovering from an incorrectly saved config.
+    """
+    src_dir = Path(model_path).resolve()
+    config_path = src_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing checkpoint config: {config_path}")
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="dreamzero_arch_override_")
+    dst_dir = Path(temp_dir.name)
+
+    for child in src_dir.iterdir():
+        if child.name == "config.json":
+            continue
+        dst = dst_dir / child.name
+        try:
+            os.symlink(child, dst, target_is_directory=child.is_dir())
+        except OSError:
+            if child.is_dir():
+                shutil.copytree(child, dst, symlinks=True)
+            else:
+                shutil.copy2(child, dst)
+
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    inner_cfg = _action_head_inner_cfg(config)
+    if inner_cfg is None:
+        raise ValueError(f"Could not find action_head_cfg.config in {config_path}")
+
+    inner_cfg["architecture"] = architecture
+    diffusion_cfg = inner_cfg.get("diffusion_model_cfg")
+    if isinstance(diffusion_cfg, dict):
+        diffusion_cfg["_target_"] = WAN_MOT_MODEL_TARGET if architecture == "mot" else WAN_JOINT_MODEL_TARGET
+
+    patched_config_path = dst_dir / "config.json"
+    with patched_config_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+    return str(dst_dir), temp_dir
+
+
+def _resolve_model_path_for_architecture(args: Args) -> tuple[str, str, tempfile.TemporaryDirectory | None]:
+    checkpoint_architecture = _read_checkpoint_architecture(args.model_path)
+    if args.architecture == "auto":
+        effective_architecture = checkpoint_architecture or "joint"
+        logger.info(
+            "Using checkpoint WAM architecture=%s (model_path=%s)",
+            effective_architecture,
+            args.model_path,
+        )
+        return args.model_path, effective_architecture, None
+
+    requested_architecture = args.architecture
+    if checkpoint_architecture == requested_architecture:
+        logger.info(
+            "Using requested WAM architecture=%s from checkpoint config",
+            requested_architecture,
+        )
+        return args.model_path, requested_architecture, None
+
+    mismatch = (
+        f"Requested architecture={requested_architecture!r}, but checkpoint "
+        f"{args.model_path!r} declares architecture={checkpoint_architecture or 'joint(default)'!r}."
+    )
+    if not args.allow_architecture_override:
+        raise ValueError(
+            mismatch
+            + " Use a matching joint/MoT checkpoint, or pass --allow-architecture-override only if the saved config is wrong."
+        )
+
+    logger.warning("%s Forcing a temporary config override.", mismatch)
+    override_path, temp_dir = _copy_checkpoint_with_architecture_override(
+        args.model_path,
+        requested_architecture,
+    )
+    return override_path, requested_architecture, temp_dir
 
 
 class ARDroidRoboarenaPolicy:
@@ -84,6 +201,7 @@ class ARDroidRoboarenaPolicy:
         image_height: int,
         image_width: int,
         output_dir: str | None = None,
+        max_chunk_size: int | None = None,
         use_rtc: bool = False,
         rtc_execution_horizon: int = 10,
         rtc_max_guidance_weight: float = 10.0,
@@ -96,6 +214,7 @@ class ARDroidRoboarenaPolicy:
         self._image_height = image_height
         self._image_width = image_width
         self._output_dir = output_dir
+        self._max_chunk_size = max_chunk_size
         self._use_rtc = use_rtc
         self._rtc_execution_horizon = rtc_execution_horizon
         self._rtc_max_guidance_weight = rtc_max_guidance_weight
@@ -351,6 +470,8 @@ class ARDroidRoboarenaPolicy:
         
         # Concatenate: (N, 7) + (N, 1) -> (N, 8)
         action = np.concatenate([joint_action, gripper_action], axis=-1).astype(np.float32)
+        if self._max_chunk_size is not None and self._max_chunk_size > 0:
+            action = action[: self._max_chunk_size]
         
         return action
     
@@ -994,10 +1115,12 @@ def main(args: Args) -> None:
 
     embodiment_tag = "oxe_droid"
     model_path = args.model_path
+    load_model_path, effective_architecture, _architecture_override_tmp = _resolve_model_path_for_architecture(args)
     policy_metadata = {
         "embodiment": embodiment_tag,
         "model_name": "dreamzero",
         "model_path": model_path,
+        "architecture": effective_architecture,
     }
 
     with nvtx_range("dreamzero.ar.init.mesh"):
@@ -1012,10 +1135,17 @@ def main(args: Args) -> None:
     with nvtx_range("dreamzero.ar.init.policy_load"):
         policy = GrootSimPolicy(
             embodiment_tag=EmbodimentTag(embodiment_tag),
-            model_path=model_path,
+            model_path=load_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
             device_mesh=device_mesh,
         )
+    loaded_architecture = getattr(getattr(policy.trained_model, "action_head", None), "config", None)
+    loaded_architecture = getattr(loaded_architecture, "architecture", None)
+    if loaded_architecture in ("joint", "mot") and loaded_architecture != effective_architecture:
+        raise RuntimeError(
+            f"Loaded WAM architecture {loaded_architecture!r}, expected {effective_architecture!r}."
+        )
+    logger.info("DreamZero WAM architecture active: %s", loaded_architecture or effective_architecture)
     image_height, image_width = _get_expected_video_resolution(policy)
     logger.info("Using checkpoint image resolution %dx%d", image_height, image_width)
 
@@ -1045,6 +1175,7 @@ def main(args: Args) -> None:
             image_height=image_height,
             image_width=image_width,
             output_dir=output_dir,
+            max_chunk_size=args.max_chunk_size,
             use_rtc=args.use_rtc,
             rtc_execution_horizon=args.rtc_execution_horizon,
             rtc_max_guidance_weight=args.rtc_max_guidance_weight,
@@ -1066,10 +1197,11 @@ def main(args: Args) -> None:
     if rank == 0:
         logging.info("Using roboarena policy server interface")
         logging.info(f"Server config: {server_config}")
+        logging.info("Serving DreamZero AR %s websocket server on ws://%s:%d", effective_architecture, args.host, args.port)
         roboarena_server = RoboarenaServer(
             policy=wrapper_policy,
             server_config=server_config,
-            host="0.0.0.0",
+            host=args.host,
             port=args.port,
             open_timeout=args.handshake_timeout_seconds,
         )
@@ -1079,7 +1211,7 @@ def main(args: Args) -> None:
         # We'll use the existing WebsocketPolicyServer's worker loop mechanism
         server = WebsocketPolicyServer(
             policy=policy,
-            host="0.0.0.0",
+            host=args.host,
             port=args.port,
             metadata=policy_metadata,
             output_dir=output_dir,

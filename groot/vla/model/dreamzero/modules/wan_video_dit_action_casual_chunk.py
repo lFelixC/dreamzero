@@ -126,12 +126,16 @@ def causal_rope_action_apply_no_polar(
         freqs_action_slice = freqs_action[
             action_state_index * num_action_per_block:(action_state_index + 1) * num_action_per_block
         ]
-        freqs_state_slice = freqs_state[
-            action_state_index * num_state_per_block:(action_state_index + 1) * num_state_per_block
-        ]
+        freqs_1d_parts = [freqs_action_slice]
+        if num_state_per_block > 0:
+            freqs_1d_parts.append(
+                freqs_state[
+                    action_state_index * num_state_per_block:(action_state_index + 1) * num_state_per_block
+                ]
+            )
         
         # Combine the action/state tokens for this frame
-        freqs_1d = torch.cat([freqs_action_slice, freqs_state_slice], dim=0).view(
+        freqs_1d = torch.cat(freqs_1d_parts, dim=0).view(
             action_register_length, 1, -1, 2
         )
         
@@ -172,10 +176,14 @@ def causal_rope_action_apply_polar(
         freqs_action = freqs_action[
             action_state_index * num_action_per_block:(action_state_index + 1) * num_action_per_block
         ]
-        freqs_state = freqs_state[
-            action_state_index * num_state_per_block:(action_state_index + 1) * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
+        freqs_1d_parts = [freqs_action]
+        if num_state_per_block > 0:
+            freqs_1d_parts.append(
+                freqs_state[
+                    action_state_index * num_state_per_block:(action_state_index + 1) * num_state_per_block
+                ]
+            )
+        freqs_1d = torch.cat(freqs_1d_parts, dim=0).view(action_register_length, 1, -1)
         freqs = torch.cat([freqs, freqs_1d], dim=0)
 
     # apply rotary embedding
@@ -622,6 +630,84 @@ class CausalWanSelfAttention(nn.Module):
                 output[:, block_start:block_end] = self.attn(q_block, k_context, v_context)
         
         return output
+
+    def _process_clean_image_only_stable(self, clean_image_q, clean_image_k, clean_image_v):
+        """Stable image-only teacher-forcing clean branch.
+
+        The optimized image-only path uses a single causal attention call with unequal
+        Q/K lengths in some cases. That path can produce NaNs on the 5B bf16 setup, so
+        MoT's video-only branch uses this explicit block loop instead.
+        """
+        block_size = self.frame_seqlen * self.num_frame_per_block
+        total_len = clean_image_q.shape[1]
+        output = torch.empty_like(clean_image_q)
+
+        first_end = min(self.frame_seqlen, total_len)
+        output[:, :first_end] = self.attn(
+            clean_image_q[:, :first_end],
+            clean_image_k[:, :first_end],
+            clean_image_v[:, :first_end],
+        )
+
+        for block_start in range(self.frame_seqlen, total_len, block_size):
+            block_end = min(block_start + block_size, total_len)
+            output[:, block_start:block_end] = self.attn(
+                clean_image_q[:, block_start:block_end],
+                clean_image_k[:, :block_end],
+                clean_image_v[:, :block_end],
+            )
+
+        return output
+
+    def _process_noisy_image_only_blocks(
+        self,
+        noisy_image_q,
+        noisy_image_k,
+        noisy_image_v,
+        clean_image_k,
+        clean_image_v,
+    ):
+        """Stable image-only teacher-forcing noisy branch.
+
+        Mirrors the Joint video/action branch without appending action/state tokens:
+        each noisy image block can attend to the first/previous clean context and its
+        current noisy block, but not future noisy image blocks.
+        """
+        block_size = self.frame_seqlen * self.num_frame_per_block
+        total_len = noisy_image_q.shape[1]
+        output = torch.empty_like(noisy_image_q)
+
+        first_end = min(self.frame_seqlen, total_len)
+        output[:, :first_end] = self.attn(
+            noisy_image_q[:, :first_end],
+            noisy_image_k[:, :first_end],
+            noisy_image_v[:, :first_end],
+        )
+
+        for block_start in range(self.frame_seqlen, total_len, block_size):
+            block_end = min(block_start + block_size, total_len)
+            clean_end = min(block_start, clean_image_k.shape[1])
+            k_context = torch.cat(
+                [
+                    clean_image_k[:, :clean_end],
+                    noisy_image_k[:, block_start:block_end],
+                ],
+                dim=1,
+            )
+            v_context = torch.cat(
+                [
+                    clean_image_v[:, :clean_end],
+                    noisy_image_v[:, block_start:block_end],
+                ],
+                dim=1,
+            )
+            output[:, block_start:block_end] = self.attn(
+                noisy_image_q[:, block_start:block_end],
+                k_context,
+                v_context,
+            )
+
+        return output
     
     def _process_state_blocks(self, state_q, state_k, state_v, state_horizon):
         """Process state blocks: self-attention only - OPTIMIZED
@@ -952,27 +1038,25 @@ class CausalWanSelfAttention(nn.Module):
                         noisy_image_outputs, noisy_action_outputs, noisy_state_outputs
                     ], dim=1)
                 else:
-                    # No action/state tokens, fall back to simple image-only teacher forcing
-                    half_frames = half_seq_len // self.frame_seqlen
+                    # No action/state tokens: use a stable image-only teacher-forcing path.
+                    # This keeps MoT's video expert independent from action tokens while
+                    # preserving the same block-wise causality pattern as the Joint branch.
                     clean_q = roped_query[:, :half_seq_len]
                     clean_k = roped_key[:, :half_seq_len]
                     clean_v = v[:, :half_seq_len]
                     noisy_q = roped_query[:, half_seq_len:]
                     noisy_k = roped_key[:, half_seq_len:]
                     noisy_v = v[:, half_seq_len:]
-                    
-                    # Process clean frames with blockwise causal attention
-                    x_clean = self._blockwise_causal_flash_attn(
-                        clean_q, clean_k, clean_v, self.frame_seqlen, self.num_frame_per_block,
-                        action_horizon=None, state_horizon=None,
-                        num_action_per_block=None, num_state_per_block=None,
-                        visualize_mask=False)
-                    
-                    # Process noisy frames: attend to all clean frames + themselves
-                    full_k = torch.cat([clean_k, noisy_k], dim=1)
-                    full_v = torch.cat([clean_v, noisy_v], dim=1)
-                    x_noisy = self.attn(noisy_q, full_k, full_v)
-                    
+
+                    x_clean = self._process_clean_image_only_stable(clean_q, clean_k, clean_v)
+                    x_noisy = self._process_noisy_image_only_blocks(
+                        noisy_q,
+                        noisy_k,
+                        noisy_v,
+                        clean_k,
+                        clean_v,
+                    )
+
                     x = torch.cat([x_clean, x_noisy], dim=1)
 
             else:
@@ -2140,7 +2224,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                x, updated_kv_cache = block(x, **kwargs)
+                assert updated_kv_cache is None
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]

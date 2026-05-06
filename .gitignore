@@ -164,6 +164,7 @@ cython_debug/
 # log
 outputs/
 logs/
+swanlog/
 *logs_rl*
 !external_dependencies/OpenHomie/HomieRL/legged_gym/logs/exported/policies/*.onnx
 

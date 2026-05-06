@@ -109,9 +109,10 @@ def rope_action_apply_no_polar(
 
     if action_register_length is not None:
         chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
-        freqs_1d_action = freqs_action[:chunk_size * num_action_per_block]
-        freqs_1d_state = freqs_state[:chunk_size * num_state_per_block]
-        freqs = torch.cat([freqs, freqs_1d_action, freqs_1d_state], dim=0)
+        freqs_1d_parts = [freqs_action[:chunk_size * num_action_per_block]]
+        if num_state_per_block > 0:
+            freqs_1d_parts.append(freqs_state[:chunk_size * num_state_per_block])
+        freqs = torch.cat([freqs, *freqs_1d_parts], dim=0)
 
     # Reshape freqs to be broadcastable: (1, seq_len, 1, D)
     freqs = freqs.unsqueeze(0).unsqueeze(2)
@@ -149,9 +150,22 @@ def rope_action_apply_polar(
 
         chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
 
-        freqs_1d_action = freqs_action[:chunk_size * num_action_per_block].view(chunk_size * num_action_per_block, 1, -1)
-        freqs_1d_state = freqs_state[:chunk_size * num_state_per_block].view(chunk_size * num_state_per_block, 1, -1)
-        freqs = torch.cat([freqs, freqs_1d_action, freqs_1d_state], dim=0)
+        freqs_1d_parts = [
+            freqs_action[:chunk_size * num_action_per_block].view(
+                chunk_size * num_action_per_block,
+                1,
+                -1,
+            )
+        ]
+        if num_state_per_block > 0:
+            freqs_1d_parts.append(
+                freqs_state[:chunk_size * num_state_per_block].view(
+                    chunk_size * num_state_per_block,
+                    1,
+                    -1,
+                )
+            )
+        freqs = torch.cat([freqs, *freqs_1d_parts], dim=0)
 
     # apply rotary embedding
     freqs = freqs.unsqueeze(0)

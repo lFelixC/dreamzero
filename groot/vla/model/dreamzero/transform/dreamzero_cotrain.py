@@ -89,7 +89,7 @@ class HuggingfaceTokenizer:
         return text
 
 
-def _pad_and_stack_numpy(values: List[np.ndarray]) -> np.ndarray:
+def _pad_and_stack_numpy(values: List[np.ndarray], target_shape: tuple[int, ...] | None = None) -> np.ndarray:
     """Pad variable-length arrays with zeros at the tail, then stack."""
     if len(values) == 0:
         raise ValueError("Cannot stack an empty list of arrays.")
@@ -101,7 +101,15 @@ def _pad_and_stack_numpy(values: List[np.ndarray]) -> np.ndarray:
     if len(ndims) != 1:
         raise ValueError(f"Cannot pad arrays with different ranks: {sorted(ndims)}")
 
-    target_shape = tuple(max(value.shape[dim] for value in values) for dim in range(values[0].ndim))
+    batch_target_shape = tuple(max(value.shape[dim] for value in values) for dim in range(values[0].ndim))
+    if target_shape is not None:
+        if len(target_shape) != values[0].ndim:
+            raise ValueError(
+                f"target_shape rank {len(target_shape)} does not match array rank {values[0].ndim}"
+            )
+        target_shape = tuple(max(batch_dim, fixed_dim) for batch_dim, fixed_dim in zip(batch_target_shape, target_shape))
+    else:
+        target_shape = batch_target_shape
     stacked = np.zeros((len(values), *target_shape), dtype=values[0].dtype)
 
     for index, value in enumerate(values):
@@ -111,15 +119,24 @@ def _pad_and_stack_numpy(values: List[np.ndarray]) -> np.ndarray:
     return stacked
 
 
-def _build_prefix_mask(lengths: List[int]) -> np.ndarray:
-    max_length = max(lengths)
+def _build_prefix_mask(lengths: List[int], max_length: int | None = None) -> np.ndarray:
+    max_length = max(lengths) if max_length is None else max(max(lengths), max_length)
     mask = np.zeros((len(lengths), max_length), dtype=bool)
     for index, length in enumerate(lengths):
         mask[index, :length] = True
     return mask
 
 
-def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
+def collate(
+    features: List[dict],
+    tokenizer: AutoTokenizer,
+    num_views=3,
+    embodiment_tag_mapping=None,
+    num_frames: int | None = None,
+    max_chunk_size: int | None = None,
+    num_action_per_block: int | None = None,
+    num_state_per_block: int | None = None,
+) -> dict:
     batch = {}
     keys = features[0].keys()
 
@@ -195,10 +212,30 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
         else:
             values = [elem[key] for elem in features]
             if all(isinstance(value, np.ndarray) for value in values):
-                batch[key] = torch.from_numpy(_pad_and_stack_numpy(values))
+                target_shape = None
+                if key == "images" and num_frames is not None:
+                    # Keep shapes stable across per-process batches. Accelerate's
+                    # IterableDataset dispatcher concatenates several batches on
+                    # rank 0 before slicing them across ranks; local max-length
+                    # padding can therefore make those batches incompatible.
+                    target_shape = (num_frames, *values[0].shape[1:])
+                elif (
+                    key in {"action", "action_mask", "lapa_action", "lapa_action_mask"}
+                    and max_chunk_size is not None
+                    and num_action_per_block is not None
+                ):
+                    target_shape = (max_chunk_size * num_action_per_block, *values[0].shape[1:])
+                elif (
+                    key in {"state", "state_mask"}
+                    and max_chunk_size is not None
+                    and num_state_per_block is not None
+                ):
+                    target_shape = (max_chunk_size * num_state_per_block, *values[0].shape[1:])
+
+                batch[key] = torch.from_numpy(_pad_and_stack_numpy(values, target_shape=target_shape))
                 if key == "images":
                     batch["images_mask"] = torch.from_numpy(
-                        _build_prefix_mask([value.shape[0] for value in values])
+                        _build_prefix_mask([value.shape[0] for value in values], max_length=num_frames)
                     )
             else:
                 batch[key] = torch.from_numpy(np.stack(values))
@@ -207,14 +244,37 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
 
 
 class DefaultDataCollator(DataCollatorMixin):
-    def __init__(self, tokenizer_path: str="google/umt5-xxl", max_length: int=512, num_views: int=1, embodiment_tag_mapping=None):
+    def __init__(
+        self,
+        tokenizer_path: str = "google/umt5-xxl",
+        max_length: int = 512,
+        num_views: int = 1,
+        embodiment_tag_mapping=None,
+        num_frames: int | None = None,
+        max_chunk_size: int | None = None,
+        num_action_per_block: int | None = None,
+        num_state_per_block: int | None = None,
+    ):
         super().__init__()
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=max_length, clean='whitespace')
         self.num_views = num_views
         self.embodiment_tag_mapping = embodiment_tag_mapping
+        self.num_frames = num_frames
+        self.max_chunk_size = max_chunk_size
+        self.num_action_per_block = num_action_per_block
+        self.num_state_per_block = num_state_per_block
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        return collate(
+            features,
+            self.tokenizer,
+            self.num_views,
+            self.embodiment_tag_mapping,
+            num_frames=self.num_frames,
+            max_chunk_size=self.max_chunk_size,
+            num_action_per_block=self.num_action_per_block,
+            num_state_per_block=self.num_state_per_block,
+        )
 
 
 class DreamTransform(InvertibleModalityTransform):
@@ -557,8 +617,11 @@ class DreamTransform(InvertibleModalityTransform):
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
 
-        if self.training:
-            # 3) Prepare actions
+        has_action_supervision = self.training or "action" in data
+        if has_action_supervision:
+            # 3) Prepare actions. Validation loss uses the same supervised
+            # video/action denoising path as training, so eval samples with
+            # action labels must keep action, action_mask, and has_real_action.
             is_detection_instance = self.embodiment_tag == EmbodimentTag.GR1_UNIFIED_SEGMENTATION
             if is_detection_instance:
                 transformed_data["segmentation_target"] = data["action"][0, -3:-1]
@@ -633,7 +696,7 @@ class DreamTransform(InvertibleModalityTransform):
             transformed_data["action"] = reshaped_lapa_actions
             transformed_data["action_mask"] = np.ones(actions_shape, dtype=bool)
 
-        if self.training:
+        if has_action_supervision:
             action_and_mask_keys = ["action", "action_mask", "lapa_action", "lapa_action_mask"]
             assert all(
                 transformed_data[key].shape == transformed_data["action"].shape
@@ -654,8 +717,10 @@ class DreamTransform(InvertibleModalityTransform):
         return collate(data_split_processed, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
 
     def apply(self, data: dict) -> dict:
-        if not self.training and data["video"].ndim == 5:
-            data["video"] = data["video"][None, ...]
+        # Dataset samples are unbatched in both train and val.  A 5D video is
+        # [T, V, H, W, C] and should stay on apply_single(); adding a batch dim
+        # here would make apply_batch() index state/action down from [T, D] to
+        # [D], which then breaks the 2D padding in _prepare_state/_prepare_action.
         is_batched, batch_size = self.check_keys_and_batch_size(data)
         if is_batched:
             return self.apply_batch(data, batch_size)

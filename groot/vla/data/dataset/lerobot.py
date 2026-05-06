@@ -135,6 +135,7 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        episode_filter_path: str | Path | None = None,
     ):
         """
         Initialize the dataset.
@@ -173,6 +174,7 @@ class LeRobotSingleDataset(Dataset):
         self.discard_bad_trajectories = discard_bad_trajectories
         self.relative_action = relative_action
         self.relative_action_per_horizon = relative_action_per_horizon
+        self.episode_filter_path = Path(episode_filter_path) if episode_filter_path else None
         # Determine which action keys should use relative action
         if relative_action_keys is not None:
             self.relative_action_keys = relative_action_keys
@@ -193,8 +195,14 @@ class LeRobotSingleDataset(Dataset):
         
         # Initialize trajectory info and chunk size early (needed for relative stats calculation)
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+        self._apply_episode_filter()
         self._data_path_pattern = self._get_data_path_pattern()
+        self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
+        self._tasks = self._get_tasks()
+        self._detailed_global_instructions = self._get_detailed_global_instructions()
+        self.curr_traj_data = None
+        self.curr_traj_id = None
         
         # Set default relative_action_keys if not provided
         if self.relative_action and self._relative_action_keys_input is None:
@@ -236,17 +244,50 @@ class LeRobotSingleDataset(Dataset):
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
-        print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
-
-        # LeRobot-specific config (some already initialized above for relative stats)
-        self._video_path_pattern = self._get_video_path_pattern()
-        self._tasks = self._get_tasks()
-        self._detailed_global_instructions = self._get_detailed_global_instructions()
-        self.curr_traj_data = None
-        self.curr_traj_id = None
-
         # Check if the dataset is valid
         self._check_integrity()
+
+        print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
+
+    def _load_episode_filter(self) -> set[int] | None:
+        if self.episode_filter_path is None:
+            return None
+        if not self.episode_filter_path.exists():
+            raise FileNotFoundError(f"Episode filter file not found: {self.episode_filter_path}")
+        with open(self.episode_filter_path, "r") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            episode_ids = (
+                payload.get("episode_indices")
+                or payload.get("episode_ids")
+                or payload.get("episodes")
+            )
+        else:
+            episode_ids = payload
+        if episode_ids is None:
+            raise ValueError(
+                f"Episode filter {self.episode_filter_path} must be a list or contain episode_indices."
+            )
+        return {int(episode_id) for episode_id in episode_ids}
+
+    def _apply_episode_filter(self) -> None:
+        episode_filter = self._load_episode_filter()
+        if episode_filter is None:
+            return
+        keep_mask = np.array(
+            [int(trajectory_id) in episode_filter for trajectory_id in self._trajectory_ids],
+            dtype=bool,
+        )
+        if not keep_mask.any():
+            raise ValueError(
+                f"Episode filter {self.episode_filter_path} did not match any trajectories."
+            )
+        self._trajectory_ids = self._trajectory_ids[keep_mask]
+        self._trajectory_lengths = self._trajectory_lengths[keep_mask]
+        print(
+            f"Applied episode filter {self.episode_filter_path}: "
+            f"{len(self._trajectory_ids)} trajectories"
+        )
 
     @property
     def dataset_path(self) -> Path:
@@ -981,14 +1022,19 @@ class LeRobotSingleDataset(Dataset):
                 for line in f:
                     episode_step_filter = json.loads(line)
                     trajectory_id = episode_step_filter["episode_index"]
-                    all_indices = np.arange(self.trajectory_lengths[trajectory_id].item())
+                    trajectory_index = self.get_trajectory_index(trajectory_id)
+                    all_indices = np.arange(self.trajectory_lengths[trajectory_index].item())
                     indices_to_filter = np.array(episode_step_filter["step_indices"])
                     step_filter[trajectory_id] = np.setdiff1d(all_indices, indices_to_filter)
         else:
             for trajectory_id in self.trajectory_ids:
+                trajectory_index = self.get_trajectory_index(trajectory_id)
                 step_filter[trajectory_id] = np.arange(
-                    self.trajectory_lengths[trajectory_id].item()
+                    self.trajectory_lengths[trajectory_index].item()
                 )
+        for trajectory_id, trajectory_length in zip(self.trajectory_ids, self.trajectory_lengths):
+            if trajectory_id not in step_filter:
+                step_filter[trajectory_id] = np.arange(trajectory_length.item())
         return step_filter
 
     def _get_metadata(self) -> DatasetMetadata:

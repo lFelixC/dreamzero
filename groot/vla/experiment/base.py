@@ -96,9 +96,23 @@ class LossLoggerCallback(TrainerCallback):
         if not state.is_world_process_zero or logs is None:
             return
         entry = {"step": state.global_step}
-        for key in ("loss", "dynamics_loss_avg", "action_loss_avg", "learning_rate"):
+        for key in (
+            "loss",
+            "dynamics_loss_avg",
+            "action_loss_avg",
+            "train/loss_total",
+            "train/loss_video",
+            "train/loss_action",
+            "val/loss_total",
+            "val/loss_video",
+            "val/loss_action",
+            "learning_rate",
+        ):
             if key in logs:
                 entry[key] = logs[key]
+        for key, value in logs.items():
+            if key.startswith("train/mot_") or key.startswith("mot_"):
+                entry[key] = value
         if len(entry) > 1:  # more than just "step"
             with open(self.output_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -415,6 +429,33 @@ class BaseTrainer(transformers.Trainer):
 
         self.loss_queues = {}
         self.loss_queue_size = 10
+        self._eval_loss_sums = {}
+        self._eval_loss_count = 0
+
+    @staticmethod
+    def _loss_aliases(outputs) -> dict[str, float]:
+        aliases = {
+            "loss_total": outputs.get("loss"),
+            "loss_video": outputs.get("dynamics_loss"),
+            "loss_action": outputs.get("action_loss"),
+        }
+        result = {}
+        for key, value in aliases.items():
+            if value is None:
+                continue
+            result[key] = value.detach().float().mean().item() if torch.is_tensor(value) else float(value)
+        return result
+
+    @staticmethod
+    def _metric_aliases(outputs) -> dict[str, float]:
+        result = {}
+        for key, value in outputs.items():
+            if not key.startswith("mot_"):
+                continue
+            if value is None:
+                continue
+            result[key] = value.detach().float().mean().item() if torch.is_tensor(value) else float(value)
+        return result
 
     def _install_backward_nvtx_wrapper(self) -> None:
         original_backward = self.accelerator.backward
@@ -474,29 +515,67 @@ class BaseTrainer(transformers.Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         with self.timer.with_label("model_forward"), nvtx_range("dreamzero.train.model_forward"):
             outputs = model(inputs)
-        ### For additional losses, track and log their moving averages
-        for key, value in outputs.items():
-            if key.endswith("_loss") and key != "loss":
-                # Initialize queue if not exists
-                if key not in self.loss_queues:
-                    self.loss_queues[key] = []
 
-                # Add current loss value to queue
-                current_value = value.item() if torch.is_tensor(value) else value
-                self.loss_queues[key].append(current_value)
+        loss_aliases = self._loss_aliases(outputs)
+        metric_aliases = self._metric_aliases(outputs)
+        if model.training:
+            if self.current_step % self.loss_queue_size == 0 and loss_aliases:
+                self.log({f"train/{key}": value for key, value in loss_aliases.items()})
+            if self.current_step % self.loss_queue_size == 0 and metric_aliases:
+                self.log({f"train/{key}": value for key, value in metric_aliases.items()})
+        else:
+            for key, value in loss_aliases.items():
+                self._eval_loss_sums[key] = self._eval_loss_sums.get(key, 0.0) + value
+            self._eval_loss_count += 1
 
-                # Keep only last N values
-                if len(self.loss_queues[key]) > self.loss_queue_size:
-                    self.loss_queues[key].pop(0)
+        if model.training:
+            ### For additional losses, track and log their moving averages
+            for key, value in outputs.items():
+                if key.endswith("_loss") and key != "loss":
+                    # Initialize queue if not exists
+                    if key not in self.loss_queues:
+                        self.loss_queues[key] = []
 
-                # Log average every 10 steps
-                if self.current_step % self.loss_queue_size == 0:
-                    avg_loss = sum(self.loss_queues[key]) / len(self.loss_queues[key])
-                    self.log({f"{key}_avg": avg_loss})
+                    # Add current loss value to queue
+                    current_value = value.item() if torch.is_tensor(value) else value
+                    self.loss_queues[key].append(current_value)
+
+                    # Keep only last N values
+                    if len(self.loss_queues[key]) > self.loss_queue_size:
+                        self.loss_queues[key].pop(0)
+
+                    # Log average every 10 steps
+                    if self.current_step % self.loss_queue_size == 0:
+                        avg_loss = sum(self.loss_queues[key]) / len(self.loss_queues[key])
+                        self.log({f"{key}_avg": avg_loss})
 
         loss = outputs["loss"]
 
         return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # VLA.forward accepts one batch dictionary, while HF Trainer's default
+        # eval path calls model(**inputs) when there are no label fields. Keep
+        # validation on the same loss/forward path as training.
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, return_outputs=False)
+            loss = loss.detach().mean()
+        return loss, None, None
+
+    def evaluate(self, *args, **kwargs):
+        self._eval_loss_sums = {}
+        self._eval_loss_count = 0
+        metrics = super().evaluate(*args, **kwargs)
+        if self._eval_loss_count > 0:
+            logs = {
+                f"val/{key}": value / self._eval_loss_count
+                for key, value in self._eval_loss_sums.items()
+            }
+            self.log(logs)
+            metrics.update(logs)
+        return metrics
 
     def create_optimizer(self):
         """
@@ -653,10 +732,16 @@ class BaseTrainer(transformers.Trainer):
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
+            "drop_last": getattr(self.args, "dataloader_drop_last", False),
         }
-        # persistent_workers is only valid when num_workers > 0 (PyTorch raises otherwise)
+        # These arguments are only valid when num_workers > 0 (PyTorch raises otherwise).
         if self.args.dataloader_num_workers > 0:
             dataloader_params["persistent_workers"] = self.args.dataloader_persistent_workers
+            dataloader_prefetch_factor = getattr(
+                self.args, "dataloader_prefetch_factor", None
+            )
+            if dataloader_prefetch_factor is not None:
+                dataloader_params["prefetch_factor"] = dataloader_prefetch_factor
 
         return DataLoader(train_dataset, **dataloader_params)
 
@@ -832,6 +917,8 @@ class BaseExperiment(ABC):
         return train_dataset
 
     def create_val_dataset(self, cfg, model):
+        if "val_dataset" in cfg and cfg.val_dataset is not None:
+            return instantiate(cfg.val_dataset)
         return None
 
     def create_data_collator(self, cfg, model):

@@ -1,0 +1,53 @@
+# @package _global_
+# Small fixed DROID train/val split for Wan2.2 MoT-vs-Joint experiments.
+
+defaults:
+  - /data/dreamzero/droid_relative_wan22
+  - _self_
+
+droid_split_root: /data/datasets/dreamzero/droid_lerobot_splits
+train_episode_filter_path: ${droid_split_root}/train.json
+val_episode_filter_path: ${droid_split_root}/val.json
+train_num_shards_to_sample: 64
+val_num_shards_to_sample: 6
+dataset_shard_sampling_rate: 0.1
+val_shard_sampling_rate: 0.02
+
+train_dataset:
+  dataset_kwargs:
+    episode_filter_path: ${train_episode_filter_path}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}
+    num_shards_to_sample: ${train_num_shards_to_sample}
+
+val_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        oxe_droid:
+          - ${droid_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+    episode_filter_path: ${val_episode_filter_path}
+  mixture_kwargs:
+    training: false
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${val_shard_sampling_rate}
+    num_shards_to_sample: ${val_num_shards_to_sample}
