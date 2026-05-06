@@ -74,7 +74,6 @@ if ! [[ "${NUM_GPUS}" =~ ^[0-9]+$ ]] || [ "${NUM_GPUS}" -lt 1 ]; then
   exit 1
 fi
 DEEPSPEED_TAG="$(sanitize_name "${DEEPSPEED_CFG}")"
-
 monitor_gpu() {
   local output_csv="$1"
   echo "timestamp,gpu_index,used_mib,total_mib,utilization_gpu" > "${output_csv}"
