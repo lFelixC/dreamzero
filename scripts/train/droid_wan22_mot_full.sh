@@ -7,6 +7,11 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
 DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero/droid_lerobot}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_mix_att_anchor_full}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
+WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
+TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-${WAN22_CKPT_DIR}/models_t5_umt5-xxl-enc-bf16.pth}"
+IMAGE_ENCODER_PATH="${IMAGE_ENCODER_PATH:-${WAN22_CKPT_DIR}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth}"
+VAE_PATH="${VAE_PATH:-${WAN22_CKPT_DIR}/Wan2.2_VAE.pth}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
 
 GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}"
 if [[ -n "${GPU_IDS}" ]]; then
@@ -47,6 +52,9 @@ cd "${DREAMZERO_ROOT}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "Using NUM_GPUS=${NUM_GPUS}, PER_DEVICE_BS=${PER_DEVICE_BS}, GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "Using DATASET_ROOT=${DATASET_ROOT}"
+echo "Using WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
+echo "Using IMAGE_ENCODER_PATH=${IMAGE_ENCODER_PATH}"
+echo "Using TOKENIZER_PATH=${TOKENIZER_PATH}"
 echo "Using WANDB_PROJECT=${WANDB_PROJECT}"
 echo "Using DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS}, DATALOADER_PREFETCH_FACTOR=${DATALOADER_PREFETCH_FACTOR}"
 echo "Using DATALOADER_PERSISTENT_WORKERS=${DATALOADER_PERSISTENT_WORKERS}"
@@ -127,11 +135,11 @@ fi
   max_chunk_size="${MAX_CHUNK_SIZE}" \
   save_strategy=steps \
   droid_data_root="${DATASET_ROOT}" \
-  dit_version="${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B" \
-  text_encoder_pretrained_path="${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth" \
-  image_encoder_pretrained_path="${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
-  vae_pretrained_path="${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B/Wan2.2_VAE.pth" \
-  tokenizer_path="${CHECKPOINT_ROOT}/umt5-xxl" \
+  dit_version="${WAN22_CKPT_DIR}" \
+  text_encoder_pretrained_path="${TEXT_ENCODER_PATH}" \
+  image_encoder_pretrained_path="${IMAGE_ENCODER_PATH}" \
+  vae_pretrained_path="${VAE_PATH}" \
+  tokenizer_path="${TOKENIZER_PATH}" \
   dataset_shard_sampling_rate=0.1 \
   +training_args.dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR}" \
   "$@"
