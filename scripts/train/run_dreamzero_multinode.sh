@@ -48,7 +48,30 @@ MODEL_FRAME_SEQLEN="${MODEL_FRAME_SEQLEN:-200}"
 # Multi-node required envs
 # -----------------------------
 NNODES="${NNODES:-1}"                         # 1 / 2 / 3 / 4
-NODE_RANK="${NODE_RANK:-${MACHINE_RANK:-${GROUP_RANK:-${SLURM_NODEID:-${RANK:-0}}}}}"
+resolve_node_rank() {
+  local candidate
+  for candidate in \
+    "${NODE_RANK:-}" \
+    "${MACHINE_RANK:-}" \
+    "${GROUP_RANK:-}" \
+    "${SLURM_NODEID:-}" \
+    "${OMPI_COMM_WORLD_NODE_RANK:-}"; do
+    if [ -n "${candidate}" ]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if NODE_RANK="$(resolve_node_rank)"; then
+  :
+elif [ "${NNODES}" = "1" ]; then
+  NODE_RANK=0
+else
+  echo "ERROR: Could not resolve NODE_RANK for NNODES=${NNODES}. Set NODE_RANK explicitly or provide MACHINE_RANK, GROUP_RANK, SLURM_NODEID, or OMPI_COMM_WORLD_NODE_RANK."
+  exit 1
+fi
 MASTER_PORT="${MASTER_PORT:-29400}"           # same on all nodes
 if [ -z "${MASTER_ADDR:-}" ]; then
   if [ "${NNODES}" = "1" ]; then

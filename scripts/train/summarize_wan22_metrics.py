@@ -54,6 +54,12 @@ def summarize_run(run_dir: Path) -> dict:
 
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("experiment_logs/lr_sweep")
+    if not root.exists():
+        print(f"Run directory root does not exist: {root}", file=sys.stderr)
+        return 1
+    if not root.is_dir():
+        print(f"Run directory root is not a directory: {root}", file=sys.stderr)
+        return 1
     run_dirs = sorted(path for path in root.iterdir() if path.is_dir())
     rows = [summarize_run(path) for path in run_dirs]
     if not rows:
