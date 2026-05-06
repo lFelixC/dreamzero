@@ -25,6 +25,7 @@ from pathlib import Path
 import shutil
 import threading
 import time
+import types
 from typing import Optional
 import warnings
 
@@ -60,6 +61,7 @@ from groot.vla.utils.checkpoint_sidecar import (
     materialize_component_sidecars,
     prepare_action_head_cfg_for_checkpoint,
 )
+from groot.vla.utils.nvtx_utils import nvtx_enabled, nvtx_range
 from groot.vla.utils.timer import ContextTimer
 
 # Fix resume: https://github.com/huggingface/transformers/pull/34632/files
@@ -86,7 +88,7 @@ LAYERNORM_LAYERS = [
 
 
 class LossLoggerCallback(TrainerCallback):
-    """Callback that writes per-step loss metrics to a JSONL file for offline analysis."""
+    """Callback that writes numeric training metrics to JSONL for offline analysis."""
 
     def __init__(self, output_path: str):
         self.output_path = output_path
@@ -94,13 +96,61 @@ class LossLoggerCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not state.is_world_process_zero or logs is None:
             return
-        entry = {"step": state.global_step}
-        for key in ("loss", "dynamics_loss_avg", "action_loss_avg", "learning_rate"):
-            if key in logs:
-                entry[key] = logs[key]
-        if len(entry) > 1:  # more than just "step"
+        entry = {
+            "step": state.global_step,
+            "epoch": state.epoch,
+            "time": time.time(),
+        }
+        for key, value in logs.items():
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                entry[key] = value
+            elif torch.is_tensor(value) and value.numel() == 1:
+                entry[key] = value.detach().float().cpu().item()
+        if len(entry) > 3:
+            Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
             with open(self.output_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+
+
+class NVTXTrainerCallback(TrainerCallback):
+    """Adds light NVTX ranges around optimizer.step without touching Trainer internals."""
+
+    def __init__(self):
+        self._optimizer_step_active = False
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if not nvtx_enabled():
+            return control
+        torch.cuda.nvtx.range_push("dreamzero.train.optimizer_step")
+        self._optimizer_step_active = True
+        return control
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if self._optimizer_step_active:
+            torch.cuda.nvtx.range_pop()
+            self._optimizer_step_active = False
+        return control
+
+
+class StopAfterStepCallback(TrainerCallback):
+    """Stops training early while leaving Trainer max_steps available to the LR scheduler."""
+
+    def __init__(self, stop_after_steps: int):
+        if stop_after_steps < 1:
+            raise ValueError(f"stop_after_steps must be positive, got {stop_after_steps}")
+        self.stop_after_steps = stop_after_steps
+        self._announced = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.stop_after_steps:
+            control.should_training_stop = True
+            if state.is_world_process_zero and not self._announced:
+                print(
+                    f"Stopping training at step {state.global_step}; "
+                    f"LR scheduler max_steps remains {args.max_steps}."
+                )
+                self._announced = True
+        return control
 
 
 def maybe_enable_swanlab_sync():
@@ -390,9 +440,76 @@ class BaseTrainer(transformers.Trainer):
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
         super().__init__(**kwargs)
+        self._install_backward_nvtx_wrapper()
+        self._install_grad_clip_nvtx_wrapper()
 
         self.loss_queues = {}
         self.loss_queue_size = 10
+
+    def _install_backward_nvtx_wrapper(self) -> None:
+        original_backward = self.accelerator.backward
+        if getattr(original_backward, "_dreamzero_nvtx_wrapped", False):
+            return
+
+        def wrapped_backward(loss, **kwargs):
+            with nvtx_range("dreamzero.train.backward"):
+                return original_backward(loss, **kwargs)
+
+        wrapped_backward._dreamzero_nvtx_wrapped = True
+        self.accelerator.backward = wrapped_backward
+
+    def _install_grad_clip_nvtx_wrapper(self) -> None:
+        original_clip_grad_norm = self.accelerator.clip_grad_norm_
+        if getattr(original_clip_grad_norm, "_dreamzero_nvtx_wrapped", False):
+            return
+
+        def wrapped_clip_grad_norm(*args, **kwargs):
+            with nvtx_range("dreamzero.train.grad_clip"):
+                grad_norm = original_clip_grad_norm(*args, **kwargs)
+            if torch.is_tensor(grad_norm):
+                self._last_grad_norm = grad_norm.detach().float().cpu().item()
+            elif grad_norm is not None:
+                self._last_grad_norm = float(grad_norm)
+            return grad_norm
+
+        wrapped_clip_grad_norm._dreamzero_nvtx_wrapped = True
+        self.accelerator.clip_grad_norm_ = wrapped_clip_grad_norm
+
+    def log(self, logs, *args, **kwargs):
+        if hasattr(self, "_last_grad_norm") and "grad_norm" not in logs:
+            logs["grad_norm"] = self._last_grad_norm
+        if torch.cuda.is_available():
+            logs.setdefault(
+                "gpu_mem_allocated_gb",
+                torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024,
+            )
+            logs.setdefault(
+                "gpu_mem_reserved_gb",
+                torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024,
+            )
+        return super().log(logs, *args, **kwargs)
+
+    def _install_optimizer_step_nvtx_wrapper(self) -> None:
+        if self.optimizer is None:
+            return
+        if getattr(self.optimizer, "_dreamzero_nvtx_step_wrapped", False):
+            return
+        original_step = self.optimizer.step
+
+        def wrapped_step(_optimizer_self, *args, **kwargs):
+            with nvtx_range("dreamzero.train.optimizer_step.call"):
+                return original_step(*args, **kwargs)
+
+        self.optimizer.step = types.MethodType(wrapped_step, self.optimizer)
+        self.optimizer._dreamzero_nvtx_step_wrapped = True
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        with nvtx_range("dreamzero.train.dataloader_wait"):
+            return super().get_batch_samples(epoch_iterator, num_batches, device)
+
+    def _prepare_inputs(self, inputs):
+        with nvtx_range("dreamzero.train.prepare_inputs_h2d"):
+            return super()._prepare_inputs(inputs)
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -413,7 +530,7 @@ class BaseTrainer(transformers.Trainer):
 
         start_time = time.time()
 
-        with self.timer.with_label("training_step"), profile_context as prof:
+        with self.timer.with_label("training_step"), nvtx_range("dreamzero.train.training_step"), profile_context as prof:
             output = super().training_step(model, inputs)
 
         time_taken = time.time() - start_time
@@ -434,7 +551,7 @@ class BaseTrainer(transformers.Trainer):
         return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        with self.timer.with_label("model_forward"):
+        with self.timer.with_label("model_forward"), nvtx_range("dreamzero.train.model_forward"):
             outputs = model(inputs)
         ### For additional losses, track and log their moving averages
         for key, value in outputs.items():
@@ -505,6 +622,7 @@ class BaseTrainer(transformers.Trainer):
                 for group in self.optimizer.param_groups:
                     group.setdefault("bias_correction", True)
 
+        self._install_optimizer_step_nvtx_wrapper()
         return self.optimizer
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
@@ -857,8 +975,45 @@ class BaseExperiment(ABC):
         ckpt_format_callback = CheckpointFormatCallback(run_name=run_name, exp_cfg_dir=exp_cfg_dir)
         trainer.add_callback(ckpt_format_callback)
 
-        loss_log_path = str(Path(training_args.output_dir) / "loss_log.jsonl")
+        metrics_root = os.environ.get("DREAMZERO_METRICS_DIR")
+        stop_after_steps = cfg.get("stop_after_steps", None)
+        if metrics_root:
+            metrics_run_name = os.environ.get("DREAMZERO_METRICS_RUN_NAME") or run_name or Path(training_args.output_dir).name
+            metrics_run_dir = Path(metrics_root) / metrics_run_name
+            metrics_run_dir.mkdir(parents=True, exist_ok=True)
+            loss_log_path = str(metrics_run_dir / "metrics.jsonl")
+            with open(metrics_run_dir / "run_meta.json", "w") as f:
+                json.dump(
+                    {
+                        "run_name": metrics_run_name,
+                        "output_dir": str(training_args.output_dir),
+                        "learning_rate": cfg.training_args.learning_rate,
+                        "per_device_train_batch_size": cfg.per_device_train_batch_size,
+                        "global_batch_size": cfg.global_batch_size,
+                        "max_steps": cfg.max_steps,
+                        "stop_after_steps": stop_after_steps,
+                        "warmup_steps": cfg.training_args.warmup_steps,
+                        "warmup_ratio": cfg.training_args.warmup_ratio,
+                        "deepspeed": cfg.training_args.deepspeed,
+                        "save_strategy": cfg.save_strategy,
+                        "logging_steps": cfg.logging_steps,
+                    },
+                    f,
+                    indent=2,
+                )
+        else:
+            loss_log_path = str(Path(training_args.output_dir) / "loss_log.jsonl")
         trainer.add_callback(LossLoggerCallback(output_path=loss_log_path))
+        trainer.add_callback(NVTXTrainerCallback())
+        if stop_after_steps is not None:
+            stop_after_steps = int(stop_after_steps)
+            if stop_after_steps > 0:
+                if stop_after_steps > training_args.max_steps:
+                    raise ValueError(
+                        "stop_after_steps must be <= training_args.max_steps, got "
+                        f"stop_after_steps={stop_after_steps}, max_steps={training_args.max_steps}"
+                    )
+                trainer.add_callback(StopAfterStepCallback(stop_after_steps=stop_after_steps))
 
 
         # Add profiling callback (local profiling only, no S3 upload)
@@ -917,6 +1072,9 @@ class BaseExperiment(ABC):
     def train(self):
         # Start training.
         self.trainer.train(resume_from_checkpoint=self.resume_from_checkpoint)
+        if os.environ.get("DREAMZERO_SKIP_FINAL_SAVE", "").lower() in {"1", "true", "yes", "on"}:
+            mprint("DREAMZERO_SKIP_FINAL_SAVE is set; skipping trainer.save_state() and final model save.")
+            return
         self.trainer.save_state()
         safe_save_model_for_hf_trainer(
             trainer=self.trainer, output_dir=self.training_args.output_dir
