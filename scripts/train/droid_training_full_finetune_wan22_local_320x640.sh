@@ -1,34 +1,49 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Fixed local setup. Edit only these lines if your paths or GPU selection change.
 # This variant keeps the DROID composite at 320x640 instead of shrinking it back
 # to 160x320 inside the Wan2.2 5B action head.
-DREAMZERO_ROOT="/data/dreamzero"
-CHECKPOINT_ROOT="/data/checkpoints/dreamzero"
-DATASET_ROOT="/data/datasets/dreamzero"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-WAN22_CKPT_DIR="${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B"
-IMAGE_ENCODER_DIR="${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P"
-TOKENIZER_DIR="${CHECKPOINT_ROOT}/umt5-xxl"
-OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_droid_wan22_full_finetune_320x640_fseq200"
+if [ -n "${DREAMZERO_ROOT:-}" ] && [ -d "${DREAMZERO_ROOT}/groot" ]; then
+    :
+elif [ -d "${SCRIPT_REPO_ROOT}/groot" ]; then
+    DREAMZERO_ROOT="${SCRIPT_REPO_ROOT}"
+else
+    DREAMZERO_ROOT="/data/dreamzero"
+fi
+export DREAMZERO_ROOT
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
+DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero}"
 
-PYTHON_BIN="${DREAMZERO_ROOT}/.venv/bin/python"
+WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
+IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P}"
+TOKENIZER_DIR="${TOKENIZER_DIR:-${CHECKPOINT_ROOT}/umt5-xxl}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_full_finetune_320x640_fseq200}"
+
+PYTHON_BIN="${PYTHON_BIN:-${DREAMZERO_ROOT}/.venv/bin/python}"
 EXPERIMENT_PY="${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py"
 
-export CUDA_VISIBLE_DEVICES="4,5,6,7"
-export CUDA_HOME="/usr/local/cuda-12.9"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.9}"
+export CUDA_COMPAT_LIB_DIR="${CUDA_COMPAT_LIB_DIR:-${_CUDA_COMPAT_PATH:-/usr/local/cuda/compat}/lib}"
 export PATH="${CUDA_HOME}/bin:${PATH}"
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${CUDA_COMPAT_LIB_DIR}:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export HYDRA_FULL_ERROR=1
-export SWANLAB_SYNC_WANDB=1      # 让 wandb 日志同时同步到 SwanLab
-export WANDB_MODE=offline        # wandb 本地离线落盘；SwanLab 通过 sync_wandb 接管展示
+export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-1}"  # 让 wandb 日志同时同步到 SwanLab
+export WANDB_MODE="${WANDB_MODE:-offline}"            # wandb 本地离线落盘；SwanLab 通过 sync_wandb 接管展示
 
-PER_DEVICE_BS=1                  # 320x640 + frame_seqlen=200 先用保守 micro-batch 起跑
-DEEPSPEED_CFG="zero2_offload"    # 这一版 token 数是原 5B 50-token 配置的 4 倍，默认走 offload 更稳
-MAX_STEPS=50000                  # 总训练步数
-SAVE_STEPS=500                   # 更密一点存 checkpoint，方便早停
-MAX_CHUNK_SIZE=2                 # 大分辨率先把 chunk 控小，减少显存压力
+PER_DEVICE_BS="${PER_DEVICE_BS:-32}"              # 320x640 + frame_seqlen=200 的单卡 micro-batch
+DEEPSPEED_CFG="${DEEPSPEED_CFG:-zero2}"           # 默认 ZeRO-2，不 offload；显存不够时再用 zero2_offload
+MAX_STEPS="${MAX_STEPS:-50000}"                   # 总训练步数；smoke test 可用 MAX_STEPS=1 覆盖
+SAVE_STEPS="${SAVE_STEPS:-500}"                   # 每多少 step 存 checkpoint
+SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"           # 容量测试可用 SAVE_STRATEGY=no 覆盖
+REPORT_TO="${REPORT_TO:-wandb}"                   # 容量测试可用 REPORT_TO=none 关闭日志回调
+LEARNING_RATE="${LEARNING_RATE:-1e-5}"            # learning-rate sweep 用环境变量覆盖
+LOGGING_STEPS="${LOGGING_STEPS:-1}"               # 记录每个 optimizer step 的 loss/grad_norm
+MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-2}"             # 大分辨率先把 chunk 控小，减少显存压力
 MODEL_TARGET_HEIGHT=320          # DROID composite 最终分辨率：320x640
 MODEL_TARGET_WIDTH=640
 MODEL_FRAME_SEQLEN=200           # (320/16/2) * (640/16/2) = 10 * 20 = 200
@@ -71,14 +86,19 @@ resolve_dataset_root() {
     return 1
 }
 
-if ! DROID_DATA_ROOT="$(resolve_dataset_root "${DATASET_ROOT}")"; then
-    echo "ERROR: Could not find meta/modality.json under ${DATASET_ROOT}"
-    echo "Expected either:"
-    echo "  ${DATASET_ROOT}/meta/modality.json"
-    echo "or"
-    echo "  ${DATASET_ROOT}/droid_lerobot/meta/modality.json"
+if [ -n "${DROID_DATA_ROOT:-}" ] && [ -f "${DROID_DATA_ROOT}/meta/modality.json" ]; then
+    :
+elif DROID_DATA_ROOT="$(resolve_dataset_root "${DATASET_ROOT}")"; then
+    :
+else
+    echo "ERROR: Could not find meta/modality.json under DROID_DATA_ROOT=${DROID_DATA_ROOT:-unset} or DATASET_ROOT=${DATASET_ROOT}"
+    echo "Expected one of:"
+    echo "  DROID_DATA_ROOT/meta/modality.json"
+    echo "  DATASET_ROOT/meta/modality.json"
+    echo "  DATASET_ROOT/droid_lerobot/meta/modality.json"
     exit 1
 fi
+export DROID_DATA_ROOT
 
 echo "Using DROID_DATA_ROOT=${DROID_DATA_ROOT}"
 
@@ -101,7 +121,7 @@ mkdir -p "${OUTPUT_DIR}"
 cd "${DREAMZERO_ROOT}"
 
 TRAIN_OVERRIDES=(
-    "report_to=wandb"                                                           # 日志上报到 wandb；不想联网可改成 none
+    "report_to=${REPORT_TO}"                                                    # 日志上报到 wandb；不想联网可改成 none
     "data=dreamzero/droid_relative_wan22"                                       # 使用的 Hydra 数据配置：DROID + Wan2.2 分辨率版本
     "wandb_project=dreamzero"                                                   # wandb project 名称
     "train_architecture=full"                                                   # 全量微调，不是 LoRA
@@ -115,10 +135,11 @@ TRAIN_OVERRIDES=(
     "num_action_per_block=24"                                                   # 每个 block 对应的动作 token 数
     "num_state_per_block=1"                                                     # 每个 block 对应的状态 token 数
     "seed=42"                                                                   # 随机种子
-    "training_args.learning_rate=1e-5"                                          # 学习率
+    "training_args.learning_rate=${LEARNING_RATE}"                              # 学习率
     "training_args.deepspeed=groot/vla/configs/deepspeed/${DEEPSPEED_CFG}.json" # DeepSpeed 配置文件
     "save_steps=${SAVE_STEPS}"                                                  # 每多少 step 存一次 checkpoint
     "training_args.warmup_ratio=0.05"                                           # warmup 比例
+    "logging_steps=${LOGGING_STEPS}"                                            # 每多少 step 记录一次指标
     "output_dir=${OUTPUT_DIR}"                                                  # checkpoint / 日志输出目录
     "per_device_train_batch_size=${PER_DEVICE_BS}"                              # 每张 GPU 的 micro-batch size
     "global_batch_size=${GLOBAL_BATCH_SIZE}"                                    # 目标有效 batch size；训练器会自动换算梯度累积
@@ -138,7 +159,7 @@ TRAIN_OVERRIDES=(
     "action_head_cfg.config.target_video_width=${MODEL_TARGET_WIDTH}"
     "save_lora_only=false"                                                      # 全量微调时保存完整权重，不只保存 LoRA
     "max_chunk_size=${MAX_CHUNK_SIZE}"                                          # 大分辨率下默认更保守
-    "save_strategy=steps"                                                       # 按 step 保存，而不是按 epoch
+    "save_strategy=${SAVE_STRATEGY}"                                            # 按 step 保存；容量测试可设为 no
     "droid_data_root=${DROID_DATA_ROOT}"                                        # DROID LeRobot 数据集根目录
     "dit_version=${WAN22_CKPT_DIR}"                                             # Wan2.2 主权重目录
     "text_encoder_pretrained_path=${WAN22_CKPT_DIR}/models_t5_umt5-xxl-enc-bf16.pth" # Wan2.2 里的文本编码器权重
