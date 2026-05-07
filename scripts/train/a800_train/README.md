@@ -124,3 +124,29 @@ bash scripts/train/a800_train/run_joint_drop_2node.sh
 ```bash
 PREPARE_ASSETS=false
 ```
+
+## SwanLab 上传
+
+训练脚本默认关闭 SwanLab 同步：
+
+```bash
+SWANLAB_SYNC_WANDB=0
+WANDB_MODE=offline
+```
+
+训练完成后，如果需要上传 Trainer 的 scalar history，在能访问 SwanLab 的机器上执行：
+
+```bash
+cd /2023133163/liuf/dreamzero
+
+python scripts/train/a800_train/upload_trainer_state_to_swanlab.py \
+  /2023133163/checkpoints/dreamzero/dreamzero_droid_wan22_joint_drop_a800_2node \
+  --project dreamzero \
+  --experiment-name dreamzero_droid_wan22_joint_drop_a800_2node
+```
+
+脚本会自动读取 `OUTPUT_DIR/trainer_state.json` 或最新 `checkpoint-*/trainer_state.json`。如果确实需要训练时实时同步，可以在启动命令前覆盖：
+
+```bash
+SWANLAB_SYNC_WANDB=1
+```
