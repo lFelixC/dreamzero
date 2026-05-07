@@ -6,6 +6,10 @@ set -euo pipefail
 # and MASTER_PORT, changing only NODE_RANK.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "${SCRIPT_DIR}/dreamzero_env_common.sh"
+dreamzero_a800_source_env
+
 DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero_mot}"
 PYTHON_BIN="${PYTHON_BIN:-/data/dreamzero/.venv/bin/python}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"

@@ -13,6 +13,21 @@
 
 三个 MoT 脚本会调用上一层的 `../run_dreamzero_mot_multinode.sh`。`run_joint_drop_2node.sh` 是 joint baseline 的独立入口，默认保持 joint 训练设置，并额外开启 DROID exterior-view drop。
 
+## 环境初始化
+
+非 MPI 的 `*_2node.sh` 现在会自动读取 `DREAMZERO_PROFILE`，默认是 `/etc/profile.d/dreamzero-uv.sh`。因此 Docker 镜像里配置的 `VIRTUAL_ENV`、`PYTHON_BIN`、`DREAMZERO_ROOT`、`DATASET_ROOT`、`CHECKPOINT_ROOT`、`PYTHONPATH`、CUDA 路径和 pip/uv 镜像都会自动生效。
+
+手动两机启动时，外面通常只需要设置拓扑变量：
+
+```bash
+MASTER_ADDR=<rank0_ip> \
+NODE_RANK=0 \
+NNODES=2 \
+scripts/train/a800_train/run_mot_first_frame_2node.sh
+```
+
+第二台机器把 `NODE_RANK=1` 即可。`CUDA_VISIBLE_DEVICES` 默认是 `0,1,2,3,4,5,6,7`，只在需要换卡组时覆盖。
+
 ## First Frame 实验
 
 在同一个实验的两个节点上分别执行，`MASTER_ADDR` 必须填写 rank0 节点能被另一个节点访问到的 IP。
