@@ -105,6 +105,7 @@ ai_station_mpi_maybe_relaunch() {
     -x PATH \
     -x LD_LIBRARY_PATH \
     -x CUDA_VISIBLE_DEVICES \
+    -x SWANLAB_SYNC_WANDB \
     -x SWANLAB_API_KEY \
     -x WANDB_MODE \
     -x WANDB_PROJECT \

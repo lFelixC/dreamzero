@@ -20,6 +20,8 @@ export DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero/droid_lerobot}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MASTER_PORT="${MASTER_PORT:-29410}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_first_frame_mpi}"
+export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-0}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 source "${SCRIPT_DIR}/ai_station_mpi_common.sh"
 ai_station_mpi_maybe_relaunch "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")" "$@"
