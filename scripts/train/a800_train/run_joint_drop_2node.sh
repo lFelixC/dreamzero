@@ -7,13 +7,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-source "${SCRIPT_DIR}/dreamzero_env_common.sh"
-dreamzero_a800_source_env
+# -----------------------------
+# Fixed runtime environment
+# -----------------------------
+export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venvs/dreamzero}"
+export PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV}/bin/python}"
+export PATH="${VIRTUAL_ENV}/bin:/usr/local/bin:/root/.local/bin:${PATH:-}"
+export DREAMZERO_ROOT="${DREAMZERO_ROOT:-/2023133163/liuf/dreamzero}"
+export DATASET_ROOT="${DATASET_ROOT:-/2023133163/datasets/dreamzero}"
+export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/2023133163/checkpoints/dreamzero}"
+export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
 
-DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero_mot}"
-PYTHON_BIN="${PYTHON_BIN:-/data/dreamzero/.venv/bin/python}"
-CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
-DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero/droid_lerobot}"
 EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py}"
 
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
@@ -63,8 +67,6 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT_NAME}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
-export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
-export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
 
 if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
   export SWANLAB_API_KEY
