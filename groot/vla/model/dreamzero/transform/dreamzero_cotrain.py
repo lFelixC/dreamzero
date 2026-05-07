@@ -120,9 +120,31 @@ def _build_prefix_mask(lengths: List[int]) -> np.ndarray:
     return mask
 
 
-def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
+def _validate_probability(name: str, value: float) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0.0, 1.0], got {value}")
+    return value
+
+
+def collate(
+    features: List[dict],
+    tokenizer: AutoTokenizer,
+    num_views=3,
+    embodiment_tag_mapping=None,
+    droid_random_drop_exterior_view_prob: float = 0.15,
+) -> dict:
     batch = {}
     keys = features[0].keys()
+    droid_random_drop_exterior_view_prob = _validate_probability(
+        "droid_random_drop_exterior_view_prob",
+        droid_random_drop_exterior_view_prob,
+    )
+    droid_drop_note = (
+        " During training, one of the two bottom exterior views may be a black screen (dropped view)."
+        if droid_random_drop_exterior_view_prob > 0.0
+        else ""
+    )
 
     for key in keys:
         if key == "text":
@@ -144,7 +166,9 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         processed_item = (
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
-                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
+                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera."
+                            + droid_drop_note
+                            + " The robot "
                             + processed_item.lower()
                         )
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
@@ -168,7 +192,9 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         item = (
                             "A multi-view video shows that a robot "
                             + str(item).lower()
-                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
+                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera."
+                            + droid_drop_note
+                            + " The robot "
                             + str(item).lower()
                         )
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
@@ -211,15 +237,32 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
 
 
 class DefaultDataCollator(DataCollatorMixin):
-    def __init__(self, tokenizer_path: str="google/umt5-xxl", max_length: int=512, num_views: int=1, embodiment_tag_mapping=None):
+    def __init__(
+        self,
+        tokenizer_path: str = "google/umt5-xxl",
+        max_length: int = 512,
+        num_views: int = 1,
+        embodiment_tag_mapping=None,
+        droid_random_drop_exterior_view_prob: float = 0.15,
+    ):
         super().__init__()
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=max_length, clean='whitespace')
         self.num_views = num_views
         self.embodiment_tag_mapping = embodiment_tag_mapping
+        self.droid_random_drop_exterior_view_prob = _validate_probability(
+            "droid_random_drop_exterior_view_prob",
+            droid_random_drop_exterior_view_prob,
+        )
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         with nvtx_range("dreamzero.data.collate"):
-            return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+            return collate(
+                features,
+                self.tokenizer,
+                self.num_views,
+                self.embodiment_tag_mapping,
+                droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
+            )
 
 
 class DreamTransform(InvertibleModalityTransform):
@@ -261,6 +304,12 @@ class DreamTransform(InvertibleModalityTransform):
     state_horizon: int
     action_horizon: int
     num_views: int = 3
+    droid_random_drop_exterior_view_prob: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Training probability of blacking out one DROID exterior view.",
+    )
 
     # Add tokenizer attribute
     tokenizer_path: str = Field(
@@ -387,16 +436,20 @@ class DreamTransform(InvertibleModalityTransform):
                 wrist_wide = np.repeat(wrist_image, 2, axis=-1)  # (t, c, h, 2w)
                 concat_images[0, :, :, :h, :] = wrist_wide
 
-                # # Bottom row: left/right exteriors.
-                # drop_exterior_idx = None
-                # if self.training:
-                #     # Always drop exactly one exterior view during training.
-                #     drop_exterior_idx = random.choice([0, 1])  # 0=left, 1=right
+                # Bottom row: left/right exteriors. When enabled, keep exactly
+                # one exterior view and leave the dropped slot black.
+                drop_exterior_idx = None
+                if (
+                    self.training
+                    and self.droid_random_drop_exterior_view_prob > 0.0
+                    and random.random() < self.droid_random_drop_exterior_view_prob
+                ):
+                    drop_exterior_idx = random.choice([0, 1])  # 0=left, 1=right
 
-                # if drop_exterior_idx != 0:
-                concat_images[0, :, :, h:, :w] = left_exterior
-                # if drop_exterior_idx != 1:
-                concat_images[0, :, :, h:, w:] = right_exterior
+                if drop_exterior_idx != 0:
+                    concat_images[0, :, :, h:, :w] = left_exterior
+                if drop_exterior_idx != 1:
+                    concat_images[0, :, :, h:, w:] = right_exterior
 
                 return concat_images
             
@@ -656,7 +709,13 @@ class DreamTransform(InvertibleModalityTransform):
         data_split = [tree.map_structure(lambda x: x[i], data) for i in range(batch_size)]
         # Process each element.
         data_split_processed = [self.apply_single(elem) for elem in data_split]
-        return collate(data_split_processed, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        return collate(
+            data_split_processed,
+            self.tokenizer,
+            self.num_views,
+            self.embodiment_tag_mapping,
+            droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
+        )
 
     def apply(self, data: dict) -> dict:
         if not self.training and data["video"].ndim == 5:
