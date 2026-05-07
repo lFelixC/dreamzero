@@ -899,15 +899,29 @@ def _override_max_chunk_size(policy: GrootSimPolicy, max_chunk_size: int) -> Non
         return
 
     num_frame_per_block = int(getattr(model, "num_frame_per_block", 1))
-    model.local_attn_size = (
+    frame_seqlen = int(getattr(model, "frame_seqlen", 1))
+    new_local_attn_size = (
         int(max_chunk_size) * num_frame_per_block + 1
         if int(max_chunk_size) != -1
         else -1
     )
+    model.local_attn_size = new_local_attn_size
+
+    # Propagate to per-block attention modules so KV cache trimming and
+    # causal mask windows are consistent with the top-level override.
+    for block in model.blocks:
+        block.local_attn_size = new_local_attn_size
+        block.self_attn.local_attn_size = new_local_attn_size
+        block.self_attn.max_attention_size = (
+            21 * frame_seqlen if new_local_attn_size == -1
+            else new_local_attn_size * frame_seqlen
+        )
+
     logger.info(
-        "Overrode inference max_chunk_size=%s -> local_attn_size=%s",
+        "Overrode inference max_chunk_size=%s -> local_attn_size=%s (synced to %d blocks)",
         max_chunk_size,
-        model.local_attn_size,
+        new_local_attn_size,
+        len(model.blocks),
     )
 
 

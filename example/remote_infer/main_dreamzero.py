@@ -542,7 +542,12 @@ class DreamZeroRealPolicyClient:
             return False
         if self._base_chunk_size <= 0:
             return False
-        launch_threshold = self._open_loop_horizon
+        # Launch prefetch one step BEFORE the open‑loop horizon so the async
+        # inference round‑trip can overlap with the last consumed action.
+        # Without the –1 margin the prefetch fires in the same step that the
+        # blocking fallback (line 653) triggers, which degenerates
+        # enable_async_prefetch into a synchronous wait.
+        launch_threshold = self._open_loop_horizon - 1 if self._open_loop_horizon > 1 else 0
         if launch_threshold <= 0:
             launch_threshold = self._base_chunk_size
         if self._base_actions_from_chunk_completed < launch_threshold:
