@@ -1,280 +1,366 @@
-# DreamZero MOT: Bake the UV Environment Into a Docker Image
+# Docker 中安装并固化 DreamZero 的 uv 环境
 
-This note explains how to make the `uv` runtime and Python environment travel
-with a Docker image, instead of creating `.venv` under the live project
-directory every time.
+这份文档用于在一个新的 Docker 容器里安装 DreamZero 训练环境，并在后续保存镜像后继续使用。
 
-It complements:
+目标：
 
-- `docs/README_DROID_WAN22_UV.md`
-- `docs/requirements_droid_wan22_uv.txt`
+- `uv` 安装在镜像里的通用路径：`/usr/local/bin/uv`
+- Python 虚拟环境安装在镜像里：`/opt/venvs/dreamzero`
+- 项目训练目录固定为：`/2023133163/liuf/dreamzero`
+- 数据集目录固定为：`/2023133163/datasets/dreamzero`
+- checkpoint 目录固定为：`/2023133163/checkpoints/dreamzero`
 
-## 1. Recommended Layout
+不要把虚拟环境放在项目目录的 `.venv` 里。项目目录可能是平台挂载盘，保存镜像时不一定会把它作为镜像环境保存；把环境放到 `/opt/venvs/dreamzero` 更稳。
 
-Use image-owned paths for tools and dependencies:
-
-```text
-/usr/local/bin/uv                  # uv and uvx
-/opt/venvs/dreamzero-mot           # Python virtual environment baked into image
-/opt/dreamzero_mot_deps            # Build-time dependency metadata
-```
-
-Use platform storage only for mutable content:
-
-```text
-<user storage>/dreamzero_mot        # Code uploaded by SFTP / rsync
-<user storage>/datasets             # Datasets
-<user storage>/checkpoints          # Model weights and training outputs
-```
-
-Avoid putting the baked venv under `/data`, `/mnt/nianfs`, or the SFTP project
-directory. Those paths are commonly mounted by the platform at runtime, and a
-mount can hide files that were originally inside the image.
-
-## 2. Build From the RDMA Base Image
-
-Assume the RDMA-ready base image tar is:
+## 1. 进入容器并检查网络
 
 ```bash
-/data/yesai_ubuntu_base_3.0_rdma.tar
+curl -I https://github.com
 ```
 
-Load it on a machine that has Docker:
+如果能看到 `HTTP/2 200` 或 `HTTP/1.1 200`，说明 DNS 和外网正常。
+
+如果报错 `Could not resolve host`，先修 DNS，例如：
 
 ```bash
-docker load -i /data/yesai_ubuntu_base_3.0_rdma.tar
-docker images | grep yesai_ubuntu_base
+cp /etc/resolv.conf /etc/resolv.conf.bak
+cat > /etc/resolv.conf <<'EOF'
+nameserver 223.5.5.5
+nameserver 114.114.114.114
+nameserver 8.8.8.8
+options timeout:2 attempts:3
+EOF
 ```
 
-The expected base tag is:
+## 2. 准备项目目录
+
+后续默认项目放在：
+
+```bash
+/2023133163/liuf/dreamzero
+```
+
+进入项目目录：
+
+```bash
+cd /2023133163/liuf/dreamzero
+```
+
+如果项目还没放到这个目录，先把代码上传、复制或 clone 到这里。该目录下应该能看到：
+
+```bash
+ls
+# 应该包含 pyproject.toml、groot/、docs/、scripts/ 等
+```
+
+## 3. 安装 uv 到镜像路径
+
+如果已经有 `uv`，可以先看版本：
+
+```bash
+which uv
+uv --version
+```
+
+建议再安装一份到 `/usr/local/bin`，这样保存镜像后更稳定：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+hash -r
+uv --version
+```
+
+## 4. 创建镜像内虚拟环境
+
+```bash
+export VIRTUAL_ENV=/opt/venvs/dreamzero
+export PATH=$VIRTUAL_ENV/bin:/usr/local/bin:/root/.local/bin:$PATH
+
+uv venv --python 3.11 "$VIRTUAL_ENV"
+source "$VIRTUAL_ENV/bin/activate"
+
+python --version
+which python
+```
+
+期望 `which python` 输出：
 
 ```text
-yesai_ubuntu_base:3.0-rdma
+/opt/venvs/dreamzero/bin/python
 ```
 
-From the repo root:
+## 5. 永久配置 pip 和 uv 清华源
+
+清华 PyPI 源：
+
+```text
+https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+把 pip 的系统级配置写到 `/etc/pip.conf`，这样后续所有 root shell 和虚拟环境里的 `pip install` 默认都会走清华源：
 
 ```bash
-cd /data/dreamzero_mot
-mkdir -p docker/uv-image
+cat > /etc/pip.conf <<'EOF'
+[global]
+index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+EOF
 ```
 
-Create `docker/uv-image/Dockerfile`:
+把 uv 的 root 用户全局配置写到 `/root/.config/uv/uv.toml`，这样后续 root 用户执行 `uv pip install` 默认也会走清华源：
 
-```dockerfile
-FROM yesai_ubuntu_base:3.0-rdma
+```bash
+mkdir -p /root/.config/uv
+cat > /root/.config/uv/uv.toml <<'EOF'
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+EOF
+```
 
-SHELL ["/bin/bash", "-lc"]
+再写一个 profile 脚本作为兜底，让登录 shell 也自动带上这两个环境变量：
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV UV_INSTALL_DIR=/usr/local/bin
-ENV VIRTUAL_ENV=/opt/venvs/dreamzero-mot
-ENV PATH=/opt/venvs/dreamzero-mot/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
-ENV PYTHONUNBUFFERED=1
-
-# Default runtime repo path. Override this on AI Station if your uploaded code
-# lives elsewhere.
-ENV DREAMZERO_ROOT=/workspace/dreamzero_mot
-ENV PYTHONPATH=/workspace/dreamzero_mot
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    wget \
-    build-essential \
-    ninja-build \
-    pkg-config \
- && rm -rf /var/lib/apt/lists/*
-
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
- && uv --version
-
-WORKDIR /opt/dreamzero_mot_deps
-
-# Keep the build context small. This image bakes dependencies, not live code.
-COPY pyproject.toml README.md ./
-COPY docs/requirements_droid_wan22_uv.txt docs/requirements_droid_wan22_uv.txt
-
-RUN uv venv --python 3.11 "${VIRTUAL_ENV}" \
- && uv pip install --upgrade pip setuptools wheel ninja packaging \
- && uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --torch-backend cu129 \
- && uv pip install -r docs/requirements_droid_wan22_uv.txt \
- && rm -rf /root/.cache/uv
-
-RUN cat >/etc/profile.d/dreamzero-uv.sh <<'EOF'
-export VIRTUAL_ENV=/opt/venvs/dreamzero-mot
-export PATH=/opt/venvs/dreamzero-mot/bin:/usr/local/bin:$PATH
-export DREAMZERO_ROOT=${DREAMZERO_ROOT:-/workspace/dreamzero_mot}
-export PYTHONPATH=$DREAMZERO_ROOT:${PYTHONPATH:-}
+```bash
+cat > /etc/profile.d/pypi-mirror.sh <<'EOF'
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 EOF
 
-WORKDIR /workspace
+source /etc/profile.d/pypi-mirror.sh
 ```
 
-Build and export:
+检查配置：
 
 ```bash
-cd /data/dreamzero_mot
-
-docker build \
-  -f docker/uv-image/Dockerfile \
-  -t yesai_ubuntu_base:3.0-rdma-uv \
-  .
-
-docker save yesai_ubuntu_base:3.0-rdma-uv \
-  -o /data/yesai_ubuntu_base_3.0_rdma_uv.tar
+cat /etc/pip.conf
+cat /root/.config/uv/uv.toml
+echo "$PIP_INDEX_URL"
+echo "$UV_DEFAULT_INDEX"
 ```
 
-Upload this tar to AI Station:
+后续保存镜像后，这些配置文件都会保留。新容器里只要还是 root 用户，`pip install` 和 `uv pip install` 默认都会走清华源。
 
-```text
-/data/yesai_ubuntu_base_3.0_rdma_uv.tar
-```
+注意：下面安装 PyTorch 时用了 `--torch-backend cu129`，这类 CUDA 轮子可能仍会访问 PyTorch 官方源；普通 Python 包会优先走清华 PyPI 源。
 
-## 3. Runtime Usage on AI Station
+## 6. 安装训练依赖
 
-After starting a container from the baked image, activate the venv and point
-`DREAMZERO_ROOT` to the uploaded project directory.
-
-Example:
-
-```bash
-source /opt/venvs/dreamzero-mot/bin/activate
-
-cd /mnt/nianfs/user-fs/2023133163/liuf/dreamzero_mot
-export DREAMZERO_ROOT=$PWD
-export PYTHONPATH=$PWD:${PYTHONPATH:-}
-
-python -c "import sys; print(sys.executable)"
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -c "import deepspeed, diffusers, transformers; print('core imports ok')"
-python -c "import groot; print('dreamzero local code ok')"
-```
-
-If AI Station exposes your user storage with a different absolute path, replace
-the `cd` path with the real path shown in the platform shell.
-
-## 4. Why the Project Is Not Installed Into the Image
-
-This Dockerfile intentionally bakes dependencies but not the live source tree.
-That keeps the workflow simple:
-
-- Docker image: stable OS packages, RDMA libraries, `uv`, Python packages
-- SFTP / rsync: changing code
-- User storage: datasets, checkpoints, logs
-
-When running from the uploaded repo root, Python sees the current project first
-through `PYTHONPATH=$PWD`, so code changes take effect without rebuilding the
-image.
-
-If you need console entry points or package metadata, run this after uploading
-the code:
-
-```bash
-source /opt/venvs/dreamzero-mot/bin/activate
-cd /mnt/nianfs/user-fs/2023133163/liuf/dreamzero_mot
-uv pip install -e . --no-deps
-```
-
-This step is quick because the heavy dependencies are already baked into
-`/opt/venvs/dreamzero-mot`.
-
-## 5. Optional CUDA Native Packages
-
-`docs/README_DROID_WAN22_UV.md` treats `flash-attn` and Transformer Engine as
-optional. If you want to bake them into the image too, add the install commands
-after the main dependency install step.
-
-Example for `flash-attn`, assuming the image has `nvcc` and `CUDA_HOME`:
-
-```dockerfile
-ENV CUDA_HOME=/usr/local/cuda-12.9
-ENV PATH=/usr/local/cuda-12.9/bin:${PATH}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:${LD_LIBRARY_PATH}
-
-RUN MAX_JOBS=8 uv pip install --no-build-isolation flash-attn \
- && rm -rf /root/.cache/uv
-```
-
-Example for Transformer Engine:
-
-```dockerfile
-ENV CUDA_HOME=/usr/local/cuda-12.9
-ENV NVTE_CUDA_INCLUDE_PATH=/usr/local/cuda-12.9/include
-
-RUN uv pip install --no-build-isolation "transformer_engine[pytorch]==2.13.0" \
- && rm -rf /root/.cache/uv
-```
-
-At runtime, if using the TE backend, expose the cuDNN libraries bundled in the
-venv:
-
-```bash
-export LD_LIBRARY_PATH=/opt/venvs/dreamzero-mot/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}
-```
-
-## 6. If You Are Editing Inside an Existing Container
-
-If you already have a running development container and plan to save it as an
-AI Station image, use the same paths:
+先装系统编译依赖：
 
 ```bash
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git wget build-essential ninja-build pkg-config
+apt-get install -y --no-install-recommends \
+  ca-certificates curl git wget \
+  build-essential ninja-build pkg-config
+```
 
-curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+进入项目目录并安装 Python 包：
 
-export VIRTUAL_ENV=/opt/venvs/dreamzero-mot
-export PATH=$VIRTUAL_ENV/bin:/usr/local/bin:$PATH
+```bash
+cd /2023133163/liuf/dreamzero
+source /opt/venvs/dreamzero/bin/activate
 
-uv venv --python 3.11 "$VIRTUAL_ENV"
 uv pip install --upgrade pip setuptools wheel ninja packaging
-uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --torch-backend cu129
 
-cd /path/to/dreamzero_mot
+uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --torch-backend cu129
+
 uv pip install -r docs/requirements_droid_wan22_uv.txt
+uv pip install -e . --no-deps
 
-cat >/etc/profile.d/dreamzero-uv.sh <<'EOF'
-export VIRTUAL_ENV=/opt/venvs/dreamzero-mot
-export PATH=/opt/venvs/dreamzero-mot/bin:/usr/local/bin:$PATH
-export DREAMZERO_ROOT=${DREAMZERO_ROOT:-/workspace/dreamzero_mot}
-export PYTHONPATH=$DREAMZERO_ROOT:${PYTHONPATH:-}
+rm -rf /root/.cache/uv
+```
+
+`uv pip install -e . --no-deps` 只把当前项目注册进环境，不重复安装大依赖。
+
+## 7. 安装 CUDA Toolkit
+
+`flash-attn` 编译需要 `nvcc`。如果 `which nvcc` 没有输出，说明容器里缺 CUDA 编译工具包，需要先安装 CUDA Toolkit。
+
+先检查：
+
+```bash
+which nvcc || true
+echo "${CUDA_HOME:-not_set}"
+```
+
+如果已经有 `nvcc`，直接跳到下一节。
+
+如果没有 `nvcc`，Ubuntu 22.04 容器里安装 CUDA Toolkit 12.9：
+
+```bash
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates wget gnupg
+
+cd /tmp
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+
+apt-get update
+apt-get install -y --no-install-recommends cuda-toolkit-12-9
+```
+
+设置环境变量：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+hash -r
+```
+
+验证：
+
+```bash
+which nvcc
+nvcc --version
+echo "$CUDA_HOME"
+```
+
+注意：这里安装的是容器内的 CUDA 编译工具包，用来提供 `nvcc`。GPU 驱动仍然由宿主机/平台提供，不能只靠容器里安装 CUDA Toolkit 解决驱动问题。
+
+## 8. 可选安装 FlashAttention
+
+`flash-attn` 是性能优化，不是硬依赖。没有它时，代码会回退到 PyTorch SDPA，但训练可能慢一些。
+
+如果有 `nvcc`，执行：
+
+```bash
+cd /2023133163/liuf/dreamzero
+source /opt/venvs/dreamzero/bin/activate
+
+if command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+elif [ -d /usr/local/cuda-12.9 ]; then
+  export CUDA_HOME=/usr/local/cuda-12.9
+fi
+
+if [ -z "${CUDA_HOME:-}" ]; then
+  echo "ERROR: CUDA_HOME not found; skip flash-attn install in this container."
+else
+  export PATH=$CUDA_HOME/bin:$PATH
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+  MAX_JOBS=2 uv pip install --no-build-isolation flash-attn
+
+  python -c "import flash_attn; print('flash-attn ok')"
+fi
+```
+
+如果编译时内存不够或太慢，可以把 `MAX_JOBS=8` 改成 `MAX_JOBS=4`。
+
+## 9. 写入自动环境变量
+
+让以后进入容器后能直接用这个环境：
+
+```bash
+cat > /etc/profile.d/dreamzero-uv.sh <<'EOF'
+export VIRTUAL_ENV=/opt/venvs/dreamzero
+export PYTHON_BIN=/opt/venvs/dreamzero/bin/python
+export PATH=/opt/venvs/dreamzero/bin:/usr/local/bin:/root/.local/bin:$PATH
+export DREAMZERO_ROOT=/2023133163/liuf/dreamzero
+export DATASET_ROOT=/2023133163/datasets/dreamzero
+export CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
+export PYTHONPATH=/2023133163/liuf/dreamzero:${PYTHONPATH:-}
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+
+if command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+elif [ -d /usr/local/cuda-12.9 ]; then
+  export CUDA_HOME=/usr/local/cuda-12.9
+fi
+
+if [ -n "${CUDA_HOME:-}" ]; then
+  export PATH=$CUDA_HOME/bin:$PATH
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+fi
 EOF
+
+source /etc/profile.d/dreamzero-uv.sh
 ```
 
-Then save the development environment as an image in AI Station. If you stop
-the development environment before saving the image, these changes may be lost.
+## 10. 验证环境
 
-## 7. SFTP Ignore List
+```bash
+which uv
+uv --version
 
-Do not upload local virtual environments or caches with VS Code SFTP:
+which python
+python -c "import sys; print(sys.executable)"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import deepspeed, diffusers, transformers; print('core imports ok')"
+python -c "import groot; print('dreamzero import ok')"
+python -c "import flash_attn; print('flash-attn ok')" || true
 
-```json
-{
-  "ignore": [
-    ".venv",
-    "__pycache__",
-    "*.pyc",
-    ".git",
-    "wandb",
-    "logs",
-    "checkpoints",
-    "datasets",
-    "data",
-    ".cache"
-  ]
-}
+echo "$DREAMZERO_ROOT"
+echo "$DATASET_ROOT"
+echo "$CHECKPOINT_ROOT"
 ```
 
-The baked environment should come from the image. The uploaded project directory
-should contain source code and lightweight config files only.
+如果 `torch.cuda.is_available()` 是 `True`，说明 PyTorch 能看到 GPU。
 
-## 8. Quick Checklist
+如果 `import groot` 失败，通常是没有进入项目目录，或者 `PYTHONPATH` 没设置：
 
-- `uv` exists at `/usr/local/bin/uv`
-- venv exists at `/opt/venvs/dreamzero-mot`
-- `which python` points to `/opt/venvs/dreamzero-mot/bin/python`
-- code is uploaded separately by SFTP / rsync
-- `PYTHONPATH` points to the uploaded repo root
-- datasets and checkpoints stay on user storage, not inside the image
+```bash
+cd /2023133163/liuf/dreamzero
+export PYTHONPATH=$PWD:${PYTHONPATH:-}
+```
+
+## 11. 训练时使用这个环境
+
+进入项目目录：
+
+```bash
+cd /2023133163/liuf/dreamzero
+source /etc/profile.d/dreamzero-uv.sh
+```
+
+因为第 9 步已经导出了 `PYTHON_BIN`、`DREAMZERO_ROOT`、`DATASET_ROOT` 和 `CHECKPOINT_ROOT`，后续 A800 脚本不需要改代码，可以直接运行：
+
+```bash
+bash scripts/train/run_dreamzero_mot_multinode.sh
+```
+
+如果跑 A800 的 2 节点脚本：
+
+```bash
+bash scripts/train/a800_train/run_mot_full_video_2node.sh
+```
+
+如果你没有执行 `source /etc/profile.d/dreamzero-uv.sh`，那就需要在命令前临时指定：
+
+```bash
+PYTHON_BIN=/opt/venvs/dreamzero/bin/python \
+DREAMZERO_ROOT=/2023133163/liuf/dreamzero \
+DATASET_ROOT=/2023133163/datasets/dreamzero \
+CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero \
+bash scripts/train/a800_train/run_mot_full_video_2node.sh
+```
+
+## 12. 保存镜像
+
+完成安装并验证通过后，在宿主机或平台的镜像管理页面保存当前容器。
+
+如果你能在宿主机执行 Docker 命令，可以这样保存：
+
+```bash
+docker ps
+docker commit <容器ID或容器名> dreamzero-uv:latest
+docker save dreamzero-uv:latest -o dreamzero-uv.tar
+```
+
+之后用 `dreamzero-uv:latest` 或 `dreamzero-uv.tar` 新建容器时，`uv` 和 `/opt/venvs/dreamzero` 都会保留。
+
+注意：如果 `/2023133163/liuf/dreamzero` 是平台挂载目录，保存镜像只会保存环境，不一定保存这个目录里的代码、数据和 checkpoint。新容器里仍然需要保证项目目录存在。
+
+## 13. 新容器中快速恢复
+
+以后从保存好的镜像启动新容器后：
+
+```bash
+source /etc/profile.d/dreamzero-uv.sh
+cd /2023133163/liuf/dreamzero
+
+which python
+python -c "import torch, groot; print('env ok')"
+```
+
+能通过就可以继续训练。
