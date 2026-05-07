@@ -1067,6 +1067,90 @@ class MoTCausalWanModel(CausalWanModel):
 
         return video_noise_pred, action_noise_pred, updated_kv_caches
 
+    def _forward_action_from_video_kv_cache(
+        self,
+        action,
+        timestep_action,
+        state,
+        embodiment_id,
+        kv_cache: list[torch.Tensor],
+        current_start_frame: int,
+        require_full_video: bool = False,
+    ) -> torch.Tensor:
+        """Run only the MoT action expert using a supplied per-layer video K/V cache."""
+        if require_full_video and self.mot_action_video_attention != "full_video":
+            raise ValueError(
+                "MoT refreshed-video action path requires "
+                "mot_action_video_attention=full_video."
+            )
+        batch_size = action.shape[0]
+        # Match the existing cached inference path, which uses the default
+        # action embodiment category when action registers are present.
+        embodiment_id = torch.zeros(batch_size, device=action.device, dtype=torch.long)
+
+        action_tokens, action_e, action_start, action_length = self.action_expert.build_action_inputs(
+            action=action,
+            timestep_action=timestep_action,
+            state=state,
+            embodiment_id=embodiment_id,
+        )
+
+        for layer_idx, block in enumerate(self.action_expert.blocks):
+            action_tokens = self._run_action_expert_block_cached(
+                block=block,
+                tokens=action_tokens,
+                e=action_e,
+                context=None,
+                video_kv=self._select_cached_video_kv_for_action(kv_cache[layer_idx]),
+                current_start_frame=current_start_frame,
+            )
+
+        return self.action_expert.decode_action(
+            tokens=action_tokens,
+            action_start=action_start,
+            action_length=action_length,
+            embodiment_id=embodiment_id,
+        )
+
+    def forward_action_from_cached_video(
+        self,
+        action,
+        timestep_action,
+        state,
+        embodiment_id,
+        kv_cache: list[torch.Tensor],
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        """Run only the MoT action expert using observed/clean video K/V caches."""
+        return self._forward_action_from_video_kv_cache(
+            action=action,
+            timestep_action=timestep_action,
+            state=state,
+            embodiment_id=embodiment_id,
+            kv_cache=kv_cache,
+            current_start_frame=current_start_frame,
+        )
+
+    def forward_action_from_refreshed_video_kv(
+        self,
+        action,
+        timestep_action,
+        state,
+        embodiment_id,
+        video_kv_cache: list[torch.Tensor],
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        """Run action expert from the latest full-video denoise refresh K/V."""
+        return self._forward_action_from_video_kv_cache(
+            action=action,
+            timestep_action=timestep_action,
+            state=state,
+            embodiment_id=embodiment_id,
+            kv_cache=video_kv_cache,
+            current_start_frame=current_start_frame,
+            require_full_video=True,
+        )
+
     def _forward_train(
         self,
         x,

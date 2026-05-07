@@ -1,17 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# Multi-node launcher for the current DreamZero MoT production training path.
-#
-# Example, run on every node with the same MASTER_ADDR/MASTER_PORT:
-#   NNODES=2 NODE_RANK=0 MASTER_ADDR=<node0_ip> CUDA_VISIBLE_DEVICES=0,1,2,3 \
-#     bash scripts/train/run_dreamzero_mot_multinode.sh
-#   NNODES=2 NODE_RANK=1 MASTER_ADDR=<node0_ip> CUDA_VISIBLE_DEVICES=0,1,2,3 \
-#     bash scripts/train/run_dreamzero_mot_multinode.sh
+# A800 2-node joint baseline with DROID exterior-view drop enabled.
+# Run this script on every node in the experiment with the same MASTER_ADDR
+# and MASTER_PORT, changing only NODE_RANK.
 
-# -----------------------------
-# Fixed paths
-# -----------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero_mot}"
 PYTHON_BIN="${PYTHON_BIN:-/data/dreamzero/.venv/bin/python}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
@@ -21,16 +15,13 @@ EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experimen
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
 IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${WAN22_CKPT_DIR}}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
-OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_a800_2node}"
 
-# -----------------------------
-# User-tunable training knobs
-# -----------------------------
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
-PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
-MAX_STEPS="${MAX_STEPS:-60000}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-8}"
+MAX_STEPS="${MAX_STEPS:-100000}"
 EVAL_STEPS="${EVAL_STEPS:-100}"
-SAVE_STEPS="${SAVE_STEPS:-5000}"
+SAVE_STEPS="${SAVE_STEPS:-250}"
 DEEPSPEED_CFG="${DEEPSPEED_CFG:-zero2}"
 NUM_FRAMES="${NUM_FRAMES:-33}"
 ACTION_HORIZON="${ACTION_HORIZON:-24}"
@@ -38,38 +29,29 @@ MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-4}"
 NUM_FRAME_PER_BLOCK="${NUM_FRAME_PER_BLOCK:-2}"
 NUM_ACTION_PER_BLOCK="${NUM_ACTION_PER_BLOCK:-24}"
 NUM_STATE_PER_BLOCK="${NUM_STATE_PER_BLOCK:-1}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-4}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
-MOT_ACTION_VIDEO_ATTENTION="${MOT_ACTION_VIDEO_ATTENTION:-first_frame}"
-MOT_ACTION_VIDEO_KI="${MOT_ACTION_VIDEO_KI:-${MOT_KI:-false}}"
-MOT_INFERENCE_VIDEO_MODE="${MOT_INFERENCE_VIDEO_MODE:-auto}"
-MOT_DECOUPLE_VIDEO_ACTION_NOISE="${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"
-MOT_VIDEO_NOISE_BETA_ALPHA="${MOT_VIDEO_NOISE_BETA_ALPHA:-3.0}"
-MOT_VIDEO_NOISE_BETA_BETA="${MOT_VIDEO_NOISE_BETA_BETA:-1.0}"
-MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE="${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE:-0.8}"
-MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS="${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-8}"
-DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB="${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB:-0.0}"
 DATASET_SHARD_SAMPLING_RATE="${DATASET_SHARD_SAMPLING_RATE:-0.1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 
-# -----------------------------
-# Multi-node required envs
-# -----------------------------
-NNODES="${NNODES:-1}"
+# Joint baseline keeps the original 320x640 concatenated DROID canvas.
+MODEL_TARGET_HEIGHT="${MODEL_TARGET_HEIGHT:-320}"
+MODEL_TARGET_WIDTH="${MODEL_TARGET_WIDTH:-640}"
+MODEL_FRAME_SEQLEN="${MODEL_FRAME_SEQLEN:-200}"
+
+# Enabled by default for this experiment. Override to 1.0 to drop exactly one
+# exterior view on every training sample, or to 0.0 to disable.
+DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB="${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB:-0.5}"
+
+NNODES="${NNODES:-2}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29400}"
+MASTER_PORT="${MASTER_PORT:-29440}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# -----------------------------
-# Runtime env
-# -----------------------------
-GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
-if [[ -n "${GPU_IDS}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
-fi
-
+export CUDA_VISIBLE_DEVICES
 export HYDRA_FULL_ERROR=1
 export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -83,9 +65,6 @@ if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
   export SWANLAB_API_KEY
 fi
 
-# -----------------------------
-# CUDA toolkit discovery
-# -----------------------------
 if command -v nvcc >/dev/null 2>&1; then
   CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
   export CUDA_HOME
@@ -99,9 +78,6 @@ else
   echo "WARN: CUDA toolkit not found; continuing without setting CUDA_HOME"
 fi
 
-# -----------------------------
-# Basic checks
-# -----------------------------
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "ERROR: Python not found or not executable at ${PYTHON_BIN}"
   exit 1
@@ -112,19 +88,8 @@ if [[ ! -f "${EXPERIMENT_PY}" ]]; then
   exit 1
 fi
 
-if [[ -n "${NUM_GPUS:-}" ]]; then
-  LOCAL_NUM_GPUS="${NUM_GPUS}"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
-  LOCAL_NUM_GPUS="${#_GPU_ID_ARRAY[@]}"
-else
-  LOCAL_NUM_GPUS="$("${PYTHON_BIN}" - <<'PY'
-import torch
-print(torch.cuda.device_count())
-PY
-)"
-fi
-
+IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+LOCAL_NUM_GPUS="${NUM_GPUS:-${#_GPU_ID_ARRAY[@]}}"
 if [[ -z "${LOCAL_NUM_GPUS}" ]] || [[ "${LOCAL_NUM_GPUS}" -lt 1 ]]; then
   echo "ERROR: No visible GPU found"
   exit 1
@@ -161,10 +126,6 @@ if ! DROID_DATA_ROOT="$(resolve_dataset_root "${DATASET_ROOT}")"; then
   exit 1
 fi
 
-# -----------------------------
-# Shared checkpoint prep
-# rank0 downloads, others wait
-# -----------------------------
 prepare_assets() {
   if [[ ! -d "${WAN22_CKPT_DIR}" ]] || [[ -z "$(ls -A "${WAN22_CKPT_DIR}" 2>/dev/null)" ]]; then
     echo "Downloading Wan2.2-TI2V-5B ..."
@@ -217,14 +178,15 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 cd "${DREAMZERO_ROOT}"
 
-echo "========== MoT multi-node launch config =========="
+echo "========== joint-drop multi-node launch config =========="
 echo "DREAMZERO_ROOT=${DREAMZERO_ROOT}"
+echo "SCRIPT_DIR=${SCRIPT_DIR}"
 echo "HOSTNAME=${HOSTNAME:-unknown}"
 echo "NNODES=${NNODES}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "NUM_GPUS(local)=${LOCAL_NUM_GPUS}"
 echo "WORLD_GPUS(total)=${WORLD_GPUS}"
 echo "PER_DEVICE_BS=${PER_DEVICE_BS}"
@@ -234,42 +196,25 @@ echo "DROID_DATA_ROOT=${DROID_DATA_ROOT}"
 echo "WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
 echo "IMAGE_ENCODER_DIR=${IMAGE_ENCODER_DIR}"
 echo "TOKENIZER_DIR=${TOKENIZER_DIR}"
-echo "MOT_ACTION_VIDEO_ATTENTION=${MOT_ACTION_VIDEO_ATTENTION}"
-echo "MOT_ACTION_VIDEO_KI=${MOT_ACTION_VIDEO_KI}"
-echo "MOT_INFERENCE_VIDEO_MODE=${MOT_INFERENCE_VIDEO_MODE}"
-echo "MOT_DECOUPLE_VIDEO_ACTION_NOISE=${MOT_DECOUPLE_VIDEO_ACTION_NOISE}"
-echo "MOT_VIDEO_NOISE_BETA_ALPHA=${MOT_VIDEO_NOISE_BETA_ALPHA}"
-echo "MOT_VIDEO_NOISE_BETA_BETA=${MOT_VIDEO_NOISE_BETA_BETA}"
-echo "MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE}"
-echo "MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS}"
+echo "MODEL_TARGET_HEIGHT=${MODEL_TARGET_HEIGHT}"
+echo "MODEL_TARGET_WIDTH=${MODEL_TARGET_WIDTH}"
+echo "MODEL_FRAME_SEQLEN=${MODEL_FRAME_SEQLEN}"
 echo "DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB=${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB}"
 echo "USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING}"
-echo "=================================================="
+echo "========================================================="
 
 TRAIN_OVERRIDES=(
   "report_to=wandb"
   "data=dreamzero/droid_relative_wan22"
   "wandb_project=${WANDB_PROJECT_NAME}"
   "train_architecture=full"
-  "architecture=mot"
-  "mot_action_hidden_dim=1024"
-  "mot_action_ffn_dim=4096"
-  "mot_action_num_layers=null"
-  "mot_action_num_heads=8"
-  "mot_action_video_attention=${MOT_ACTION_VIDEO_ATTENTION}"
-  "mot_action_video_ki=${MOT_ACTION_VIDEO_KI}"
-  "mot_inference_video_mode=${MOT_INFERENCE_VIDEO_MODE}"
-  "mot_decouple_video_action_noise=${MOT_DECOUPLE_VIDEO_ACTION_NOISE}"
-  "mot_video_noise_beta_alpha=${MOT_VIDEO_NOISE_BETA_ALPHA}"
-  "mot_video_noise_beta_beta=${MOT_VIDEO_NOISE_BETA_BETA}"
-  "mot_decoupled_inference_video_final_noise=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE}"
-  "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS}"
+  "architecture=joint"
   "droid_random_drop_exterior_view_prob=${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB}"
   "num_frames=${NUM_FRAMES}"
   "action_horizon=${ACTION_HORIZON}"
   "num_views=3"
   "model=dreamzero/vla"
-  "model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_mot"
+  "model/dreamzero/action_head=wan_flow_matching_action_tf_wan22"
   "action_head_cfg.config.use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING}"
   "model/dreamzero/transform=dreamzero_cotrain"
   "num_frame_per_block=${NUM_FRAME_PER_BLOCK}"
@@ -302,6 +247,9 @@ TRAIN_OVERRIDES=(
   "dataloader_persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
   "image_resolution_width=320"
   "image_resolution_height=160"
+  "frame_seqlen=${MODEL_FRAME_SEQLEN}"
+  "action_head_cfg.config.target_video_height=${MODEL_TARGET_HEIGHT}"
+  "action_head_cfg.config.target_video_width=${MODEL_TARGET_WIDTH}"
   "save_lora_only=false"
   "max_chunk_size=${MAX_CHUNK_SIZE}"
   "save_strategy=steps"

@@ -78,6 +78,30 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=False,
         metadata={"help": "If true, action loss gradients flow through action-visible video K/V into the video expert."},
     )
+    mot_inference_video_mode: str = field(
+        default="auto",
+        metadata={"help": "MoT inference video path: auto, denoise, cache_only, or decoupled_denoise."},
+    )
+    mot_decouple_video_action_noise: bool = field(
+        default=False,
+        metadata={"help": "MoT full-video training: video uses high-noise Beta timesteps, action uses independent uniform timesteps."},
+    )
+    mot_video_noise_beta_alpha: float = field(
+        default=3.0,
+        metadata={"help": "MoT decoupled video timestep Beta alpha; larger values bias video toward higher noise."},
+    )
+    mot_video_noise_beta_beta: float = field(
+        default=1.0,
+        metadata={"help": "MoT decoupled video timestep Beta beta."},
+    )
+    mot_decoupled_inference_video_final_noise: float = field(
+        default=0.8,
+        metadata={"help": "Final video sigma for MoT decoupled_denoise inference."},
+    )
+    mot_decoupled_inference_video_refresh_steps: int = field(
+        default=8,
+        metadata={"help": "Number of full video-expert refresh steps in MoT decoupled_denoise inference: 5, 6, 7, 8, or 16."},
+    )
     input_embedding_dim: int = field(
         default=1536, metadata={"help": "Input embedding channel dimension."}
     )
@@ -226,6 +250,7 @@ class WANPolicyHead(ActionHead):
 
         self.cpu_offload = False
 
+        self._validate_mot_decoupled_config(config)
         self._select_diffusion_model_architecture(config)
         self.model = instantiate(config.diffusion_model_cfg)
         self.action_dim = config.action_dim
@@ -311,12 +336,44 @@ class WANPolicyHead(ActionHead):
         else:
             print("Skipping external component loading (expecting checkpoint state_dict to provide full weights)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
+        self.video_beta_dist = Beta(config.mot_video_noise_beta_alpha, config.mot_video_noise_beta_beta)
         # self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self._noise_logged = False
+        self._mot_inference_video_mode_logged = False
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+    @staticmethod
+    def _coerce_bool(value: bool | str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _validate_mot_decoupled_config(self, config: WANPolicyHeadConfig) -> None:
+        architecture = getattr(config, "architecture", "joint")
+        action_video_attention = getattr(config, "mot_action_video_attention", "first_frame")
+        decoupled = self._coerce_bool(getattr(config, "mot_decouple_video_action_noise", False))
+        inference_mode = str(getattr(config, "mot_inference_video_mode", "auto")).strip().lower()
+
+        if decoupled and architecture != "mot":
+            raise ValueError("mot_decouple_video_action_noise=true requires architecture=mot.")
+        if decoupled and action_video_attention != "full_video":
+            raise ValueError(
+                "mot_decouple_video_action_noise=true requires "
+                "mot_action_video_attention=full_video."
+            )
+        if inference_mode == "decoupled_denoise":
+            if architecture != "mot":
+                raise ValueError("mot_inference_video_mode=decoupled_denoise requires architecture=mot.")
+            if action_video_attention != "full_video":
+                raise ValueError(
+                    "mot_inference_video_mode=decoupled_denoise requires "
+                    "mot_action_video_attention=full_video."
+                )
 
     def _select_diffusion_model_architecture(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
@@ -776,8 +833,17 @@ class WANPolicyHead(ActionHead):
         noise = noise.transpose(1, 2)
         latents = latents.transpose(1, 2)
 
-        # Video/action use the production coupled timestep schedule.
-        timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
+        if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
+            # MoT decoupled mode: train action against full-video K/V while keeping
+            # video at a higher-noise distribution, matching decoupled inference.
+            video_noise_ratio = self.video_beta_dist.sample([noise.shape[0], noise.shape[1]])
+            timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
+            timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
+            noise_mode = "MOT_DECOUPLED"
+        else:
+            # Video/action use the production coupled timestep schedule.
+            timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
+            noise_mode = "STANDARD"
 
         timestep_id_block = timestep_id[:, 1:].reshape(
                     timestep_id.shape[0], -1, self.num_frame_per_block)
@@ -788,14 +854,34 @@ class WANPolicyHead(ActionHead):
             assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
             assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
 
-            timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
-            timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
+            if noise_mode == "MOT_DECOUPLED":
+                timestep_action_id = torch.randint(
+                    0,
+                    self.scheduler.num_train_timesteps,
+                    (actions.shape[0], actions.shape[1]),
+                )
+                action_mode = "INDEPENDENT"
+            else:
+                timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
+                timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
+                action_mode = "COUPLED"
 
             # Log noise mode once
             if not self._noise_logged:
                 video_mean = timestep_id.float().mean().item()
                 action_mean = timestep_action_id.float().mean().item()
-                print(f"[NOISE] Mode=STANDARD | Video+Action: Uniform mean_t={video_mean:.0f} | Action: COUPLED mean_t={action_mean:.0f}")
+                if noise_mode == "MOT_DECOUPLED":
+                    print(
+                        "[NOISE] Mode=MOT_DECOUPLED | "
+                        f"Video: Beta({self.config.mot_video_noise_beta_alpha},"
+                        f"{self.config.mot_video_noise_beta_beta}) mean_t={video_mean:.0f} | "
+                        f"Action: {action_mode} Uniform mean_t={action_mean:.0f}"
+                    )
+                else:
+                    print(
+                        f"[NOISE] Mode=STANDARD | Video+Action: Uniform mean_t={video_mean:.0f} | "
+                        f"Action: {action_mode} mean_t={action_mean:.0f}"
+                    )
                 self._noise_logged = True
         else:
             noise_action = None
@@ -1039,6 +1125,217 @@ class WANPolicyHead(ActionHead):
         flow_pred_uncond, _ = predictions[1]
         flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
         return flow_pred, flow_pred_cond_action
+
+    def _effective_mot_inference_video_mode(self, *, use_rtc: bool) -> str:
+        configured_mode = os.getenv(
+            "MOT_INFERENCE_VIDEO_MODE",
+            getattr(self.config, "mot_inference_video_mode", "auto"),
+        )
+        mode = str(configured_mode).strip().lower()
+        if mode not in {"auto", "denoise", "cache_only", "decoupled_denoise"}:
+            raise ValueError(
+                "Unsupported mot_inference_video_mode="
+                f"{configured_mode!r}; "
+                "expected 'auto', 'denoise', 'cache_only', or 'decoupled_denoise'."
+            )
+        if not getattr(self.model, "is_mot_wam", False):
+            if mode == "decoupled_denoise":
+                raise ValueError("mot_inference_video_mode=decoupled_denoise requires MoT architecture.")
+            return "denoise"
+        if mode == "auto":
+            action_video_attention = getattr(self.model, "mot_action_video_attention", "first_frame")
+            if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
+                mode = "decoupled_denoise"
+            else:
+                mode = "cache_only" if action_video_attention in {"first_frame", "none"} else "denoise"
+        if mode == "cache_only" and use_rtc:
+            if self.ip_rank == 0:
+                print("[MoT] mot_inference_video_mode=cache_only is not used with RTC guidance; falling back to denoise.")
+            return "denoise"
+        if mode == "decoupled_denoise":
+            if use_rtc:
+                raise RuntimeError("mot_inference_video_mode=decoupled_denoise does not support RTC guidance yet.")
+            if getattr(self.model, "mot_action_video_attention", None) != "full_video":
+                raise ValueError(
+                    "mot_inference_video_mode=decoupled_denoise requires "
+                    "mot_action_video_attention=full_video."
+                )
+        return mode
+
+    @staticmethod
+    def _build_mot_video_refresh_mask(refresh_steps: int, total_steps: int) -> list[bool]:
+        masks = {
+            5: [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False],
+            6: [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True],
+            7: [True, True, True, False, False, False, True, False, False, False, True, False, False, False, True, True],
+            8: [True, True, True, False, False, False, True, False, False, False, True, False, False, True, True, True],
+            16: [True] * 16,
+        }
+        if refresh_steps not in masks:
+            raise ValueError(
+                "mot_decoupled_inference_video_refresh_steps must be one of "
+                "5, 6, 7, 8, or 16."
+            )
+        mask = masks[refresh_steps]
+        if len(mask) != total_steps:
+            raise ValueError(
+                "MoT decoupled video refresh masks currently expect "
+                f"{len(mask)} inference steps, got {total_steps}."
+            )
+        assert mask[0], "first decoupled video refresh step must be True"
+        return mask
+
+    def _rescale_video_scheduler_final_noise(
+        self,
+        sample_scheduler: FlowUniPCMultistepScheduler,
+    ) -> float:
+        final_noise = float(getattr(self.config, "mot_decoupled_inference_video_final_noise", 0.8))
+        sigma_max = float(sample_scheduler.sigmas[0].item())
+        if not 0.0 <= final_noise <= sigma_max:
+            raise ValueError(
+                "mot_decoupled_inference_video_final_noise must be between "
+                f"0.0 and {sigma_max:.4f}, got {final_noise}."
+            )
+        if sigma_max == 0.0:
+            return final_noise
+        sample_scheduler.sigmas = (
+            sample_scheduler.sigmas * (sigma_max - final_noise) / sigma_max + final_noise
+        )
+        sample_scheduler.timesteps = (
+            sample_scheduler.sigmas[:-1] * sample_scheduler.config.num_train_timesteps
+        ).to(device=sample_scheduler.timesteps.device, dtype=torch.int64)
+        return final_noise
+
+    def _run_action_only_diffusion_step(
+        self,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        kv_caches: list[KVCacheType],
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        if not hasattr(self.model, "forward_action_from_cached_video"):
+            raise RuntimeError("mot_inference_video_mode=cache_only requires MoTCausalWanModel.")
+
+        action_noise_pred = self.model.forward_action_from_cached_video(
+            action=noisy_input_action,
+            timestep_action=timestep_action,
+            state=state_features,
+            embodiment_id=embodiment_id,
+            kv_cache=kv_caches[0],
+            current_start_frame=current_start_frame,
+        )
+        if self.ip_size > 1:
+            action_noise_pred = self._broadcast_cond_tensor(action_noise_pred)
+        return action_noise_pred
+
+    def _run_local_mot_refresh_step(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        seq_len: int,
+        y: torch.Tensor,
+        kv_cache: KVCacheType,
+        crossattn_cache: KVCacheType,
+        current_start_frame: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        if not getattr(self.model, "is_mot_wam", False):
+            raise RuntimeError("MoT decoupled denoise refresh requires MoTCausalWanModel.")
+
+        obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
+            noisy_input,
+            timestep,
+            action=noisy_input_action,
+            timestep_action=timestep_action,
+            state=state_features,
+            embodiment_id=embodiment_id,
+            context=prompt_emb,
+            seq_len=seq_len,
+            y=y,
+            clip_feature=self.clip_feas,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_frame=current_start_frame,
+        )
+        return (
+            obs_noise_pred.clone(),
+            action_noise_pred.clone(),
+            [updated_kv_cache.detach() for updated_kv_cache in updated_kv_caches],
+        )
+
+    def _run_mot_decoupled_refresh_step(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        prompt_embs: list[torch.Tensor],
+        seq_len: int,
+        y: torch.Tensor,
+        kv_caches: list[KVCacheType],
+        crossattn_caches: list[KVCacheType],
+        current_start_frame: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None]:
+        predictions = []
+        cond_video_kv: list[torch.Tensor] | None = None
+        for index, prompt_emb in enumerate(prompt_embs):
+            obs_pred, action_pred, updated_kv_caches = self._run_local_mot_refresh_step(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                noisy_input_action=noisy_input_action,
+                timestep_action=timestep_action,
+                state_features=state_features,
+                embodiment_id=embodiment_id,
+                prompt_emb=prompt_emb,
+                seq_len=seq_len,
+                y=y,
+                kv_cache=kv_caches[index],
+                crossattn_cache=crossattn_caches[index],
+                current_start_frame=current_start_frame,
+            )
+            predictions.append((obs_pred, action_pred))
+            if (self.ip_size == 1 or self.ip_rank == 0) and index == 0:
+                cond_video_kv = updated_kv_caches
+
+        predictions = self._exchange_predictions(predictions)
+        flow_pred, flow_pred_cond_action = self._combine_cfg_predictions(predictions)
+        return flow_pred, flow_pred_cond_action, cond_video_kv
+
+    def _run_action_from_refreshed_video_kv_step(
+        self,
+        noisy_input_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        video_kv_cache: list[torch.Tensor] | None,
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        if self.ip_size > 1 and self.ip_rank != 0:
+            return self._broadcast_cond_tensor(torch.empty_like(noisy_input_action))
+        if video_kv_cache is None:
+            raise RuntimeError("MoT decoupled action step requires a prior video refresh K/V cache.")
+        if not hasattr(self.model, "forward_action_from_refreshed_video_kv"):
+            raise RuntimeError("mot_inference_video_mode=decoupled_denoise requires MoTCausalWanModel.")
+
+        action_noise_pred = self.model.forward_action_from_refreshed_video_kv(
+            action=noisy_input_action,
+            timestep_action=timestep_action,
+            state=state_features,
+            embodiment_id=embodiment_id,
+            video_kv_cache=video_kv_cache,
+            current_start_frame=current_start_frame,
+        )
+        if self.ip_size > 1:
+            action_noise_pred = self._broadcast_cond_tensor(action_noise_pred)
+        return action_noise_pred
 
     def _broadcast_cond_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.ip_size == 1:
@@ -1680,93 +1977,228 @@ class WANPolicyHead(ActionHead):
         sample_scheduler_action.set_timesteps(
             self.num_inference_steps, device=noise_obs.device, shift=self.sigma_shift)
 
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        prev_predictions = []
+        inference_video_mode = self._effective_mot_inference_video_mode(use_rtc=use_rtc)
+        if self.ip_rank == 0 and getattr(self.model, "is_mot_wam", False) and not self._mot_inference_video_mode_logged:
+            print(
+                "[MoT] inference_video_mode="
+                f"{inference_video_mode} "
+                f"(configured={os.getenv('MOT_INFERENCE_VIDEO_MODE', getattr(self.config, 'mot_inference_video_mode', 'auto'))}, "
+                f"action_video_attention={getattr(self.model, 'mot_action_video_attention', 'n/a')})"
+            )
+            self._mot_inference_video_mode_logged = True
+
+        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler_action.timesteps]
+        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler_action.timesteps]
         self.skip_countdown = 0
         dit_compute_steps = 0
         rtc_total_steps = len(sample_scheduler.timesteps)
         rtc_guidance_max_steps = max(int(rtc_guidance_max_steps), 0)
         rtc_guidance_step_stride = max(int(rtc_guidance_step_stride), 1)
-        for index, current_timestep in enumerate(sample_scheduler.timesteps):
-            start_diffusion_events[index].record()
+        if inference_video_mode == "cache_only":
+            for index, action_timestep in enumerate(sample_scheduler_action.timesteps):
+                start_diffusion_events[index].record()
+                timestep_action = torch.ones(
+                    [batch_size, self.action_horizon],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * action_timestep
 
-            action_timestep = sample_scheduler_action.timesteps[index]
-            video_timestep = sample_scheduler.timesteps[index]
-            timestep = torch.ones(
-                [batch_size, self.num_frame_per_block],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * video_timestep
-            timestep_action = torch.ones(
-                [batch_size, self.action_horizon],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * action_timestep
-
-            should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
-            if should_run_model:
                 dit_compute_steps += 1
-                if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
-                    y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
-                else:
-                    y = self.ys[:, :, -self.num_frame_per_block:]
-                rtc_prev_chunk_left_over = prev_chunk_left_over if use_rtc else None
-                rtc_guidance_start_idx = max(rtc_total_steps - rtc_guidance_max_steps, 0)
-                apply_rtc_guidance = (
-                    rtc_prev_chunk_left_over is not None
-                    and rtc_guidance_max_steps > 0
-                    and index >= rtc_guidance_start_idx
-                    and ((index - rtc_guidance_start_idx) % rtc_guidance_step_stride == 0)
-                )
-                flow_pred, flow_pred_cond_action = self._run_diffusion_steps_with_rtc(
-                    noisy_input=noisy_input.transpose(1, 2),
-                    timestep=timestep,
+                flow_pred_cond_action = self._run_action_only_diffusion_step(
                     noisy_input_action=noisy_input_action,
                     timestep_action=timestep_action,
                     state_features=state_features,
                     embodiment_id=embodiment_id,
-                    prompt_embs=prompt_embs,
-                    seq_len=seq_len,
-                    y=y,
                     kv_caches=kv_caches,
-                    crossattn_caches=crossattn_caches,
-                    start_frame=self.current_start_frame,
-                    prev_chunk_left_over=rtc_prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    rtc_execution_horizon=rtc_execution_horizon,
-                    rtc_max_guidance_weight=rtc_max_guidance_weight,
-                    rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
-                    apply_rtc_guidance=apply_rtc_guidance,
+                    current_start_frame=self.current_start_frame,
                 )
-                prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
-                max_cache_size = 2
-                if len(prev_predictions) > max_cache_size:
-                    prev_predictions.pop(0)
-            else:
-                assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
-                _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+                end_diffusion_events[index].record()
 
-            end_diffusion_events[index].record()
+                noisy_input_action = sample_scheduler_action.step(
+                    model_output=flow_pred_cond_action,
+                    timestep=action_timestep,
+                    sample=noisy_input_action,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+            output = image
+        elif inference_video_mode == "decoupled_denoise":
+            video_final_noise = self._rescale_video_scheduler_final_noise(sample_scheduler)
+            video_refresh_steps = int(getattr(self.config, "mot_decoupled_inference_video_refresh_steps", 8))
+            video_refresh_mask = self._build_mot_video_refresh_mask(
+                video_refresh_steps,
+                total_steps=len(sample_scheduler.timesteps),
+            )
+            if self.ip_rank == 0:
+                print(
+                    "[MoT] decoupled_denoise: "
+                    f"video_final_noise={video_final_noise:.3f}, "
+                    f"video_refresh_steps={sum(video_refresh_mask)}/{len(video_refresh_mask)}, "
+                    "action_steps=every_step"
+                )
 
-            noisy_input = sample_scheduler.step(
-                model_output=flow_pred.transpose(1, 2),
-                timestep=video_timestep,
-                sample=noisy_input,
-                step_index=index,
-                return_dict=False,
-            )[0]
-            noisy_input_action = sample_scheduler_action.step(
-                model_output=flow_pred_cond_action,
-                timestep=action_timestep,
-                sample=noisy_input_action,
-                step_index=index,
-                return_dict=False,
-            )[0]
+            latest_video_flow: torch.Tensor | None = None
+            latest_cond_video_kv: list[torch.Tensor] | None = None
+            action_compute_steps = 0
 
-        output = noisy_input
-        if self.current_start_frame == 1:
-            output = torch.cat([image, output], dim=1)
+            for index, current_timestep in enumerate(sample_scheduler.timesteps):
+                start_diffusion_events[index].record()
+
+                action_timestep = sample_scheduler_action.timesteps[index]
+                video_timestep = sample_scheduler.timesteps[index]
+                timestep = torch.ones(
+                    [batch_size, self.num_frame_per_block],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * video_timestep
+                timestep_action = torch.ones(
+                    [batch_size, self.action_horizon],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * action_timestep
+
+                if video_refresh_mask[index]:
+                    dit_compute_steps += 1
+                    action_compute_steps += 1
+                    if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                        y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                    else:
+                        y = self.ys[:, :, -self.num_frame_per_block:]
+                    flow_pred, flow_pred_cond_action, latest_cond_video_kv = self._run_mot_decoupled_refresh_step(
+                        noisy_input=noisy_input.transpose(1, 2),
+                        timestep=timestep,
+                        noisy_input_action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state_features=state_features,
+                        embodiment_id=embodiment_id,
+                        prompt_embs=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        current_start_frame=self.current_start_frame,
+                    )
+                    latest_video_flow = flow_pred
+                else:
+                    if latest_video_flow is None:
+                        raise RuntimeError("MoT decoupled denoise requires the first video refresh step to run.")
+                    flow_pred = latest_video_flow
+                    action_compute_steps += 1
+                    flow_pred_cond_action = self._run_action_from_refreshed_video_kv_step(
+                        noisy_input_action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state_features=state_features,
+                        embodiment_id=embodiment_id,
+                        video_kv_cache=latest_cond_video_kv,
+                        current_start_frame=self.current_start_frame,
+                    )
+
+                end_diffusion_events[index].record()
+
+                noisy_input = sample_scheduler.step(
+                    model_output=flow_pred.transpose(1, 2),
+                    timestep=video_timestep,
+                    sample=noisy_input,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+                noisy_input_action = sample_scheduler_action.step(
+                    model_output=flow_pred_cond_action,
+                    timestep=action_timestep,
+                    sample=noisy_input_action,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+
+            output = noisy_input
+            if self.current_start_frame == 1:
+                output = torch.cat([image, output], dim=1)
+            if self.ip_rank == 0:
+                print(
+                    "[MoT] decoupled_denoise compute: "
+                    f"video_refresh_steps={dit_compute_steps}, action_steps={action_compute_steps}"
+                )
+        else:
+            prev_predictions = []
+            for index, current_timestep in enumerate(sample_scheduler.timesteps):
+                start_diffusion_events[index].record()
+
+                action_timestep = sample_scheduler_action.timesteps[index]
+                video_timestep = sample_scheduler.timesteps[index]
+                timestep = torch.ones(
+                    [batch_size, self.num_frame_per_block],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * video_timestep
+                timestep_action = torch.ones(
+                    [batch_size, self.action_horizon],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * action_timestep
+
+                should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
+                if should_run_model:
+                    dit_compute_steps += 1
+                    if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                        y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                    else:
+                        y = self.ys[:, :, -self.num_frame_per_block:]
+                    rtc_prev_chunk_left_over = prev_chunk_left_over if use_rtc else None
+                    rtc_guidance_start_idx = max(rtc_total_steps - rtc_guidance_max_steps, 0)
+                    apply_rtc_guidance = (
+                        rtc_prev_chunk_left_over is not None
+                        and rtc_guidance_max_steps > 0
+                        and index >= rtc_guidance_start_idx
+                        and ((index - rtc_guidance_start_idx) % rtc_guidance_step_stride == 0)
+                    )
+                    flow_pred, flow_pred_cond_action = self._run_diffusion_steps_with_rtc(
+                        noisy_input=noisy_input.transpose(1, 2),
+                        timestep=timestep,
+                        noisy_input_action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state_features=state_features,
+                        embodiment_id=embodiment_id,
+                        prompt_embs=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        start_frame=self.current_start_frame,
+                        prev_chunk_left_over=rtc_prev_chunk_left_over,
+                        inference_delay=inference_delay,
+                        rtc_execution_horizon=rtc_execution_horizon,
+                        rtc_max_guidance_weight=rtc_max_guidance_weight,
+                        rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
+                        apply_rtc_guidance=apply_rtc_guidance,
+                    )
+                    prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
+                    max_cache_size = 2
+                    if len(prev_predictions) > max_cache_size:
+                        prev_predictions.pop(0)
+                else:
+                    assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
+                    _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+
+                end_diffusion_events[index].record()
+
+                noisy_input = sample_scheduler.step(
+                    model_output=flow_pred.transpose(1, 2),
+                    timestep=video_timestep,
+                    sample=noisy_input,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+                noisy_input_action = sample_scheduler_action.step(
+                    model_output=flow_pred_cond_action,
+                    timestep=action_timestep,
+                    sample=noisy_input_action,
+                    step_index=index,
+                    return_dict=False,
+                )[0]
+
+            output = noisy_input
+            if self.current_start_frame == 1:
+                output = torch.cat([image, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
         latents_action = noisy_input_action

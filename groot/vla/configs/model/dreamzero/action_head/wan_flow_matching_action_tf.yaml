@@ -18,6 +18,12 @@ mot_action_num_layers: null
 mot_action_num_heads: 8
 mot_action_video_attention: first_frame
 mot_action_video_ki: false
+mot_inference_video_mode: auto
+mot_decouple_video_action_noise: false
+mot_video_noise_beta_alpha: 3.0
+mot_video_noise_beta_beta: 1.0
+mot_decoupled_inference_video_final_noise: 0.8
+mot_decoupled_inference_video_refresh_steps: 8
 num_frame_per_block: 1
 num_action_per_block: 32
 num_state_per_block: 1
@@ -47,6 +53,12 @@ action_head_cfg:
     mot_action_num_heads: ${mot_action_num_heads}
     mot_action_video_attention: ${mot_action_video_attention}
     mot_action_video_ki: ${mot_action_video_ki}
+    mot_inference_video_mode: ${mot_inference_video_mode}
+    mot_decouple_video_action_noise: ${mot_decouple_video_action_noise}
+    mot_video_noise_beta_alpha: ${mot_video_noise_beta_alpha}
+    mot_video_noise_beta_beta: ${mot_video_noise_beta_beta}
+    mot_decoupled_inference_video_final_noise: ${mot_decoupled_inference_video_final_noise}
+    mot_decoupled_inference_video_refresh_steps: ${mot_decoupled_inference_video_refresh_steps}
     use_gradient_checkpointing: true
     add_pos_embed: ${add_pos_embed}
     model_dtype: float32
