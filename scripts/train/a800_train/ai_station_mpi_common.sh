@@ -50,32 +50,104 @@ ai_station_mpi_count_unique_hosts() {
     | awk '{print $1}'
 }
 
+ai_station_mpi_host_rank_from_file() {
+  local hostfile="$1"
+  local current_hosts rank host
+  current_hosts="$(hostname 2>/dev/null; hostname -s 2>/dev/null; hostname -f 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\n')"
+  rank=0
+  while IFS= read -r host; do
+    host="${host%%:*}"
+    if printf '%s\n' "${current_hosts}" | awk -v h="${host}" '$0 == h {found=1} END {exit found ? 0 : 1}'; then
+      echo "${rank}"
+      return 0
+    fi
+    rank=$((rank + 1))
+  done < <(awk 'NF && $1 !~ /^#/ {host=$1; sub(/:.*/, "", host); if (!seen[host]++) print host}' "${hostfile}")
+  return 1
+}
+
 ai_station_mpi_inside_mpi_rank() {
   [[ -n "${OMPI_COMM_WORLD_SIZE:-}" || -n "${PMI_SIZE:-}" || -n "${PMIX_SIZE:-}" ]]
+}
+
+ai_station_mpi_find_mpirun() {
+  local candidate
+  for candidate in \
+    mpirun \
+    mpiexec \
+    /usr/local/mpi/bin/mpirun \
+    /usr/local/openmpi/bin/mpirun \
+    /opt/mpi/bin/mpirun \
+    /opt/openmpi/bin/mpirun \
+    /usr/lib64/openmpi/bin/mpirun; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+      command -v "${candidate}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 ai_station_mpi_maybe_relaunch() {
   local script_path="$1"
   shift
 
-  local hostfile host_count
+  local hostfile host_count mpirun_bin current_rank
   if [[ "${AI_STATION_MPI_REENTERED:-0}" == "1" ]] || ai_station_mpi_inside_mpi_rank; then
     return 0
   fi
 
-  if ! command -v mpirun >/dev/null 2>&1; then
-    echo "WARN: mpirun not found; running this script in the current container only"
-    return 0
-  fi
-
   if ! hostfile="$(ai_station_mpi_find_hostfile)"; then
-    echo "WARN: MPI hostfile not found; running this script in the current container only"
-    return 0
+    if [[ "${AI_STATION_ALLOW_LOCAL_FALLBACK:-0}" == "1" ]]; then
+      echo "WARN: MPI hostfile not found; running this script in the current container only"
+      return 0
+    fi
+    echo "ERROR: MPI hostfile not found and this process is not inside an MPI rank."
+    echo "Set AI_STATION_ALLOW_LOCAL_FALLBACK=1 only for intentional single-node debugging."
+    exit 1
   fi
 
   host_count="$(ai_station_mpi_count_unique_hosts "${hostfile}")"
+
+  if ! mpirun_bin="$(ai_station_mpi_find_mpirun)"; then
+    if ai_station_mpi_is_uint "${host_count}" \
+      && (( host_count >= 1 )) \
+      && current_rank="$(ai_station_mpi_host_rank_from_file "${hostfile}")"; then
+      export OMPI_COMM_WORLD_SIZE="${host_count}"
+      export OMPI_COMM_WORLD_RANK="${current_rank}"
+      export OMPI_COMM_WORLD_LOCAL_RANK=0
+      export OMPI_COMM_WORLD_LOCAL_SIZE=1
+      export AI_STATION_MPI_REENTERED=1
+      echo "WARN: mpirun not found; derived rank ${current_rank}/${host_count} from ${hostfile}"
+      return 0
+    fi
+
+    if [[ "${AI_STATION_ALLOW_LOCAL_FALLBACK:-0}" == "1" ]]; then
+      echo "WARN: mpirun not found; running this script in the current container only"
+      return 0
+    fi
+    echo "ERROR: mpirun not found and current host is not listed in ${hostfile}."
+    echo "Install OpenMPI/mpirun in the image, or make AI Station run this script on worker hosts."
+    exit 1
+  fi
+
   if ! ai_station_mpi_is_uint "${host_count}" || (( host_count < 2 )); then
-    echo "WARN: MPI hostfile ${hostfile} has ${host_count:-0} unique host; running locally"
+    if [[ "${AI_STATION_ALLOW_LOCAL_FALLBACK:-0}" == "1" ]]; then
+      echo "WARN: MPI hostfile ${hostfile} has ${host_count:-0} unique host; running locally"
+      return 0
+    fi
+    echo "ERROR: MPI hostfile ${hostfile} has ${host_count:-0} unique host."
+    echo "Set AI_STATION_ALLOW_LOCAL_FALLBACK=1 only for intentional single-node debugging."
+    exit 1
+  fi
+
+  if current_rank="$(ai_station_mpi_host_rank_from_file "${hostfile}")"; then
+    export OMPI_COMM_WORLD_SIZE="${host_count}"
+    export OMPI_COMM_WORLD_RANK="${current_rank}"
+    export OMPI_COMM_WORLD_LOCAL_RANK=0
+    export OMPI_COMM_WORLD_LOCAL_SIZE=1
+    export AI_STATION_MPI_REENTERED=1
+    echo "INFO: current host is listed in ${hostfile}; derived rank ${current_rank}/${host_count}"
     return 0
   fi
 
@@ -90,7 +162,7 @@ ai_station_mpi_maybe_relaunch() {
   echo "SCRIPT=${script_path}"
   echo "================================================"
 
-  exec mpirun \
+  exec "${mpirun_bin}" \
     --allow-run-as-root \
     --hostfile "${hostfile}" \
     --map-by ppr:1:node \
