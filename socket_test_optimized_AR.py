@@ -398,8 +398,11 @@ class ARDroidRoboarenaPolicy:
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
         
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
+        # Store video predictions for potential saving (drop conditioning anchor latents)
+        if video_pred is not None:
+            video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+            if video_pred_to_save is not None:
+                self.video_across_time.append(video_pred_to_save)
         
         # Extract and convert action
         action_dict = self._extract_action_dict(result_batch.act)
@@ -411,9 +414,42 @@ class ARDroidRoboarenaPolicy:
         
         return action
     
+    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        """Drop conditioning anchor latent frames from video_pred before saving.
+
+        After causal cache resets, action_head prepends the current input frame latent
+        to warm the next video block. Saving it as prediction causes periodic gray/jump frames.
+        """
+        condition_latent_frames = int(
+            getattr(
+                self._policy.trained_model.action_head,
+                "last_video_pred_condition_latent_frames",
+                0,
+            )
+            or 0
+        )
+        if condition_latent_frames <= 0:
+            return video_pred
+        if video_pred.ndim < 3:
+            logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
+            return video_pred
+        if video_pred.shape[2] <= condition_latent_frames:
+            logger.warning(
+                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
+                condition_latent_frames,
+                tuple(video_pred.shape),
+            )
+            return None
+        logger.info(
+            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            condition_latent_frames,
+            tuple(video_pred.shape),
+        )
+        return video_pred[:, :, condition_latent_frames:]
+
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
-        
+
         Args:
             save_video: Whether to save accumulated video before reset.
         """
@@ -563,6 +599,38 @@ class WebsocketPolicyServer:
                 logger.warning(f"Failed to save obs key '{key}': {e}")
                 continue
 
+    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        """Drop conditioning anchor latent frames from video_pred before saving.
+
+        After causal cache resets, action_head prepends the current input frame latent
+        to warm the next video block. Saving it as prediction causes periodic gray/jump frames.
+        """
+        condition_latent_frames = int(
+            getattr(
+                self._policy.trained_model.action_head,
+                "last_video_pred_condition_latent_frames",
+                0,
+            )
+            or 0
+        )
+        if condition_latent_frames <= 0:
+            return video_pred
+        if video_pred.ndim < 3:
+            logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
+            return video_pred
+        if video_pred.shape[2] <= condition_latent_frames:
+            logger.warning(
+                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
+                condition_latent_frames,
+                tuple(video_pred.shape),
+            )
+            return None
+        logger.info(
+            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            condition_latent_frames,
+            tuple(video_pred.shape),
+        )
+        return video_pred[:, :, condition_latent_frames:]
 
 
     def serve_forever(self, rank: int = 0) -> None:
@@ -692,11 +760,13 @@ class WebsocketPolicyServer:
                     print(f"Forward Time: {time.perf_counter() - forward_start_time:.2f} seconds")
 
                     action_chunk_dict = result_batch.act
-                    video_chunk = video_pred
+                    # Drop conditioning anchor latents from video prediction before using it
+                    video_chunk = self._drop_condition_latents_from_video_pred(video_pred) if video_pred is not None else None
 
                     print(f"Inference Time: {time.perf_counter() - infer_start_time:.2f} seconds")
 
-                    self.video_across_time.append(video_chunk)
+                    if video_chunk is not None:
+                        self.video_across_time.append(video_chunk)
 
                     if len(self.video_across_time) > 10:
                         frame_list = []
@@ -758,7 +828,7 @@ class WebsocketPolicyServer:
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")
-                        self.video_across_time = [video_chunk]
+                        self.video_across_time = [video_chunk] if video_chunk is not None else []
 
                     
                     def batch_to_dict(batch):
