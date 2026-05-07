@@ -22,6 +22,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MASTER_PORT="${MASTER_PORT:-29430}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_decoupled_mpi}"
 
+source "${SCRIPT_DIR}/ai_station_mpi_common.sh"
+ai_station_mpi_maybe_relaunch "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")" "$@"
+
 is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
@@ -140,6 +143,8 @@ MPI_WORLD_SIZE="$(as_uint_or "${OMPI_COMM_WORLD_SIZE:-${PMI_SIZE:-${PMIX_SIZE:-$
 MPI_GLOBAL_RANK="$(as_uint_or "${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMIX_RANK:-${MPI_RANK:-${RANK:-0}}}}}" 0)"
 MPI_LOCAL_RANK="$(as_uint_or "${OMPI_COMM_WORLD_LOCAL_RANK:-${PMI_LOCAL_RANK:-${MPI_LOCALRANKID:-${LOCAL_RANK:-${SLURM_LOCALID:-0}}}}}" 0)"
 MPI_LOCAL_SIZE="$(as_uint_or "${OMPI_COMM_WORLD_LOCAL_SIZE:-${PMI_LOCAL_SIZE:-${MPI_LOCALNRANKS:-${MPI_LOCAL_SIZE:-1}}}}" 1)"
+
+ai_station_mpi_prepare_master_addr "${MPI_WRAPPER_START_EPOCH}" "${MPI_WORLD_SIZE}" "${MPI_GLOBAL_RANK}"
 
 if (( MPI_LOCAL_SIZE < 1 )); then
   MPI_LOCAL_SIZE=1
