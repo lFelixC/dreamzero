@@ -808,7 +808,7 @@ class BaseTrainer(transformers.Trainer):
             if dataloader_prefetch_factor is not None:
                 dataloader_params["prefetch_factor"] = dataloader_prefetch_factor
 
-            dataloader_in_order = os.environ.get("DREAMZERO_DATALOADER_IN_ORDER", "false")
+            dataloader_in_order = os.environ.get("DREAMZERO_DATALOADER_IN_ORDER", "true")
             dataloader_params["in_order"] = dataloader_in_order.lower() in {
                 "1",
                 "true",

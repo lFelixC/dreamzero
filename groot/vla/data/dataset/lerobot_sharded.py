@@ -20,7 +20,7 @@ SHARD_TIMING_PREFIX = "DREAMZERO_SHARD_TIMING"
 
 
 def _shard_timing_enabled() -> bool:
-    value = os.environ.get("DREAMZERO_SHARD_TIMING", "1").lower()
+    value = os.environ.get("DREAMZERO_SHARD_TIMING", "0").lower()
     return value not in {"0", "false", "no", "off"}
 
 
@@ -36,11 +36,11 @@ def _read_self_rss_bytes() -> int:
 
 
 def _shard_timing_sample_interval() -> int:
-    value = os.environ.get("DREAMZERO_SHARD_TIMING_SAMPLE_INTERVAL", "100")
+    value = os.environ.get("DREAMZERO_SHARD_TIMING_SAMPLE_INTERVAL", "0")
     try:
         return max(0, int(value))
     except ValueError:
-        return 100
+        return 0
 
 
 def _shard_prefetch_delay_samples() -> int:

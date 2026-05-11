@@ -1,9 +1,27 @@
 #!/bin/bash
 set -euo pipefail
 
-# RoboTwin Wan2.2 training entrypoint.
-# Switch architectures with ARCH=joint or ARCH=mot. This script uses its own
-# robotwin_* config and never rewrites DROID paths.
+# A800 2-node RoboTwin Wan2.2 joint training with the runtime infra knobs
+# disabled. This is useful as a baseline close to the pre-infra-fix behavior.
+# This script is self-contained: it launches experiment.py directly and does not
+# depend on scripts/train/robotwin_training_wan22.sh.
+# Run this script on every node in the experiment with the same MASTER_ADDR
+# and MASTER_PORT, changing only NODE_RANK.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# -----------------------------
+# Fixed runtime environment
+# -----------------------------
+export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venvs/dreamzero}"
+export PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV}/bin/python}"
+export PATH="${VIRTUAL_ENV}/bin:/usr/local/bin:/root/.local/bin:${PATH:-}"
+export DREAMZERO_ROOT="${DREAMZERO_ROOT:-/2023133163/liuf/dreamzero}"
+export DATASET_ROOT="${DATASET_ROOT:-/2023133163/datasets/dreamzero}"
+export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/2023133163/checkpoints/dreamzero}"
+export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
+
+EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py}"
 
 ARCH="${ARCH:-joint}"
 if [[ "${ARCH}" != "joint" && "${ARCH}" != "mot" ]]; then
@@ -11,23 +29,14 @@ if [[ "${ARCH}" != "joint" && "${ARCH}" != "mot" ]]; then
   exit 1
 fi
 
-export VIRTUAL_ENV="${VIRTUAL_ENV:-/data/dreamzero/.venv}"
-export PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV}/bin/python}"
-export PATH="${VIRTUAL_ENV}/bin:/usr/local/bin:/root/.local/bin:${PATH:-}"
-export DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero_mot}"
-export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
-export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
-
-EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py}"
-ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-/data/datasets/dreamzero/robotwin_unified_dreamzero}"
+ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-${DATASET_ROOT}/robotwin_unified_dreamzero}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_no_infra_a800_2node}"
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
 IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${WAN22_CKPT_DIR}}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
-OUTPUT_DIR_WAS_SET="${OUTPUT_DIR+x}"
-OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_${ARCH}}"
 
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
-PER_DEVICE_BS="${PER_DEVICE_BS:-32}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
 MAX_STEPS="${MAX_STEPS:-60000}"
 SAVE_STEPS="${SAVE_STEPS:-5000}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
@@ -38,57 +47,28 @@ MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-4}"
 NUM_FRAME_PER_BLOCK="${NUM_FRAME_PER_BLOCK:-2}"
 NUM_ACTION_PER_BLOCK="${NUM_ACTION_PER_BLOCK:-24}"
 NUM_STATE_PER_BLOCK="${NUM_STATE_PER_BLOCK:-1}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
-DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-1}"
+
+# Baseline dataloader settings matching the older RoboTwin/DROID style.
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-4}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
 DATALOADER_IN_ORDER="${DATALOADER_IN_ORDER:-true}"
 DATALOADER_WARMUP_BATCHES="${DATALOADER_WARMUP_BATCHES:-0}"
 SHARD_PREFETCH_DELAY_SAMPLES="${SHARD_PREFETCH_DELAY_SAMPLES:-0}"
 TRAIN_STEP_BARRIER="${TRAIN_STEP_BARRIER:-false}"
 TRAIN_STEP_BARRIER_STEPS="${TRAIN_STEP_BARRIER_STEPS:-0}"
+
 DATASET_SHARD_SAMPLING_RATE="${DATASET_SHARD_SAMPLING_RATE:-0.1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
 EPISODE_FILTER_PATH="${EPISODE_FILTER_PATH:-null}"
 
-NNODES="${NNODES:-1}"
+NNODES="${NNODES:-2}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29431}"
-
-if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
-  NNODES=1
-  NODE_RANK=0
-  MASTER_ADDR="127.0.0.1"
-  GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0}}"
-  if [[ "${GPU_IDS}" == *,* ]]; then
-    GPU_IDS="${GPU_IDS%%,*}"
-  fi
-  PER_DEVICE_BS="${SMOKE_PER_DEVICE_BS:-1}"
-  MAX_STEPS="${SMOKE_MAX_STEPS:-2}"
-  SAVE_STEPS="${SMOKE_SAVE_STEPS:-1}"
-  SAVE_TOTAL_LIMIT="${SMOKE_SAVE_TOTAL_LIMIT:-5}"
-  DATALOADER_NUM_WORKERS="${SMOKE_DATALOADER_NUM_WORKERS:-1}"
-  DATALOADER_PREFETCH_FACTOR="${SMOKE_DATALOADER_PREFETCH_FACTOR:-2}"
-  DATALOADER_PERSISTENT_WORKERS="${SMOKE_DATALOADER_PERSISTENT_WORKERS:-false}"
-  DATALOADER_IN_ORDER="${SMOKE_DATALOADER_IN_ORDER:-true}"
-  DATALOADER_WARMUP_BATCHES="${SMOKE_DATALOADER_WARMUP_BATCHES:-0}"
-  SHARD_PREFETCH_DELAY_SAMPLES="${SMOKE_SHARD_PREFETCH_DELAY_SAMPLES:-0}"
-  TRAIN_STEP_BARRIER="${SMOKE_TRAIN_STEP_BARRIER:-false}"
-  TRAIN_STEP_BARRIER_STEPS="${SMOKE_TRAIN_STEP_BARRIER_STEPS:-0}"
-  DATASET_SHARD_SAMPLING_RATE="${SMOKE_DATASET_SHARD_SAMPLING_RATE:-1.0}"
-  if [[ -z "${OUTPUT_DIR_WAS_SET}" ]]; then
-    OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_${ARCH}_smoke"
-  fi
-  if [[ "${EPISODE_FILTER_PATH}" == "null" && -f "${ROBOTWIN_DATA_ROOT}/meta/smoke_episode_filter.json" ]]; then
-    EPISODE_FILTER_PATH="${ROBOTWIN_DATA_ROOT}/meta/smoke_episode_filter.json"
-  fi
-fi
-
+MASTER_PORT="${MASTER_PORT:-29445}"
 GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
-if [[ -n "${GPU_IDS}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
-fi
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 
 export HYDRA_FULL_ERROR=1
 export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-0}"
@@ -96,12 +76,16 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT_NAME}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+# Explicitly disable the runtime infra switches.
 export DREAMZERO_DATALOADER_IN_ORDER="${DREAMZERO_DATALOADER_IN_ORDER:-${DATALOADER_IN_ORDER}}"
 export DREAMZERO_DATALOADER_WARMUP_BATCHES="${DREAMZERO_DATALOADER_WARMUP_BATCHES:-${DATALOADER_WARMUP_BATCHES}}"
 export DREAMZERO_SHARD_PREFETCH_DELAY_SAMPLES="${DREAMZERO_SHARD_PREFETCH_DELAY_SAMPLES:-${SHARD_PREFETCH_DELAY_SAMPLES}}"
 export DREAMZERO_TRAIN_STEP_BARRIER="${DREAMZERO_TRAIN_STEP_BARRIER:-${TRAIN_STEP_BARRIER}}"
 export DREAMZERO_TRAIN_STEP_BARRIER_STEPS="${DREAMZERO_TRAIN_STEP_BARRIER_STEPS:-${TRAIN_STEP_BARRIER_STEPS}}"
 export DREAMZERO_SHARD_SCHEDULE_BALANCE="${DREAMZERO_SHARD_SCHEDULE_BALANCE:-none}"
+export DREAMZERO_SHARD_COST_PROFILE="${DREAMZERO_SHARD_COST_PROFILE:-}"
+export DREAMZERO_SHARD_COST_KEY="${DREAMZERO_SHARD_COST_KEY:-source_total_bytes}"
 export DREAMZERO_SHARD_TIMING="${DREAMZERO_SHARD_TIMING:-0}"
 export DREAMZERO_SHARD_TIMING_SAMPLE_INTERVAL="${DREAMZERO_SHARD_TIMING_SAMPLE_INTERVAL:-0}"
 
@@ -114,41 +98,9 @@ elif [[ -d /usr/local/cuda-12.9 ]]; then
   export CUDA_HOME="/usr/local/cuda-12.9"
   export PATH="${CUDA_HOME}/bin:${PATH}"
   export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-fi
-
-if [[ ! -x "${PYTHON_BIN}" ]]; then
-  echo "ERROR: Python not found or not executable at ${PYTHON_BIN}"
-  exit 1
-fi
-if [[ ! -f "${EXPERIMENT_PY}" ]]; then
-  echo "ERROR: experiment.py not found at ${EXPERIMENT_PY}"
-  exit 1
-fi
-if [[ ! -f "${ROBOTWIN_DATA_ROOT}/meta/modality.json" ]]; then
-  echo "ERROR: RoboTwin metadata missing at ${ROBOTWIN_DATA_ROOT}/meta/modality.json"
-  echo "Run scripts/data/convert_robotwin_v3_to_dreamzero.py and scripts/data/convert_lerobot_to_gear.py first."
-  exit 1
-fi
-
-if [[ -n "${NUM_GPUS:-}" ]]; then
-  LOCAL_NUM_GPUS="${NUM_GPUS}"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
-  LOCAL_NUM_GPUS="${#_GPU_ID_ARRAY[@]}"
 else
-  LOCAL_NUM_GPUS="$("${PYTHON_BIN}" - <<'PY'
-import torch
-print(torch.cuda.device_count())
-PY
-)"
+  echo "WARN: CUDA toolkit not found; continuing without setting CUDA_HOME"
 fi
-if [[ -z "${LOCAL_NUM_GPUS}" ]] || [[ "${LOCAL_NUM_GPUS}" -lt 1 ]]; then
-  echo "ERROR: No visible GPU found"
-  exit 1
-fi
-
-WORLD_GPUS=$((NNODES * LOCAL_NUM_GPUS))
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((WORLD_GPUS * PER_DEVICE_BS))}"
 
 download_hf() {
   if command -v hf >/dev/null 2>&1; then
@@ -178,6 +130,7 @@ prepare_assets() {
     local image_encoder_name="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
     local image_encoder_cache_dir="${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P"
     local src
+
     for src in \
       "${image_encoder_cache_dir}/${image_encoder_name}" \
       "${CHECKPOINT_ROOT}/DreamZero-DROID/${image_encoder_name}"; do
@@ -195,6 +148,32 @@ prepare_assets() {
     cp -L "${image_encoder_cache_dir}/${image_encoder_name}" "${IMAGE_ENCODER_DIR}/${image_encoder_name}"
   fi
 }
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "ERROR: Python not found or not executable at ${PYTHON_BIN}"
+  exit 1
+fi
+
+if [[ ! -f "${EXPERIMENT_PY}" ]]; then
+  echo "ERROR: experiment.py not found at ${EXPERIMENT_PY}"
+  exit 1
+fi
+
+if [[ ! -f "${ROBOTWIN_DATA_ROOT}/meta/modality.json" ]]; then
+  echo "ERROR: RoboTwin metadata missing at ${ROBOTWIN_DATA_ROOT}/meta/modality.json"
+  exit 1
+fi
+
+IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+LOCAL_NUM_GPUS="${NUM_GPUS:-${#_GPU_ID_ARRAY[@]}}"
+if [[ -z "${LOCAL_NUM_GPUS}" ]] || [[ "${LOCAL_NUM_GPUS}" -lt 1 ]]; then
+  echo "ERROR: No visible GPU found"
+  exit 1
+fi
+export NUM_GPUS="${LOCAL_NUM_GPUS}"
+
+WORLD_GPUS=$((NNODES * LOCAL_NUM_GPUS))
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((WORLD_GPUS * PER_DEVICE_BS))}"
 
 if [[ "${PREPARE_ASSETS:-true}" == "true" ]]; then
   if [[ "${NODE_RANK}" == "0" ]]; then
@@ -218,16 +197,22 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 cd "${DREAMZERO_ROOT}"
 
-echo "========== RoboTwin Wan2.2 launch config =========="
-echo "ARCH=${ARCH}"
+echo "========== RoboTwin joint no-infra A800 2-node launch =========="
 echo "DREAMZERO_ROOT=${DREAMZERO_ROOT}"
+echo "SCRIPT_DIR=${SCRIPT_DIR}"
+echo "HOSTNAME=${HOSTNAME:-unknown}"
+echo "NNODES=${NNODES}"
+echo "NODE_RANK=${NODE_RANK}"
+echo "MASTER_ADDR=${MASTER_ADDR}"
+echo "MASTER_PORT=${MASTER_PORT}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "NUM_GPUS(local)=${NUM_GPUS}"
+echo "WORLD_GPUS(total)=${WORLD_GPUS}"
+echo "PER_DEVICE_BS=${PER_DEVICE_BS}"
+echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "ROBOTWIN_DATA_ROOT=${ROBOTWIN_DATA_ROOT}"
 echo "WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
-echo "OUTPUT_DIR=${OUTPUT_DIR}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
-echo "NUM_GPUS(local)=${LOCAL_NUM_GPUS}"
-echo "NNODES=${NNODES}"
-echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS}"
 echo "DATALOADER_PREFETCH_FACTOR=${DATALOADER_PREFETCH_FACTOR}"
 echo "DATALOADER_IN_ORDER=${DREAMZERO_DATALOADER_IN_ORDER}"
@@ -235,9 +220,11 @@ echo "DATALOADER_WARMUP_BATCHES=${DREAMZERO_DATALOADER_WARMUP_BATCHES}"
 echo "SHARD_PREFETCH_DELAY_SAMPLES=${DREAMZERO_SHARD_PREFETCH_DELAY_SAMPLES}"
 echo "TRAIN_STEP_BARRIER=${DREAMZERO_TRAIN_STEP_BARRIER}"
 echo "TRAIN_STEP_BARRIER_STEPS=${DREAMZERO_TRAIN_STEP_BARRIER_STEPS}"
-echo "SMOKE_TEST=${SMOKE_TEST:-0}"
-echo "EPISODE_FILTER_PATH=${EPISODE_FILTER_PATH}"
-echo "==================================================="
+echo "DREAMZERO_SHARD_SCHEDULE_BALANCE=${DREAMZERO_SHARD_SCHEDULE_BALANCE}"
+echo "DREAMZERO_SHARD_COST_PROFILE=${DREAMZERO_SHARD_COST_PROFILE}"
+echo "DREAMZERO_SHARD_COST_KEY=${DREAMZERO_SHARD_COST_KEY}"
+echo "DREAMZERO_SHARD_TIMING=${DREAMZERO_SHARD_TIMING}"
+echo "================================================================"
 
 TRAIN_OVERRIDES=(
   "report_to=wandb"

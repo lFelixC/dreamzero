@@ -1,6 +1,6 @@
 # A800 Multi-Node Training Scripts
 
-这个目录只保留三个 A800 多机训练入口。每个脚本都是自包含的，可以直接运行，不依赖其它训练启动脚本或环境 helper。
+这个目录保留 A800 多机训练入口。所有脚本都是自包含的，可以直接运行，不依赖其它训练启动脚本或环境 helper。
 
 默认环境固定为：
 
@@ -21,6 +21,8 @@ CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
 | `run_mot_full_video_2node.sh` | MoT full-video attention | `29420` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_2node` |
 | `run_mot_full_video_decoupled_2node.sh` | MoT full-video attention + decoupled video/action noise | `29430` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_decoupled_2node` |
 | `run_joint_drop_2node.sh` | joint baseline + DROID exterior-view drop | `29440` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_a800_2node` |
+| `run_robotwin_joint_cost_group_2node.sh` | RoboTwin joint; infra knobs default off, cost-group can be enabled explicitly | `29444` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_a800_2node` |
+| `run_robotwin_joint_no_infra_2node.sh` | RoboTwin joint baseline with runtime infra knobs disabled | `29445` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_no_infra_a800_2node` |
 
 ## 首次进入容器检查
 
@@ -29,11 +31,12 @@ CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
 ```bash
 cd /2023133163/liuf/dreamzero
 
-find scripts/train/a800_train -type f -name "*.sh" -exec sed -i 's/\r$//' {} \;
-chmod +x scripts/train/a800_train/*.sh
+find scripts/train/a800_train -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i 's/\r$//' {} +
+
+find scripts/train/a800_train -type f \( -name "*.sh" -o -name "*.py" \) -exec chmod +x {} +
 ```
 
-第一行用于修复 CRLF 换行，否则可能出现 `/bin/bash^M: bad interpreter`。第二行给 shell 脚本加可执行权限，否则直接执行时可能出现 `Permission denied`。
+第一行用于修复 CRLF 换行，否则可能出现 `/bin/bash^M: bad interpreter` 或 `set: pipefail` 这类异常。第二行给脚本加可执行权限，否则直接执行时可能出现 `Permission denied`。
 
 ## 配置公网 DNS
 
