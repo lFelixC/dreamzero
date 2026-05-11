@@ -19,8 +19,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default="dreamzero", help="SwanLab project name.")
     parser.add_argument("--workspace", default=None, help="SwanLab workspace/user/org name.")
     parser.add_argument("--experiment-name", default=None, help="SwanLab experiment name.")
+    parser.add_argument("--resume-id", default=None, help="Existing SwanLab experiment id to resume.")
+    parser.add_argument(
+        "--resume",
+        default="must",
+        choices=["must", "allow", "never"],
+        help="Resume behavior used with --resume-id.",
+    )
+    parser.add_argument(
+        "--step-mode",
+        default="auto",
+        choices=["trainer", "auto"],
+        help=(
+            "Use trainer_state step as the x-axis, or omit explicit step so "
+            "SwanLab increments once per uploaded log call."
+        ),
+    )
     parser.add_argument("--mode", default="cloud", choices=["cloud", "local", "offline", "disabled"])
     parser.add_argument("--logdir", default=None, help="Optional SwanLab local log directory.")
+    parser.add_argument(
+        "--raw-metric-names",
+        action="store_true",
+        help="Upload Trainer metric names as-is instead of matching HuggingFace/W&B names.",
+    )
     return parser.parse_args()
 
 
@@ -28,7 +49,7 @@ def latest_trainer_state(output_dir: Path) -> Path:
     candidates = list(output_dir.glob("checkpoint-*/trainer_state.json"))
     direct_state = output_dir / "trainer_state.json"
     if direct_state.exists():
-      candidates.append(direct_state)
+        candidates.append(direct_state)
 
     if not candidates:
         raise FileNotFoundError(f"No trainer_state.json found under {output_dir}")
@@ -46,7 +67,18 @@ def latest_trainer_state(output_dir: Path) -> Path:
     return sorted(candidates, key=sort_key)[-1]
 
 
-def scalar_metrics(entry: dict[str, Any]) -> dict[str, float]:
+def rewrite_metric_name(key: str) -> str:
+    """Match the train/eval/test prefixes used by HuggingFace's W&B logger."""
+    if "/" in key:
+        return key
+    if key.startswith("eval_"):
+        return f"eval/{key.removeprefix('eval_')}"
+    if key.startswith("test_"):
+        return f"test/{key.removeprefix('test_')}"
+    return f"train/{key}"
+
+
+def scalar_metrics(entry: dict[str, Any], *, raw_metric_names: bool = False) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for key, value in entry.items():
         if key in {"step", "epoch"}:
@@ -54,7 +86,8 @@ def scalar_metrics(entry: dict[str, Any]) -> dict[str, float]:
         if isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
-            metrics[key] = float(value)
+            metric_name = key if raw_metric_names else rewrite_metric_name(key)
+            metrics[metric_name] = float(value)
     return metrics
 
 
@@ -84,6 +117,9 @@ def main() -> None:
     }
     if args.workspace:
         init_kwargs["workspace"] = args.workspace
+    if args.resume_id:
+        init_kwargs["id"] = args.resume_id
+        init_kwargs["resume"] = args.resume
     if args.logdir:
         init_kwargs["logdir"] = args.logdir
 
@@ -95,10 +131,13 @@ def main() -> None:
         step = entry.get("step")
         if not isinstance(step, int):
             continue
-        metrics = scalar_metrics(entry)
+        metrics = scalar_metrics(entry, raw_metric_names=args.raw_metric_names)
         if not metrics:
             continue
-        swanlab.log(metrics, step=step)
+        if args.step_mode == "auto":
+            swanlab.log(metrics)
+        else:
+            swanlab.log(metrics, step=step)
         uploaded += 1
 
     if hasattr(swanlab, "finish"):

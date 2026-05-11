@@ -83,6 +83,16 @@ def load_info(dataset_path: Path) -> dict:
 
 def get_parquet_paths(dataset_path: Path, info: dict) -> list[Path]:
     pattern = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
+    if "{chunk_index" in pattern and "{file_index" in pattern:
+        glob_pattern = (
+            pattern
+            .replace("{chunk_index:03d}", "*")
+            .replace("{file_index:03d}", "*")
+            .replace("{chunk_index}", "*")
+            .replace("{file_index}", "*")
+        )
+        return sorted(dataset_path.glob(glob_pattern))
+
     total_episodes = info["total_episodes"]
     chunks_size = info.get("chunks_size", 1000)
     paths = []
@@ -248,11 +258,95 @@ def compute_stats(parquet_paths: list[Path], columns: list[str]) -> dict:
     return stats
 
 
+class _RunningArrayStats:
+    def __init__(self, dim: int, quantile_samples: int = 2_000_000) -> None:
+        self.dim = dim
+        self.quantile_samples = quantile_samples
+        self.count = 0
+        self.total = np.zeros(dim, dtype=np.float64)
+        self.total_sq = np.zeros(dim, dtype=np.float64)
+        self.min = np.full(dim, np.inf, dtype=np.float64)
+        self.max = np.full(dim, -np.inf, dtype=np.float64)
+        self.samples: np.ndarray | None = None
+        self.sample_filled = 0
+        self.rng = np.random.default_rng(42)
+        self.sample_seen = 0
+
+    def update(self, rows: np.ndarray) -> None:
+        if rows.size == 0:
+            return
+        rows = rows.reshape(-1, self.dim).astype(np.float64, copy=False)
+        self.count += rows.shape[0]
+        self.total += rows.sum(axis=0)
+        self.total_sq += np.square(rows).sum(axis=0)
+        self.min = np.minimum(self.min, rows.min(axis=0))
+        self.max = np.maximum(self.max, rows.max(axis=0))
+
+        if self.quantile_samples <= 0:
+            if self.samples is None:
+                self.samples = rows.copy()
+            else:
+                self.samples = np.concatenate([self.samples, rows], axis=0)
+            return
+
+        if self.samples is None:
+            self.samples = np.empty((self.quantile_samples, self.dim), dtype=np.float64)
+
+        if self.sample_filled < self.quantile_samples:
+            remaining = self.quantile_samples - self.sample_filled
+            take = min(remaining, rows.shape[0])
+            if take > 0:
+                self.samples[self.sample_filled:self.sample_filled + take] = rows[:take]
+                self.sample_filled += take
+                self.sample_seen += take
+                rows = rows[take:]
+            if rows.shape[0] == 0:
+                return
+
+        assert self.samples is not None
+        positions = self.sample_seen + np.arange(1, rows.shape[0] + 1)
+        keep_prob = self.quantile_samples / positions
+        keep_mask = self.rng.random(rows.shape[0]) < keep_prob
+        kept = rows[keep_mask]
+        if kept.size:
+            target_indices = self.rng.integers(0, self.quantile_samples, size=kept.shape[0])
+            self.samples[target_indices] = kept
+        self.sample_seen += rows.shape[0]
+
+    def as_dict(self) -> dict:
+        if self.count == 0:
+            raise ValueError("No rows were accumulated")
+        mean = self.total / self.count
+        variance = np.maximum((self.total_sq / self.count) - np.square(mean), 0.0)
+        samples = self.samples
+        if samples is not None and self.quantile_samples > 0:
+            samples = samples[:self.sample_filled]
+        if samples is None or len(samples) == 0:
+            samples = np.zeros((1, self.dim), dtype=np.float64)
+        return {
+            "max": self.max.tolist(),
+            "min": self.min.tolist(),
+            "mean": mean.tolist(),
+            "std": np.sqrt(variance).tolist(),
+            "q01": np.quantile(samples, 0.01, axis=0).tolist(),
+            "q99": np.quantile(samples, 0.99, axis=0).tolist(),
+        }
+
+
+def _iter_episode_groups(df: pd.DataFrame):
+    if "episode_index" in df.columns and df["episode_index"].nunique(dropna=False) > 1:
+        for _, episode_df in df.groupby("episode_index", sort=False):
+            yield episode_df
+    else:
+        yield df
+
+
 def compute_relative_stats(
     parquet_paths: list[Path],
     modality: dict,
     relative_action_keys: list[str],
     action_horizon: int = 24,
+    quantile_samples: int = 2_000_000,
 ) -> dict:
     """Compute relative-action statistics: (action - reference_state) for each key.
 
@@ -275,49 +369,51 @@ def compute_relative_stats(
         action_meta = modality["action"][rel_key]
         state_meta = modality["state"][rel_key]
 
-        all_relative = []
+        running: _RunningArrayStats | None = None
         for pp in tqdm(parquet_paths, desc=f"Relative stats [{rel_key}]"):
-            df = pd.read_parquet(pp)
             action_col = action_meta["original_key"]
             state_col = state_meta["original_key"]
+            columns = [action_col, state_col]
+            if "episode_index" not in columns:
+                columns.append("episode_index")
+            try:
+                df = pd.read_parquet(pp, columns=columns)
+            except Exception:
+                df = pd.read_parquet(pp)
             if action_col not in df.columns or state_col not in df.columns:
                 continue
 
-            action_data = np.stack(df[action_col].values).astype(np.float64)
-            state_data = np.stack(df[state_col].values).astype(np.float64)
-            if action_data.ndim == 1:
-                action_data = action_data.reshape(-1, 1)
-            if state_data.ndim == 1:
-                state_data = state_data.reshape(-1, 1)
+            for episode_df in _iter_episode_groups(df):
+                action_data = np.stack(episode_df[action_col].values).astype(np.float64)
+                state_data = np.stack(episode_df[state_col].values).astype(np.float64)
+                if action_data.ndim == 1:
+                    action_data = action_data.reshape(-1, 1)
+                if state_data.ndim == 1:
+                    state_data = state_data.reshape(-1, 1)
 
-            a_start, a_end = action_meta["start"], action_meta["end"]
-            s_start, s_end = state_meta["start"], state_meta["end"]
+                a_start, a_end = action_meta["start"], action_meta["end"]
+                s_start, s_end = state_meta["start"], state_meta["end"]
 
-            action_slice = action_data[:, a_start:a_end]
-            state_slice = state_data[:, s_start:s_end]
+                action_slice = action_data[:, a_start:a_end]
+                state_slice = state_data[:, s_start:s_end]
+                dim = action_slice.shape[1]
+                if running is None:
+                    running = _RunningArrayStats(dim, quantile_samples=quantile_samples)
 
-            traj_len = len(df)
-            usable = traj_len - action_horizon
-            for i in range(max(usable, 0)):
-                ref_state = state_slice[i]
-                chunk_end = min(i + action_horizon, traj_len)
-                actions = action_slice[i:chunk_end]
-                relative = actions - ref_state
-                all_relative.extend(relative)
+                traj_len = len(episode_df)
+                usable = traj_len - action_horizon
+                if usable <= 0:
+                    continue
+                ref_states = state_slice[:usable]
+                for horizon_idx in range(action_horizon):
+                    relative = action_slice[horizon_idx:horizon_idx + usable] - ref_states
+                    running.update(relative)
 
-        if not all_relative:
+        if running is None or running.count == 0:
             log.warning("No relative actions computed for '%s'", rel_key)
             continue
 
-        data = np.array(all_relative)
-        stats[rel_key] = {
-            "max": np.max(data, axis=0).tolist(),
-            "min": np.min(data, axis=0).tolist(),
-            "mean": np.mean(data, axis=0).tolist(),
-            "std": np.std(data, axis=0).tolist(),
-            "q01": np.quantile(data, 0.01, axis=0).tolist(),
-            "q99": np.quantile(data, 0.99, axis=0).tolist(),
-        }
+        stats[rel_key] = running.as_dict()
 
     return stats
 
@@ -345,6 +441,20 @@ def build_tasks(parquet_paths: list[Path], task_key: str | None) -> list[dict]:
         return [{"task_index": 0, "task": ""}]
 
     return [{"task_index": idx, "task": text} for text, idx in sorted(task_set.items(), key=lambda x: x[1])]
+
+
+def build_tasks_from_v3_metadata(dataset_path: Path) -> list[dict]:
+    tasks_path = dataset_path / "meta" / "tasks.parquet"
+    if not tasks_path.exists():
+        return []
+    tasks_df = pd.read_parquet(tasks_path)
+    if "task_index" not in tasks_df.columns:
+        return []
+    tasks = []
+    for index, row in tasks_df.iterrows():
+        task_text = str(row["task"] if "task" in tasks_df.columns else index)
+        tasks.append({"task_index": int(row["task_index"]), "task": task_text})
+    return sorted(tasks, key=lambda item: int(item["task_index"]))
 
 
 def read_jsonl_records(path: Path) -> list[dict]:
@@ -395,28 +505,33 @@ def build_episodes(
     episodes = []
     for ep_idx, pp in enumerate(tqdm(parquet_paths, desc="Building episodes")):
         df = pd.read_parquet(pp)
-        length = len(df)
+        for episode_df in _iter_episode_groups(df):
+            length = len(episode_df)
+            if "episode_index" in episode_df.columns:
+                episode_index = int(episode_df["episode_index"].iloc[0])
+            else:
+                episode_index = ep_idx
 
-        ep_tasks: list[str] = []
-        if task_key and task_key in df.columns:
-            unique_tasks = df[task_key].unique()
-            for t in unique_tasks:
-                if numeric_task_key and isinstance(t, (int, float, np.integer, np.floating)):
-                    text = task_idx_to_text.get(int(t), "")
-                else:
-                    text = str(t) if not isinstance(t, str) else t
-                if text and text in task_text_to_idx:
-                    ep_tasks.append(text)
-        if not ep_tasks:
-            ep_tasks = [""]
+            ep_tasks: list[str] = []
+            if task_key and task_key in episode_df.columns:
+                unique_tasks = episode_df[task_key].unique()
+                for t in unique_tasks:
+                    if numeric_task_key and isinstance(t, (int, float, np.integer, np.floating)):
+                        text = task_idx_to_text.get(int(t), "")
+                    else:
+                        text = str(t) if not isinstance(t, str) else t
+                    if text and text in task_text_to_idx:
+                        ep_tasks.append(text)
+            if not ep_tasks:
+                ep_tasks = [""]
 
-        episodes.append({
-            "episode_index": ep_idx,
-            "tasks": ep_tasks,
-            "length": length,
-        })
+            episodes.append({
+                "episode_index": episode_index,
+                "tasks": ep_tasks,
+                "length": length,
+            })
 
-    return episodes
+    return sorted(episodes, key=lambda item: int(item["episode_index"]))
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +607,15 @@ def main():
     )
     parser.add_argument("--fps", type=float, default=None, help="Override FPS (default: use dataset FPS from info.json)")
     parser.add_argument("--action-horizon", type=int, default=24, help="Action horizon for relative stats (default: 24)")
+    parser.add_argument(
+        "--relative-quantile-samples",
+        type=int,
+        default=2_000_000,
+        help=(
+            "Maximum rows kept per relative-action key for q01/q99 estimation. "
+            "Set to 0 for exact quantiles, which can be very memory-heavy."
+        ),
+    )
     parser.add_argument("--force", action="store_true", help="Overwrite existing GEAR metadata files")
 
     args = parser.parse_args()
@@ -618,6 +742,7 @@ def main():
             rel_stats = compute_relative_stats(
                 parquet_paths, modality, args.relative_action_keys,
                 action_horizon=args.action_horizon,
+                quantile_samples=args.relative_quantile_samples,
             )
             if rel_stats:
                 with open(rel_stats_path, "w") as f:
@@ -640,6 +765,12 @@ def main():
                 "  Preserving existing natural-language tasks.jsonl because task key '%s' is numeric",
                 task_key,
             )
+        elif numeric_task_key:
+            tasks = build_tasks_from_v3_metadata(output_path)
+            if tasks:
+                log.info("  Loaded natural-language tasks from meta/tasks.parquet")
+            else:
+                tasks = build_tasks(parquet_paths, task_key)
         else:
             tasks = build_tasks(parquet_paths, task_key)
         with open(tasks_path, "w") as f:

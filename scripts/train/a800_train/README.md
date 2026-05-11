@@ -35,6 +35,55 @@ chmod +x scripts/train/a800_train/*.sh
 
 第一行用于修复 CRLF 换行，否则可能出现 `/bin/bash^M: bad interpreter`。第二行给 shell 脚本加可执行权限，否则直接执行时可能出现 `Permission denied`。
 
+## 配置公网 DNS
+
+如果容器无法解析公网域名，例如 `pypi.org`、`huggingface.co`、`swanlab.cn`，可以在容器启动后临时改 `/etc/resolv.conf`：
+
+```bash
+cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) 2>/dev/null || true
+
+cat > /etc/resolv.conf <<'EOF'
+nameserver 223.5.5.5
+nameserver 114.114.114.114
+nameserver 8.8.8.8
+options timeout:2 attempts:3 rotate
+EOF
+```
+
+检查 DNS 是否生效：
+
+```bash
+getent hosts pypi.org
+getent hosts huggingface.co
+getent hosts swanlab.cn
+```
+
+检查是否真的能访问外网：
+
+```bash
+python - <<'PY'
+import socket
+import urllib.request
+
+for host in ["pypi.org", "huggingface.co", "swanlab.cn"]:
+    print(host, socket.gethostbyname(host))
+
+for url in ["https://pypi.org/simple/pip/", "https://swanlab.cn"]:
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        print(url, resp.status)
+PY
+```
+
+如果 `getent hosts` 有输出，但 `urllib` 访问超时，说明 DNS 已经好了，问题是平台没有放开外网出口或需要 HTTP/HTTPS 代理。此时需要在任务环境里配置代理，例如：
+
+```bash
+export HTTP_PROXY=http://<proxy_host>:<proxy_port>
+export HTTPS_PROXY=http://<proxy_host>:<proxy_port>
+export NO_PROXY=localhost,127.0.0.1
+```
+
+注意：公网 DNS 只负责解析公网域名，通常不能解析 AI Station/Kubernetes 内部的 `worker-*` 主机名。多机训练的 `MASTER_ADDR` 仍然建议使用 rank0 节点 IP，或者通过平台内部 DNS/`/etc/hosts` 解决。
+
 ## 两机启动
 
 在两台机器上使用相同的 `MASTER_ADDR`、`MASTER_PORT` 和 `NNODES`，只改变 `NODE_RANK`。`MASTER_ADDR` 必须是 rank0 节点能被其它节点访问到的 IP。

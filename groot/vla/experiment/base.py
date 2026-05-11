@@ -138,6 +138,61 @@ class NVTXTrainerCallback(TrainerCallback):
         return control
 
 
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f"Ignoring invalid {name}={raw_value!r}; using {default}.")
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == "":
+        return default
+    return raw_value.lower() in {"1", "true", "yes", "on"}
+
+
+class WarmupDataLoader(DataLoader):
+    """Wait for a backlog of batches before yielding the first training batch."""
+
+    def __init__(self, *args, warmup_batches: int = 0, **kwargs):
+        self.warmup_batches = max(0, int(warmup_batches))
+        super().__init__(*args, **kwargs)
+
+    def __iter__(self):
+        iterator = super().__iter__()
+        if self.warmup_batches <= 0:
+            yield from iterator
+            return
+
+        start_time = time.perf_counter()
+        buffered_batches = []
+        for _ in range(self.warmup_batches):
+            try:
+                buffered_batches.append(next(iterator))
+            except StopIteration:
+                break
+
+        record = {
+            "buffered_batches": len(buffered_batches),
+            "requested_batches": self.warmup_batches,
+            "seconds": round(time.perf_counter() - start_time, 3),
+            "rank": os.environ.get("RANK"),
+            "local_rank": os.environ.get("LOCAL_RANK"),
+            "world_size": os.environ.get("WORLD_SIZE"),
+            "num_workers": self.num_workers,
+            "prefetch_factor": getattr(self, "prefetch_factor", None),
+        }
+        print(f"DREAMZERO_DATALOADER_WARMUP {json.dumps(record, sort_keys=True)}", flush=True)
+
+        yield from buffered_batches
+        yield from iterator
+
+
 def maybe_enable_swanlab_sync():
     """Optionally route wandb logs through SwanLab with minimal intrusion.
 
@@ -491,6 +546,16 @@ class BaseTrainer(transformers.Trainer):
             profile_context = contextlib.nullcontext()
 
         start_time = time.time()
+        barrier_steps = _env_int("DREAMZERO_TRAIN_STEP_BARRIER_STEPS", 0)
+        if (
+            _env_flag("DREAMZERO_TRAIN_STEP_BARRIER", False)
+            and self.world_size > 1
+            and self.current_step < barrier_steps
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            with nvtx_range("dreamzero.train.step_start_barrier"):
+                torch.distributed.barrier()
 
         with self.timer.with_label("training_step"), nvtx_range("dreamzero.train.training_step"), profile_context as prof:
             output = super().training_step(model, inputs)
@@ -742,6 +807,27 @@ class BaseTrainer(transformers.Trainer):
             )
             if dataloader_prefetch_factor is not None:
                 dataloader_params["prefetch_factor"] = dataloader_prefetch_factor
+
+            dataloader_in_order = os.environ.get("DREAMZERO_DATALOADER_IN_ORDER", "false")
+            dataloader_params["in_order"] = dataloader_in_order.lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        if self.args.local_rank in {-1, 0}:
+            print(f"Sharded train dataloader params: {dataloader_params}")
+
+        warmup_batches = max(0, _env_int("DREAMZERO_DATALOADER_WARMUP_BATCHES", 0))
+        if warmup_batches > 0:
+            if self.args.local_rank in {-1, 0}:
+                print(f"Sharded train dataloader warmup batches: {warmup_batches}")
+            return WarmupDataLoader(
+                train_dataset,
+                warmup_batches=warmup_batches,
+                **dataloader_params,
+            )
 
         return DataLoader(train_dataset, **dataloader_params)
 
