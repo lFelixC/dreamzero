@@ -21,8 +21,7 @@ CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
 | `run_mot_full_video_2node.sh` | MoT full-video attention | `29420` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_2node` |
 | `run_mot_full_video_decoupled_2node.sh` | MoT full-video attention + decoupled video/action noise | `29430` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_decoupled_2node` |
 | `run_joint_drop_2node.sh` | joint baseline + DROID exterior-view drop | `29440` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_a800_2node` |
-| `run_robotwin_joint_cost_group_2node.sh` | RoboTwin joint; infra knobs default off, cost-group can be enabled explicitly | `29444` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_a800_2node` |
-| `run_robotwin_joint_no_infra_2node.sh` | RoboTwin joint baseline with runtime infra knobs disabled | `29445` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_no_infra_a800_2node` |
+| `run_robotwin_joint_no_infra_2node.sh` | RoboTwin joint baseline | `29445` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_no_infra_a800_2node` |
 
 ## 首次进入容器检查
 
@@ -118,6 +117,7 @@ bash scripts/train/a800_train/run_mot_full_video_2node.sh
 ```bash
 bash scripts/train/a800_train/run_mot_full_video_decoupled_2node.sh
 bash scripts/train/a800_train/run_joint_drop_2node.sh
+bash scripts/train/a800_train/run_robotwin_joint_no_infra_2node.sh
 ```
 
 ## 常用覆盖项
@@ -144,7 +144,7 @@ OUTPUT_DIR=/2023133163/checkpoints/dreamzero/my_exp \
 bash scripts/train/a800_train/run_mot_full_video_2node.sh
 ```
 
-如果多个实验并跑，请确保每个实验使用不同的 `MASTER_PORT`。三个脚本默认端口已经错开。
+如果多个实验并跑，请确保每个实验使用不同的 `MASTER_PORT`。表中脚本默认端口已经错开。
 
 ## 实验参数
 
@@ -171,7 +171,7 @@ DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB=1.0 \
 bash scripts/train/a800_train/run_joint_drop_2node.sh
 ```
 
-三个脚本都会在 rank0 准备共享模型资产，其它节点等待资产出现。已经提前准备好模型时，可以设置：
+表中脚本都会在 rank0 准备共享模型资产，其它节点等待资产出现。已经提前准备好模型时，可以设置：
 
 ```bash
 PREPARE_ASSETS=false
