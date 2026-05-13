@@ -30,12 +30,16 @@ CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
 ```bash
 cd /2023133163/liuf/dreamzero
 
-find scripts/train/a800_train -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i 's/\r$//' {} +
+find scripts/train/a800_train -type f \( -name "*.sh" -o -name "*.py" \) -exec perl -pi -e 's/\r//g' {} +
 
 find scripts/train/a800_train -type f \( -name "*.sh" -o -name "*.py" \) -exec chmod +x {} +
+
+bash -n scripts/train/a800_train/run_robotwin_joint_no_infra_2node.sh
+
+bash -n scripts/train/a800_train/run_joint_drop_2node.sh
 ```
 
-第一行用于修复 CRLF 换行，否则可能出现 `/bin/bash^M: bad interpreter` 或 `set: pipefail` 这类异常。第二行给脚本加可执行权限，否则直接执行时可能出现 `Permission denied`。
+第一行会删除脚本里的所有 `\r` 字符，避免普通 `sed -i 's/\r$//'` 没清干净时继续出现 `/bin/bash^M: bad interpreter` 或 `set: pipefail` 这类异常。第二行给脚本加可执行权限，否则直接执行时可能出现 `Permission denied`。最后两行用于快速检查 RoboTwin 脚本语法；没有输出就说明检查通过。
 
 ## 配置公网 DNS
 

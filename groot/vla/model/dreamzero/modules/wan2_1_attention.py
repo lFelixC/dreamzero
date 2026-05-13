@@ -202,6 +202,67 @@ def flash_attention(
     return x.type(out_dtype)
 
 
+def _torch_scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    key_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.,
+    softmax_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    causal: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    out_dtype = q.dtype
+    q = q.transpose(1, 2).to(dtype)
+    k = k.transpose(1, 2).to(dtype)
+    v = v.transpose(1, 2).to(dtype)
+    if q_scale is not None:
+        q = q * q_scale
+
+    attn_mask = None
+    empty_rows = None
+    if key_mask is not None:
+        if key_mask.ndim != 2:
+            raise ValueError(f"key_mask must have shape [B, Lk], got {tuple(key_mask.shape)}")
+        if key_mask.shape != (q.shape[0], k.shape[-2]):
+            raise ValueError(
+                "key_mask shape must match attention keys: "
+                f"got {tuple(key_mask.shape)}, expected {(q.shape[0], k.shape[-2])}"
+            )
+        attn_mask = key_mask.to(device=q.device, dtype=torch.bool)[:, None, None, :]
+
+    if causal and attn_mask is not None:
+        causal_mask = torch.ones(
+            (q.shape[-2], k.shape[-2]),
+            device=q.device,
+            dtype=torch.bool,
+        ).tril()
+        attn_mask = attn_mask & causal_mask[None, None, :, :]
+
+    if attn_mask is not None:
+        empty_rows = ~attn_mask.any(dim=-1, keepdim=True)
+        if empty_rows.any():
+            first_key = torch.zeros_like(attn_mask)
+            first_key[..., :1] = True
+            attn_mask = attn_mask | (empty_rows & first_key)
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=causal and attn_mask is None,
+        dropout_p=dropout_p,
+        scale=softmax_scale,
+    )
+    if empty_rows is not None:
+        out = out.masked_fill(empty_rows, 0)
+
+    return out.transpose(1, 2).contiguous().to(out_dtype)
+
+
 class AttentionModule(torch.nn.Module):
     def __init__(
         self,
@@ -238,26 +299,44 @@ class AttentionModule(torch.nn.Module):
         self.backend = backend
 
         if backend == "torch":
-            def _torch_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-                out_dtype = q.dtype
-                q = q.transpose(1, 2).to(dtype)
-                k = k.transpose(1, 2).to(dtype)
-                v = v.transpose(1, 2).to(dtype)
-
-                out = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=None,
-                    is_causal=causal,
+            def _torch_impl(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                key_mask: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+                return _torch_scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    key_mask=key_mask,
                     dropout_p=dropout_p,
-                    scale=softmax_scale,
+                    softmax_scale=softmax_scale,
+                    q_scale=q_scale,
+                    causal=causal,
+                    dtype=dtype,
                 )
-
-                out = out.transpose(1, 2).contiguous()
-                return out.to(out_dtype)
             self.attn_func = _torch_impl
 
         elif  backend == "torch_onnx":
-            def _torch_onnx_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            def _torch_onnx_impl(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                key_mask: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+                if key_mask is not None:
+                    return _torch_scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        key_mask=key_mask,
+                        dropout_p=dropout_p,
+                        softmax_scale=softmax_scale,
+                        q_scale=q_scale,
+                        causal=causal,
+                        dtype=dtype,
+                    )
                 out_dtype = q.dtype
                 # use torch.nn.functional.scaled_dot_product_attention for tensorrt export
 
@@ -295,7 +374,24 @@ class AttentionModule(torch.nn.Module):
                 attention_dropout=dropout_p,
             )
 
-            def _te_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            def _te_impl(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                key_mask: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+                if key_mask is not None:
+                    return _torch_scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        key_mask=key_mask,
+                        dropout_p=dropout_p,
+                        softmax_scale=softmax_scale,
+                        q_scale=q_scale,
+                        causal=causal,
+                        dtype=dtype,
+                    )
                 out_dtype = q.dtype
                 return self.attn_backend(
                     query_layer=q.to(dtype),
@@ -308,7 +404,20 @@ class AttentionModule(torch.nn.Module):
             def _flash_attn_impl(
                 q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 q_lens: Optional[torch.Tensor], k_lens: Optional[torch.Tensor],
+                key_mask: Optional[torch.Tensor] = None,
             ) -> torch.Tensor:
+                if key_mask is not None:
+                    return _torch_scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        key_mask=key_mask,
+                        dropout_p=dropout_p,
+                        softmax_scale=softmax_scale,
+                        q_scale=q_scale,
+                        causal=causal,
+                        dtype=dtype,
+                    )
                 return flash_attention(
                     q=q, k=k, v=v,
                     q_lens=q_lens, k_lens=k_lens,
@@ -333,16 +442,17 @@ class AttentionModule(torch.nn.Module):
         v: torch.Tensor,
         q_lens: Optional[torch.Tensor] = None,
         k_lens: Optional[torch.Tensor] = None,
+        key_mask: Optional[torch.Tensor] = None,
     ):
         if (
             self.backend == "torch" or
             self.backend == "torch_onnx" or
             (self.backend == "TE" and TRANSFORMER_ENGINE_AVAILABLE)
         ):
-            if q_lens is not None or k_lens is not None:
+            if key_mask is None and (q_lens is not None or k_lens is not None):
                 warnings.warn(
                     'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
                 )
-            return self.attn_func(q, k, v)  # type: ignore[call-arg]
+            return self.attn_func(q, k, v, key_mask=key_mask)  # type: ignore[call-arg]
         else:
-            return self.attn_func(q, k, v, q_lens, k_lens)  # type: ignore[call-arg]
+            return self.attn_func(q, k, v, q_lens, k_lens, key_mask=key_mask)  # type: ignore[call-arg]

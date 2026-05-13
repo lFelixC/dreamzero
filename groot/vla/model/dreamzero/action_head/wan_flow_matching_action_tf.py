@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import gc
 import logging
 import math
 import time
@@ -14,7 +15,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from safetensors.torch import load_file
+from safetensors import safe_open
 import json
 from huggingface_hub import hf_hub_download
 
@@ -174,6 +175,146 @@ class WANPolicyHead(ActionHead):
     config_class = WANPolicyHeadConfig
     supports_gradient_checkpointing = True
 
+    @staticmethod
+    def _distributed_rank_info() -> tuple[int, int, int]:
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            local_rank = _env_int("LOCAL_RANK", rank)
+            return rank, local_rank, world_size
+
+        rank = _env_int("RANK", 0)
+        local_rank = _env_int("LOCAL_RANK", rank)
+        world_size = _env_int("WORLD_SIZE", 1)
+        return rank, local_rank, world_size
+
+    @classmethod
+    def _stagger_distributed_component_loading(cls) -> None:
+        rank, _, world_size = cls._distributed_rank_info()
+        if world_size <= 1:
+            return
+
+        try:
+            delay_per_rank = float(os.environ.get("WAN_COMPONENT_LOAD_STAGGER_SECONDS", "5"))
+        except ValueError:
+            delay_per_rank = 5.0
+        if delay_per_rank <= 0:
+            return
+
+        delay = rank * delay_per_rank
+        print(
+            f"[DreamZero] Staggering component load: rank={rank}/{world_size}, "
+            f"sleep={delay:.1f}s",
+            flush=True,
+        )
+        time.sleep(delay)
+
+    @staticmethod
+    def _load_torch_checkpoint_into_module(
+        module: nn.Module,
+        path: str,
+        *,
+        strict: bool = True,
+    ) -> tuple[list[str], list[str]]:
+        load_kwargs = dict(map_location="cpu")
+        try:
+            state_dict = torch.load(path, mmap=True, weights_only=True, **load_kwargs)
+        except TypeError:
+            state_dict = torch.load(path, **load_kwargs)
+        except Exception:
+            state_dict = torch.load(path, **load_kwargs)
+
+        try:
+            incompatible = module.load_state_dict(state_dict, strict=strict)
+            return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
+        finally:
+            del state_dict
+            gc.collect()
+
+    @staticmethod
+    def _copy_safetensor_tensor_into_state(
+        target_state: dict[str, torch.Tensor],
+        loaded_keys: set[str],
+        unexpected_keys: list[str],
+        error_messages: list[str],
+        key: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        target = target_state.get(key)
+        if target is None:
+            unexpected_keys.append(key)
+            return
+        if target.shape != tensor.shape:
+            error_messages.append(
+                f"size mismatch for {key}: checkpoint has {tuple(tensor.shape)}, "
+                f"model expects {tuple(target.shape)}"
+            )
+            return
+        with torch.no_grad():
+            target.copy_(tensor)
+        loaded_keys.add(key)
+
+    @classmethod
+    def _load_safetensors_into_module(
+        cls,
+        module: nn.Module,
+        dit_dir: str,
+    ) -> tuple[list[str], list[str]]:
+        safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
+        safetensors_index_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors.index.json")
+        target_state = module.state_dict()
+        loaded_keys: set[str] = set()
+        unexpected_keys: list[str] = []
+        error_messages: list[str] = []
+
+        def load_safetensors_file(path: str, keys: list[str] | None = None) -> None:
+            print(f"Streaming safetensors weights: {path}", flush=True)
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                file_keys = keys if keys is not None else list(handle.keys())
+                for key in file_keys:
+                    tensor = handle.get_tensor(key)
+                    cls._copy_safetensor_tensor_into_state(
+                        target_state,
+                        loaded_keys,
+                        unexpected_keys,
+                        error_messages,
+                        key,
+                        tensor,
+                    )
+                    del tensor
+            gc.collect()
+
+        if os.path.exists(safetensors_index_path):
+            print(f"Loading sharded safetensors using index: {safetensors_index_path}", flush=True)
+            with open(safetensors_index_path, "r") as f:
+                index = json.load(f)
+
+            shard_to_keys: dict[str, list[str]] = {}
+            for key, shard_file in index["weight_map"].items():
+                shard_to_keys.setdefault(shard_file, []).append(key)
+
+            for shard_file in sorted(shard_to_keys):
+                load_safetensors_file(
+                    os.path.join(dit_dir, shard_file),
+                    sorted(shard_to_keys[shard_file]),
+                )
+        elif os.path.exists(safetensors_path):
+            load_safetensors_file(safetensors_path)
+        else:
+            raise ValueError(f"No safetensors file found at {safetensors_path} or {safetensors_index_path}")
+
+        if error_messages:
+            raise RuntimeError("Error(s) in loading safetensors state_dict:\n\t" + "\n\t".join(error_messages))
+
+        missing_keys = [key for key in target_state.keys() if key not in loaded_keys]
+        return missing_keys, unexpected_keys
+
     def __init__(
         self,
         config: WANPolicyHeadConfig,
@@ -241,7 +382,8 @@ class WANPolicyHead(ActionHead):
         self.normalize_video = v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
 
-        self.use_gradient_checkpointing = config.use_gradient_checkpointing
+        self.use_gradient_checkpointing = self._coerce_bool(config.use_gradient_checkpointing)
+        config.use_gradient_checkpointing = self.use_gradient_checkpointing
         if self.training:
             self.scheduler.set_timesteps(1000, training=True)
 
@@ -251,6 +393,8 @@ class WANPolicyHead(ActionHead):
         self.cpu_offload = False
 
         self._validate_mot_decoupled_config(config)
+        if config.diffusion_model_cfg is not None:
+            config.diffusion_model_cfg["use_gradient_checkpointing"] = self.use_gradient_checkpointing
         self._select_diffusion_model_architecture(config)
         self.model = instantiate(config.diffusion_model_cfg)
         self.action_dim = config.action_dim
@@ -258,20 +402,23 @@ class WANPolicyHead(ActionHead):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         if not config.skip_component_loading:
+            self._stagger_distributed_component_loading()
+
             text_enc_path = ensure_file(
                 self.text_encoder.text_encoder_pretrained_path,
                 "models_t5_umt5-xxl-enc-bf16.pth",
             )
             self.text_encoder.text_encoder_pretrained_path = text_enc_path
-            self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location="cpu"))
+            self._load_torch_checkpoint_into_module(self.text_encoder, text_enc_path)
 
             img_enc_path = ensure_file(
                 self.image_encoder.image_encoder_pretrained_path,
                 "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
             )
             self.image_encoder.image_encoder_pretrained_path = img_enc_path
-            self.image_encoder.model.load_state_dict(
-                torch.load(img_enc_path, map_location="cpu"),
+            self._load_torch_checkpoint_into_module(
+                self.image_encoder.model,
+                img_enc_path,
                 strict=False,
             )
 
@@ -284,7 +431,7 @@ class WANPolicyHead(ActionHead):
                 repo_id=vae_repo_id,
             )
             self.vae.vae_pretrained_path = vae_path
-            self.vae.model.load_state_dict(torch.load(vae_path, map_location="cpu"))
+            self._load_torch_checkpoint_into_module(self.vae.model, vae_path)
 
             dit_dir = self.model.diffusion_model_pretrained_path
             # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
@@ -294,38 +441,12 @@ class WANPolicyHead(ActionHead):
                 dit_dir = os.path.dirname(index_path)
                 with open(index_path, 'r') as f:
                     index = json.load(f)
-                for shard_file in set(index["weight_map"].values()):
+                for shard_file in sorted(set(index["weight_map"].values())):
                     hf_hub_download(repo_id=dit_repo_id, filename=shard_file)
 
             if dit_dir is not None:
                 self.model.diffusion_model_pretrained_path = dit_dir
-                safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
-                safetensors_index_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors.index.json")
-                state_dict = {}
-
-                if os.path.exists(safetensors_index_path):
-                    # Handle sharded safetensors
-                    print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-
-                    with open(safetensors_index_path, 'r') as f:
-                        index = json.load(f)
-
-                    # Load each shard
-                    for shard_file in set(index["weight_map"].values()):
-                        shard_path = os.path.join(dit_dir, shard_file)
-                        print(f"Loading shard: {shard_path}")
-                        shard_state_dict = load_file(shard_path)
-                        state_dict.update(shard_state_dict)
-
-                elif os.path.exists(safetensors_path):
-                    # Handle single safetensors file
-                    print(f"Loading weights from safetensors: {safetensors_path}")
-                    state_dict = load_file(safetensors_path)
-
-                else:
-                    raise ValueError(f"No safetensors file found at {safetensors_path} or {safetensors_index_path}")
-
-                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                missing_keys, unexpected_keys = self._load_safetensors_into_module(self.model, dit_dir)
 
                 if missing_keys:
                     print(f"Missing keys when loading pretrained weights: {missing_keys}")
@@ -640,8 +761,9 @@ class WANPolicyHead(ActionHead):
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
-        for i, v in enumerate(seq_lens):
-            prompt_emb[:, v:] = 0
+        positions = torch.arange(prompt_emb.shape[1], device=prompt_emb.device)
+        valid = positions.unsqueeze(0) < seq_lens.to(prompt_emb.device).unsqueeze(1)
+        prompt_emb = prompt_emb.masked_fill(~valid.unsqueeze(-1), 0)
         return prompt_emb
 
     def _ensure_vae_on_device(self, ref_tensor):
@@ -762,6 +884,7 @@ class WANPolicyHead(ActionHead):
         has_real_action = action_input.has_real_action
         action_mask = action_input.action_mask
         video_frame_mask = getattr(action_input, "images_mask", None)
+        state_mask = getattr(action_input, "state_mask", None)
 
         state_features = action_input.state
 
@@ -911,6 +1034,24 @@ class WANPolicyHead(ActionHead):
             noisy_actions = None
             training_target_action = None
 
+        model_mask_kwargs = {}
+        if getattr(self.config, "architecture", "joint") == "mot" or getattr(self.model, "is_mot_wam", False):
+            if latent_frame_mask is not None:
+                model_mask_kwargs["video_frame_mask"] = latent_frame_mask.to(
+                    device=self._device,
+                    dtype=torch.bool,
+                )
+            if action_mask is not None:
+                model_mask_kwargs["action_token_mask"] = action_mask.to(
+                    device=self._device,
+                    dtype=torch.bool,
+                ).any(dim=2)
+            if state_mask is not None:
+                model_mask_kwargs["state_token_mask"] = state_mask.to(
+                    device=self._device,
+                    dtype=torch.bool,
+                ).any(dim=2)
+
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             if actions.numel() > 0:
@@ -919,6 +1060,7 @@ class WANPolicyHead(ActionHead):
                     state=state_features, embodiment_id=embodiment_id,
                     action=noisy_actions, timestep_action=timestep_action,
                     clean_x=latents.transpose(1, 2),
+                    **model_mask_kwargs,
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
@@ -926,6 +1068,7 @@ class WANPolicyHead(ActionHead):
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
                     clean_x=latents.transpose(1, 2),
+                    **model_mask_kwargs,
                 )
 
             self._debug_finite("video_noise_pred", video_noise_pred)

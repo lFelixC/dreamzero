@@ -1374,7 +1374,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 concat_first_frame_latent=True):
+                 concat_first_frame_latent=True,
+                 use_gradient_checkpointing=True):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1507,7 +1508,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-        self.gradient_checkpointing = True
+        if isinstance(use_gradient_checkpointing, str):
+            use_gradient_checkpointing = use_gradient_checkpointing.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.gradient_checkpointing = bool(use_gradient_checkpointing)
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
 
