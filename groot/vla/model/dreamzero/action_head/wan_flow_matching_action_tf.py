@@ -77,7 +77,7 @@ class WANPolicyHeadConfig(PretrainedConfig):
     )
     mot_action_video_ki: bool = field(
         default=False,
-        metadata={"help": "If true, action loss gradients flow through action-visible video K/V into the video expert."},
+        metadata={"help": "If true, keep video/action experts independent by detaching action-visible video K/V for action loss."},
     )
     mot_inference_video_mode: str = field(
         default="auto",

@@ -27,9 +27,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full
 # -----------------------------
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
 PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
-MAX_STEPS="${MAX_STEPS:-60000}"
+MAX_STEPS="${MAX_STEPS:-30000}"
 EVAL_STEPS="${EVAL_STEPS:-100}"
-SAVE_STEPS="${SAVE_STEPS:-5000}"
+SAVE_STEPS="${SAVE_STEPS:-2000}"
 DEEPSPEED_CFG="${DEEPSPEED_CFG:-zero2}"
 NUM_FRAMES="${NUM_FRAMES:-33}"
 ACTION_HORIZON="${ACTION_HORIZON:-24}"
@@ -42,6 +42,9 @@ DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-4}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
 MOT_ACTION_VIDEO_ATTENTION="full_video"
+# KI means keep the video/action experts independent for action loss.
+# false: action loss gradients flow through causal video K/V into the video expert.
+# true: action sees causal video K/V, but the K/V is detached for action loss.
 MOT_ACTION_VIDEO_KI="${MOT_ACTION_VIDEO_KI:-${MOT_KI:-false}}"
 MOT_INFERENCE_VIDEO_MODE="${MOT_INFERENCE_VIDEO_MODE:-auto}"
 MOT_DECOUPLE_VIDEO_ACTION_NOISE="${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"

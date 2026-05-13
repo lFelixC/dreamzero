@@ -1714,7 +1714,7 @@ class MoTCausalWanModel(CausalWanModel):
                     seq_len=seq_len,
                     clean_seq_len=clean_seq_len,
                 )
-                if not self.mot_action_video_ki:
+                if self.mot_action_video_ki:
                     video_kv = self._detach_video_kv(video_kv)
                 action_tokens_out = self._run_action_expert_block(
                     block=_action_block,
