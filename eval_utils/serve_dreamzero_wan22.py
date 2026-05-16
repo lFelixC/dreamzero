@@ -99,11 +99,19 @@ def _get_expected_video_resolution(policy: GrootSimPolicy) -> tuple[int, int]:
 
 
 def _resize_frames_to_resolution(frames: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Resize video frames to (target_h, target_w). Accepts (H,W,C) or (T,H,W,C)."""
+    """Resize video frames to (target_h, target_w).
+
+    Accepts (H,W,C), (T,H,W,C), or batched (B,T,H,W,C).
+    """
     if frames.ndim == 3:
         if (frames.shape[0], frames.shape[1]) != (target_h, target_w):
             frames = cv2.resize(frames, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         return frames
+    if frames.ndim == 5:
+        return np.stack(
+            [_resize_frames_to_resolution(sample, target_h, target_w) for sample in frames],
+            axis=0,
+        )
     out = np.stack(
         [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_LINEAR) for f in frames],
         axis=0,

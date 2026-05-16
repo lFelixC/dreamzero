@@ -75,6 +75,7 @@ git clone https://github.com/huggingface/lerobot.git
 git clone https://github.com/RoboTwin-Platform/RoboTwin.git
 
 cd /data/dreamzero_mot/third_party/lerobot
+git checkout 0e6114ac36e23038fafbbcaed89c2917aeb00fc5
 python -m pip install -e . --no-deps --ignore-requires-python
 /data/envs/robotwin310/bin/python /data/dreamzero_mot/example/robotwin/patch_lerobot_py310.py \
   --lerobot-root /data/dreamzero_mot/third_party/lerobot
@@ -139,6 +140,29 @@ For Hugging Face mirror downloads:
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
+Pinned third-party checkout:
+
+```text
+LeRobot repo: https://github.com/huggingface/lerobot.git
+LeRobot commit: 0e6114ac36e23038fafbbcaed89c2917aeb00fc5
+RoboTwin repo: https://github.com/RoboTwin-Platform/RoboTwin.git
+RoboTwin commit: 0aeea2d669c0f8516f4d5785f0aa33ba812c14b4
+Recorded: 2026-05-15
+```
+
+At the time this pin was recorded, the local LeRobot checkout also had
+uncommitted changes outside the RoboTwin env wrapper:
+
+```text
+M src/lerobot/datasets/streaming_dataset.py
+M src/lerobot/motors/motors_bus.py
+M src/lerobot/processor/pipeline.py
+M src/lerobot/utils/io_utils.py
+```
+
+If those edits are needed for a run, preserve them as a separate patch or commit
+before recreating the checkout elsewhere.
+
 ## 4. Server Only
 
 Run the DreamZero websocket server from the original uv environment:
@@ -201,43 +225,111 @@ The client maps RoboTwin cameras as:
 It sends split state keys, avoiding the packed `observation.state` fallback.
 Returned actions must have shape `(N, 14)` in `[left7, right7]` order.
 
-## 7. One-Command Full Test
+## 7. Parallel RoboTwin Eval
 
-Run one RoboTwin episode for both smoke checkpoints:
+The first parallel eval path does not use Ray and does not modify
+`third_party`. It runs a controller process, multiple RoboTwin subprocess
+workers, and one DreamZero websocket server that receives batched observations.
+
+`run_robotwin_eval.sh` is the only recommended shell entrypoint. It defaults to
+parallel eval; serial benchmark/smoke shell modes were removed to keep this
+folder focused on normal RoboTwin eval.
+
+Run one task with the 6/7 server and env workers on card 7:
 
 ```bash
 cd /data/dreamzero_mot
 
-bash example/robotwin/run_full_infer_test.sh
+SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=8 \
+EPISODES=8 SAVE_VIDEO=0 OPEN_LOOP_HORIZON=8 \
+bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Useful overrides:
+`NUM_ENVS` is the main parallelism knob. On this machine, use `4/8/16/24` for
+capacity experiments and watch GPU memory/utilization.
+
+Task selection:
 
 ```bash
-CKPT=both EPISODES=1 EPISODE_LENGTH=4 MAX_STEPS=1 OPEN_LOOP_HORIZON=4 \
-SERVER_CUDA=1 CLIENT_CUDA=2 PORT=8000 SAVE_VIDEO=0 \
-bash example/robotwin/run_full_infer_test.sh
+# Single task.
+SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=8 \
+bash example/robotwin/run_robotwin_eval.sh
 
-CKPT=joint bash example/robotwin/run_full_infer_test.sh
-CKPT=mot bash example/robotwin/run_full_infer_test.sh
-MAX_STEPS=20 SAVE_VIDEO=1 bash example/robotwin/run_full_infer_test.sh
-SERVER_CUDA=1 CLIENT_CUDA=2 PORT=8000 bash example/robotwin/run_full_infer_test.sh
+# Multiple tasks. Tasks run sequentially; each task uses same-task env parallelism.
+SERVER_GPU=6,7 CLIENT_GPU=7 TASKS=beat_block_hammer,pick_dual_bottles NUM_ENVS=4 \
+bash example/robotwin/run_robotwin_eval.sh
+
+# All RoboTwin eval tasks from third_party/RoboTwin/task_config/_eval_step_limit.yml.
+SERVER_GPU=6,7 CLIENT_GPU=7 TASKS=all NUM_ENVS=8 \
+bash example/robotwin/run_robotwin_eval.sh
+
+# Print the resolved task list without launching server/envs.
+TASKS=all LIST_TASKS=1 bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Outputs are written under:
+Dry-run the env worker path without the policy server:
 
 ```bash
-/data/checkpoints/dreamzero/robotwin_eval_runs/joint_smoke
-/data/checkpoints/dreamzero/robotwin_eval_runs/mot_smoke
+cd /data/dreamzero_mot
+
+SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=1 \
+DRY_RUN_ACTIONS=1 EPISODES=1 EPISODE_LENGTH=8 MAX_STEPS=1 \
+bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Each episode JSON records task, seed, steps, success, reward sum, action shapes,
-and checkpoint metadata.
+Run a small real smoke:
 
-Verified smoke outputs from this machine:
+```bash
+cd /data/dreamzero_mot
 
-- `joint_smoke`: `steps=4`, `action_shapes=[[4, 14]]`
-- `mot_smoke`: `steps=4`, `action_shapes=[[4, 14]]`
+SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=4 \
+EPISODES=4 SAVE_VIDEO=0 OPEN_LOOP_HORIZON=8 \
+bash example/robotwin/run_robotwin_eval.sh
+```
+
+Useful variables:
+
+```bash
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin
+OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/my_run
+SERVER_GPU=6,7
+CLIENT_GPU=7
+NUM_ENVS=8
+TASK=beat_block_hammer
+TASKS=beat_block_hammer,pick_dual_bottles
+TASKS=all
+EPISODES=8
+OPEN_LOOP_HORIZON=8
+SAVE_VIDEO=0
+PORT=8100
+```
+
+`SERVER_GPU` replaces the older `SERVER_CUDA` name. `CLIENT_GPU` replaces the
+older `ENV_CUDA`/`CLIENT_CUDA` names. The old names still work as aliases, but
+new commands should use `SERVER_GPU` and `CLIENT_GPU`.
+
+Parallel eval outputs keep the existing layout:
+
+```text
+${OUTPUT_ROOT}/beat_block_hammer/episode_000000.json
+${OUTPUT_ROOT}/beat_block_hammer/summary.json
+${OUTPUT_ROOT}/report.json
+${OUTPUT_ROOT}/report.csv
+${OUTPUT_ROOT}/logs/env_worker_0.log
+```
+
+Each episode JSON records `reset_time`, `infer_wait_time`, `env_step_time`,
+`get_obs_time`, `episode_wall_time`, and `infer_payload_size_bytes`. Task
+summaries include batch infer time, per-env infer time, episode length
+mean/std/min/max, and sync idle steps.
+
+V1 constraints:
+
+- Batch entries must share the same task and prompt.
+- The controller uses fixed-size synchronized waves. Done envs stay inactive
+  until the wave ends, preserving the server temporal cache batch shape.
+- RTC batch, Ray, pipeline overlap, per-env virtual websocket sessions, and
+  parallel video saving are intentionally out of scope.
 
 ## Troubleshooting
 

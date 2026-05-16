@@ -63,8 +63,10 @@ class Args:
 
 def _normalize_image_array(data: Any, key: str) -> np.ndarray:
     arr = np.asarray(data)
-    if arr.ndim not in (3, 4):
-        raise ValueError(f"{key} must have shape (H, W, 3) or (T, H, W, 3), got {arr.shape}")
+    if arr.ndim not in (3, 4, 5):
+        raise ValueError(
+            f"{key} must have shape (H, W, 3), (T, H, W, 3), or (B, T, H, W, 3), got {arr.shape}"
+        )
     if arr.shape[-1] != 3:
         raise ValueError(f"{key} must end with 3 color channels, got {arr.shape}")
 
@@ -84,15 +86,21 @@ def _normalize_image_array(data: Any, key: str) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def _ensure_2d_state(value: Any, key: str, width: int) -> np.ndarray:
+def _ensure_state_array(value: Any, key: str, width: int) -> np.ndarray:
     arr = np.asarray(value)
     if arr.ndim == 0:
         arr = arr.reshape(1, 1)
     elif arr.ndim == 1:
         arr = arr.reshape(1, -1)
 
-    if arr.ndim != 2 or arr.shape[1] != width:
-        raise ValueError(f"{key} must have shape ({1}, {width}) or ({width},), got {arr.shape}")
+    if arr.ndim == 2:
+        if arr.shape[1] != width:
+            raise ValueError(f"{key} must have trailing width {width}, got {arr.shape}")
+    elif arr.ndim == 3:
+        if arr.shape[-1] != width:
+            raise ValueError(f"{key} must have trailing width {width}, got {arr.shape}")
+    else:
+        raise ValueError(f"{key} must have shape ({width},), (T, {width}), or (B, T, {width}), got {arr.shape}")
     return np.ascontiguousarray(arr.astype(np.float64, copy=False))
 
 
@@ -104,6 +112,39 @@ def _normalize_prompt(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _prompt_values(value: Any, batch_size: int) -> list[str]:
+    if isinstance(value, np.ndarray):
+        raw_values = value.reshape(-1).tolist()
+    elif isinstance(value, (list, tuple)):
+        raw_values = list(value)
+    elif value is None:
+        raw_values = [""]
+    else:
+        raw_values = [value]
+
+    prompts = [str(item) for item in raw_values]
+    if batch_size <= 1:
+        return prompts[:1] if prompts else [""]
+    if len(prompts) == 1:
+        prompts = prompts * batch_size
+    if len(prompts) != batch_size:
+        raise ValueError(f"Prompt batch length {len(prompts)} does not match batch size {batch_size}")
+    unique = set(prompts)
+    if len(unique) > 1:
+        raise ValueError(f"Batch prompt must be identical in v1, got {sorted(unique)}")
+    return prompts
+
+
+def _infer_batch_info_from_converted(converted: dict[str, Any]) -> tuple[bool, int]:
+    for value in converted.values():
+        if isinstance(value, np.ndarray):
+            if value.ndim == 5 and value.shape[-1] == 3:
+                return True, int(value.shape[0])
+            if value.ndim == 3 and value.shape[-1] in (1, 6, 14):
+                return True, int(value.shape[0])
+    return False, 1
 
 
 def _extract_action_dict(action_chunk: Batch | dict) -> dict[str, Any]:
@@ -162,6 +203,50 @@ def _align_rows(arr: np.ndarray, rows: int, key: str) -> np.ndarray:
     if arr.shape[0] == 1:
         return np.repeat(arr, rows, axis=0)
     raise ValueError(f"{key} has {arr.shape[0]} rows but expected {rows}")
+
+
+def _to_numpy_action_array(value: Any, key: str, width: int) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        if width != 1:
+            raise ValueError(f"{key} expected width {width}, got scalar")
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        if width == 1:
+            arr = arr.reshape(-1, 1)
+        elif arr.shape[0] == width:
+            arr = arr.reshape(1, width)
+        else:
+            raise ValueError(f"{key} expected trailing width {width}, got {arr.shape}")
+    elif arr.ndim in (2, 3):
+        if arr.shape[-1] != width:
+            raise ValueError(f"{key} expected trailing width {width}, got {arr.shape}")
+    else:
+        raise ValueError(f"{key} expected 1D, 2D, or 3D action array, got {arr.shape}")
+    return np.ascontiguousarray(arr)
+
+
+def _broadcast_action_prefix(arr: np.ndarray, prefix: tuple[int, int], key: str) -> np.ndarray:
+    batch, horizon = prefix
+    if arr.ndim == 2:
+        if arr.shape[0] == horizon:
+            return np.repeat(arr[None, ...], batch, axis=0)
+        if arr.shape[0] == 1:
+            return np.repeat(np.repeat(arr[None, ...], batch, axis=0), horizon, axis=1)
+        raise ValueError(f"{key} has horizon {arr.shape[0]} but expected {horizon}")
+    if arr.ndim != 3:
+        raise ValueError(f"{key} expected 2D or 3D action array, got {arr.shape}")
+    out = arr
+    if out.shape[0] == 1 and batch != 1:
+        out = np.repeat(out, batch, axis=0)
+    if out.shape[1] == 1 and horizon != 1:
+        out = np.repeat(out, horizon, axis=1)
+    if out.shape[:2] != prefix:
+        raise ValueError(f"{key} has prefix {out.shape[:2]} but expected {prefix}")
+    return np.ascontiguousarray(out)
 
 
 def _reset_model_temporal_state(policy: GrootSimPolicy) -> None:
@@ -260,10 +345,10 @@ class AlohaBimanualPolicy:
 
         if all(key in obs for key in (left_joint_key, left_gripper_key, right_joint_key, right_gripper_key)):
             return {
-                left_joint_key: _ensure_2d_state(obs[left_joint_key], left_joint_key, 6),
-                left_gripper_key: _ensure_2d_state(obs[left_gripper_key], left_gripper_key, 1),
-                right_joint_key: _ensure_2d_state(obs[right_joint_key], right_joint_key, 6),
-                right_gripper_key: _ensure_2d_state(obs[right_gripper_key], right_gripper_key, 1),
+                left_joint_key: _ensure_state_array(obs[left_joint_key], left_joint_key, 6),
+                left_gripper_key: _ensure_state_array(obs[left_gripper_key], left_gripper_key, 1),
+                right_joint_key: _ensure_state_array(obs[right_joint_key], right_joint_key, 6),
+                right_gripper_key: _ensure_state_array(obs[right_gripper_key], right_gripper_key, 1),
             }
 
         if "observation.state" not in obs:
@@ -273,21 +358,50 @@ class AlohaBimanualPolicy:
             )
 
         packed = np.asarray(obs["observation.state"], dtype=np.float64)
+        if packed.ndim == 1:
+            if packed.shape != (14,):
+                raise ValueError(f"observation.state must have shape (14,), got {packed.shape}")
+            right = packed[:7]
+            left = packed[7:]
+            return {
+                left_joint_key: left[:6].reshape(1, 6),
+                left_gripper_key: left[6:7].reshape(1, 1),
+                right_joint_key: right[:6].reshape(1, 6),
+                right_gripper_key: right[6:7].reshape(1, 1),
+            }
         if packed.ndim == 2:
-            if packed.shape[0] != 1:
-                raise ValueError(f"observation.state must be 1D or single-row 2D, got {packed.shape}")
-            packed = packed[0]
-        if packed.shape != (14,):
-            raise ValueError(f"observation.state must have shape (14,), got {packed.shape}")
-
-        right = packed[:7]
-        left = packed[7:]
-        return {
-            left_joint_key: left[:6].reshape(1, 6),
-            left_gripper_key: left[6:7].reshape(1, 1),
-            right_joint_key: right[:6].reshape(1, 6),
-            right_gripper_key: right[6:7].reshape(1, 1),
-        }
+            if packed.shape[0] == 1 and packed.shape[1] == 14:
+                packed = packed[0]
+                right = packed[:7]
+                left = packed[7:]
+                return {
+                    left_joint_key: left[:6].reshape(1, 6),
+                    left_gripper_key: left[6:7].reshape(1, 1),
+                    right_joint_key: right[:6].reshape(1, 6),
+                    right_gripper_key: right[6:7].reshape(1, 1),
+                }
+            if packed.shape[1] != 14:
+                raise ValueError(f"observation.state must have trailing width 14, got {packed.shape}")
+            right = packed[:, :7]
+            left = packed[:, 7:]
+            return {
+                left_joint_key: left[:, None, :6],
+                left_gripper_key: left[:, None, 6:7],
+                right_joint_key: right[:, None, :6],
+                right_gripper_key: right[:, None, 6:7],
+            }
+        if packed.ndim == 3:
+            if packed.shape[-1] != 14:
+                raise ValueError(f"observation.state must have trailing width 14, got {packed.shape}")
+            right = packed[..., :7]
+            left = packed[..., 7:]
+            return {
+                left_joint_key: left[..., :6],
+                left_gripper_key: left[..., 6:7],
+                right_joint_key: right[..., :6],
+                right_gripper_key: right[..., 6:7],
+            }
+        raise ValueError(f"observation.state must be 1D, 2D, or 3D, got {packed.shape}")
 
     def _convert_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
         converted: dict[str, Any] = {
@@ -297,10 +411,12 @@ class AlohaBimanualPolicy:
         }
         converted.update(self._extract_state(obs))
 
-        prompt = _normalize_prompt(obs.get("prompt", obs.get("annotation.task", "")))
+        is_batched, batch_size = _infer_batch_info_from_converted(converted)
+        prompts = _prompt_values(obs.get("prompt", obs.get("annotation.task", "")), batch_size)
+        prompt = prompts[0] if prompts else ""
         if prompt:
             self._current_prompt = prompt
-        converted["annotation.task"] = prompt
+        converted["annotation.task"] = np.asarray(prompts) if is_batched else prompt
         return converted
 
     def _convert_action(self, action_dict: dict[str, Any]) -> np.ndarray:
@@ -323,39 +439,84 @@ class AlohaBimanualPolicy:
                 packed = value
 
         if left_joint is not None and right_joint is not None:
-            left_joint_arr = _to_numpy_2d(left_joint, "action.left_joint_pos", 6)
-            right_joint_arr = _to_numpy_2d(right_joint, "action.right_joint_pos", 6)
-            row_count = max(left_joint_arr.shape[0], right_joint_arr.shape[0])
-            left_joint_arr = _align_rows(left_joint_arr, row_count, "action.left_joint_pos")
-            right_joint_arr = _align_rows(right_joint_arr, row_count, "action.right_joint_pos")
+            left_joint_arr = _to_numpy_action_array(left_joint, "action.left_joint_pos", 6)
+            right_joint_arr = _to_numpy_action_array(right_joint, "action.right_joint_pos", 6)
+            is_batched = left_joint_arr.ndim == 3 or right_joint_arr.ndim == 3
+            if is_batched:
+                if left_joint_arr.ndim == 3:
+                    prefix = left_joint_arr.shape[:2]
+                else:
+                    prefix = right_joint_arr.shape[:2]
+                left_joint_arr = _broadcast_action_prefix(left_joint_arr, prefix, "action.left_joint_pos")
+                right_joint_arr = _broadcast_action_prefix(right_joint_arr, prefix, "action.right_joint_pos")
+                left_gripper_arr = (
+                    np.zeros((*prefix, 1), dtype=np.float32)
+                    if left_gripper is None
+                    else _broadcast_action_prefix(
+                        _to_numpy_action_array(left_gripper, "action.left_gripper_pos", 1),
+                        prefix,
+                        "action.left_gripper_pos",
+                    )
+                )
+                right_gripper_arr = (
+                    np.zeros((*prefix, 1), dtype=np.float32)
+                    if right_gripper is None
+                    else _broadcast_action_prefix(
+                        _to_numpy_action_array(right_gripper, "action.right_gripper_pos", 1),
+                        prefix,
+                        "action.right_gripper_pos",
+                    )
+                )
+                packed_action = np.concatenate(
+                    [
+                        np.concatenate([left_joint_arr, left_gripper_arr], axis=-1),
+                        np.concatenate([right_joint_arr, right_gripper_arr], axis=-1),
+                    ],
+                    axis=-1,
+                )
+            else:
+                row_count = max(left_joint_arr.shape[0], right_joint_arr.shape[0])
+                left_joint_arr = _align_rows(left_joint_arr, row_count, "action.left_joint_pos")
+                right_joint_arr = _align_rows(right_joint_arr, row_count, "action.right_joint_pos")
 
-            left_gripper_arr = (
-                np.zeros((row_count, 1), dtype=np.float32)
-                if left_gripper is None
-                else _align_rows(_to_numpy_2d(left_gripper, "action.left_gripper_pos", 1), row_count, "action.left_gripper_pos")
-            )
-            right_gripper_arr = (
-                np.zeros((row_count, 1), dtype=np.float32)
-                if right_gripper is None
-                else _align_rows(_to_numpy_2d(right_gripper, "action.right_gripper_pos", 1), row_count, "action.right_gripper_pos")
-            )
+                left_gripper_arr = (
+                    np.zeros((row_count, 1), dtype=np.float32)
+                    if left_gripper is None
+                    else _align_rows(
+                        _to_numpy_2d(left_gripper, "action.left_gripper_pos", 1),
+                        row_count,
+                        "action.left_gripper_pos",
+                    )
+                )
+                right_gripper_arr = (
+                    np.zeros((row_count, 1), dtype=np.float32)
+                    if right_gripper is None
+                    else _align_rows(
+                        _to_numpy_2d(right_gripper, "action.right_gripper_pos", 1),
+                        row_count,
+                        "action.right_gripper_pos",
+                    )
+                )
 
-            packed_action = np.concatenate(
-                [
-                    np.concatenate([left_joint_arr, left_gripper_arr], axis=-1),
-                    np.concatenate([right_joint_arr, right_gripper_arr], axis=-1),
-                ],
-                axis=-1,
-            )
+                packed_action = np.concatenate(
+                    [
+                        np.concatenate([left_joint_arr, left_gripper_arr], axis=-1),
+                        np.concatenate([right_joint_arr, right_gripper_arr], axis=-1),
+                    ],
+                    axis=-1,
+                )
         elif packed is not None:
-            packed_action = _to_numpy_2d(packed, "action.joint_position", 14)
+            packed_action = _to_numpy_action_array(packed, "action.joint_position", 14)
         else:
             raise KeyError(
                 f"Could not construct ALOHA bimanual action from keys: {sorted(action_dict.keys())}"
             )
 
         if self._max_chunk_size is not None and self._max_chunk_size > 0:
-            packed_action = packed_action[: self._max_chunk_size]
+            if packed_action.ndim == 3:
+                packed_action = packed_action[:, : self._max_chunk_size, :]
+            else:
+                packed_action = packed_action[: self._max_chunk_size]
 
         return np.ascontiguousarray(packed_action.astype(np.float32))
 
@@ -457,6 +618,12 @@ class AlohaBimanualPolicy:
             )
 
         converted_obs = self._convert_observation(obs)
+        is_batched_request, converted_batch_size = _infer_batch_info_from_converted(converted_obs)
+        if is_batched_request and (self._use_rtc or rtc_requested):
+            raise ValueError(
+                "Batched RoboTwin inference does not support RTC in v1; "
+                f"batch_size={converted_batch_size}, use_rtc={self._use_rtc}, rtc_requested={rtc_requested}"
+            )
         worker_obs = self._set_reset_flag(converted_obs, should_reset)
         session_state = self._get_session_state(session_id) if rtc_requested else None
         prev_chunk_left_over_abs = None

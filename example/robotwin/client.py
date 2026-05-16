@@ -43,6 +43,9 @@ for extra in (
         sys.path.insert(0, str(extra))
 
 from eval_utils.policy_client import WebsocketClientPolicy  # noqa: E402
+from example.robotwin.robotwin_fast_env import (  # noqa: E402
+    robotwin_fast_step as shared_robotwin_fast_step,
+)
 
 VIDEO_KEYS = {
     "cam_high": "observation.images.cam_high",
@@ -98,6 +101,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robotwin-task", default="beat_block_hammer", help="RoboTwin task name for --mode robotwin.")
     parser.add_argument("--episode-length", type=int, default=300, help="Max live-env steps per episode.")
     parser.add_argument("--seed-start", type=int, default=0, help="First seed/episode index for live RoboTwin runs.")
+    parser.add_argument(
+        "--reset-retries",
+        type=int,
+        default=5,
+        help="Retry live RoboTwin reset with later seeds when scene initialization is unstable.",
+    )
+    parser.add_argument(
+        "--fast-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For --mode robotwin, skip camera rendering on open-loop intermediate actions. "
+            "The final action before the next inference still renders a fresh observation."
+        ),
+    )
     parser.add_argument(
         "--clip-action",
         action=argparse.BooleanOptionalAction,
@@ -634,16 +652,95 @@ def save_rollout_video(output_dir: Path, episode_index: int, frames: list[np.nda
     return path.as_posix()
 
 
+def is_unstable_reset_error(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "UnStableError" or "Objects is unstable" in str(exc)
+
+
+def make_arm_tag(value: str) -> Any:
+    try:
+        ensure_robotwin_workdir()
+        from envs.utils import ArmTag
+
+        return ArmTag(value)
+    except Exception:
+        return value
+
+
+def initialize_robotwin_eval_state(env: gym.Env) -> None:
+    """Fill task fields that expert play_once normally creates before check_success."""
+    inner_env = getattr(env, "_env", None)
+    if inner_env is None:
+        return
+
+    task_name = str(getattr(inner_env, "task_name", getattr(env, "task_name", "")))
+    if task_name == "open_laptop" and not hasattr(inner_env, "arm_tag") and hasattr(inner_env, "laptop"):
+        try:
+            ensure_robotwin_workdir()
+            from envs.utils import ArmTag, get_face_prod
+
+            face_prod = get_face_prod(inner_env.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
+            inner_env.arm_tag = ArmTag("left" if face_prod > 0 else "right")
+        except Exception:
+            inner_env.arm_tag = make_arm_tag("left")
+
+    elif task_name == "place_object_scale" and not hasattr(inner_env, "arm_tag") and hasattr(inner_env, "object"):
+        inner_env.arm_tag = make_arm_tag("right" if inner_env.object.get_pose().p[0] > 0 else "left")
+
+    elif task_name == "put_object_cabinet" and hasattr(inner_env, "object"):
+        if not hasattr(inner_env, "arm_tag"):
+            inner_env.arm_tag = make_arm_tag("right" if inner_env.object.get_pose().p[0] > 0 else "left")
+        if not hasattr(inner_env, "origin_z"):
+            inner_env.origin_z = float(inner_env.object.get_pose().p[2])
+
+
+def reset_robotwin_env_with_retries(
+    args: argparse.Namespace,
+    episode_offset: int,
+) -> tuple[gym.Env, int, int, dict[str, Any], dict[str, Any]]:
+    retries = max(int(args.reset_retries), 0)
+    base_seed = args.seed_start + episode_offset
+    last_error: BaseException | None = None
+
+    for attempt in range(retries + 1):
+        seed = base_seed + attempt * max(int(args.episodes), 1)
+        env = make_robotwin_env(args.robotwin_task, seed, args.episode_length)
+        try:
+            obs, info = env.reset(seed=seed)
+            initialize_robotwin_eval_state(env)
+            return env, seed, attempt, obs, info
+        except Exception as exc:
+            last_error = exc
+            with contextlib.suppress(Exception):
+                env.close()
+            if not is_unstable_reset_error(exc) or attempt >= retries:
+                raise
+            warnings.warn(
+                f"RoboTwin reset for task={args.robotwin_task!r} seed={seed} was unstable; "
+                f"retrying with a later seed ({attempt + 1}/{retries}).",
+                RuntimeWarning,
+            )
+
+    assert last_error is not None
+    raise last_error
+
+
+def robotwin_fast_step(
+    env: gym.Env,
+    action: np.ndarray,
+    *,
+    need_obs: bool,
+) -> tuple[dict[str, Any] | None, float, bool, bool, dict[str, Any]]:
+    """Step RoboTwin without rendering unless the next inference needs obs."""
+    return shared_robotwin_fast_step(env, action, need_obs=need_obs)
+
+
 def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     max_steps = args.episode_length if args.max_steps is None else args.max_steps
     prompt = args.task_name or args.robotwin_task.replace("_", " ")
 
     for episode_offset in range(args.episodes):
-        seed = args.seed_start + episode_offset
-        env = make_robotwin_env(args.robotwin_task, seed, args.episode_length)
-        session_id = f"robotwin-live-{args.robotwin_task}-{seed}-{uuid.uuid4().hex[:8]}"
-        client.reset({"session_id": session_id})
+        env: gym.Env | None = None
         frames: list[np.ndarray] = []
         action_shapes: list[list[int]] = []
         first_action: list[float] | None = None
@@ -654,7 +751,9 @@ def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -
         info: dict[str, Any] = {}
 
         try:
-            obs, info = env.reset(seed=seed)
+            env, seed, reset_attempts, obs, info = reset_robotwin_env_with_retries(args, episode_offset)
+            session_id = f"robotwin-live-{args.robotwin_task}-{seed}-{uuid.uuid4().hex[:8]}"
+            client.reset({"session_id": session_id})
             for _ in range(max_steps):
                 if args.save_video:
                     head_image = obs.get("pixels", {}).get("head_camera")
@@ -671,10 +770,21 @@ def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -
                 if first_action is None and action_chunk.size:
                     first_action = action_chunk[0].tolist()
 
-                for action in action_chunk[: args.open_loop_horizon]:
+                executable_actions = action_chunk[: args.open_loop_horizon]
+                for action_index, action in enumerate(executable_actions):
                     if args.clip_action:
                         action = np.clip(action, env.action_space.low, env.action_space.high)
-                    obs, reward, terminated, truncated, info = env.step(action)
+                    need_obs = action_index == len(executable_actions) - 1
+                    if args.fast_eval:
+                        next_obs, reward, terminated, truncated, info = robotwin_fast_step(
+                            env,
+                            action,
+                            need_obs=need_obs,
+                        )
+                        if next_obs is not None:
+                            obs = next_obs
+                    else:
+                        obs, reward, terminated, truncated, info = env.step(action)
                     actions_sent += 1
                     rewards.append(float(reward))
                     success = bool(info.get("is_success", success))
@@ -684,12 +794,14 @@ def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -
                 if done:
                     break
         finally:
-            env.close()
+            if env is not None:
+                env.close()
 
         video_path = save_rollout_video(args.output_dir, episode_offset, frames, args.fps) if args.save_video else None
         result = {
             "episode_index": episode_offset,
             "seed": seed,
+            "reset_attempts": reset_attempts,
             "task": args.robotwin_task,
             "prompt": prompt,
             "steps": actions_sent,
@@ -700,6 +812,7 @@ def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -
             "first_action": first_action,
             "checkpoint": checkpoint_result(args),
             "video_path": video_path,
+            "fast_eval": bool(args.fast_eval),
             "last_info": info,
         }
         results.append(result)
