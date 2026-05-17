@@ -12,6 +12,8 @@ train_num_shards_to_sample: 64
 val_num_shards_to_sample: 6
 dataset_shard_sampling_rate: 0.1
 val_shard_sampling_rate: 0.02
+val_shard_sampling_strategy: ${dataset_shard_sampling_strategy}
+val_shard_sampling_block_size: ${dataset_shard_sampling_block_size}
 
 train_dataset:
   dataset_kwargs:
@@ -21,6 +23,8 @@ train_dataset:
     balance_dataset_weights: false
     seed: 42
     shard_sampling_rate: ${dataset_shard_sampling_rate}
+    shard_sampling_strategy: ${dataset_shard_sampling_strategy}
+    shard_sampling_block_size: ${dataset_shard_sampling_block_size}
     num_shards_to_sample: ${train_num_shards_to_sample}
 
 val_dataset:
@@ -50,4 +54,6 @@ val_dataset:
     balance_dataset_weights: false
     seed: 42
     shard_sampling_rate: ${val_shard_sampling_rate}
+    shard_sampling_strategy: ${val_shard_sampling_strategy}
+    shard_sampling_block_size: ${val_shard_sampling_block_size}
     num_shards_to_sample: ${val_num_shards_to_sample}
