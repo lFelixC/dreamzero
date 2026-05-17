@@ -151,11 +151,6 @@ def collate(
         "droid_random_drop_exterior_view_prob",
         droid_random_drop_exterior_view_prob,
     )
-    droid_drop_note = (
-        " During training, one of the two bottom exterior views may be a black screen (dropped view)."
-        if droid_random_drop_exterior_view_prob > 0.0
-        else ""
-    )
 
     for key in keys:
         if key == "text":
@@ -178,7 +173,6 @@ def collate(
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera."
-                            + droid_drop_note
                             + " The robot "
                             + processed_item.lower()
                         )
@@ -204,7 +198,6 @@ def collate(
                             "A multi-view video shows that a robot "
                             + str(item).lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera."
-                            + droid_drop_note
                             + " The robot "
                             + str(item).lower()
                         )
