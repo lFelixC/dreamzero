@@ -1,1 +1,34 @@
 *.DS_Store
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Experiment outputs
+results/
+scripts/results/
+video_*.mp4
+robot_camera_views.png
+scripts/robot_camera_views.png
+scripts/rtc_trace.jsonl
+
+# Local package artifacts
+*.whl
+
+# Local environment snapshots
+environment.yml
+droid_env_export.yml
+robot_dreamzero_full.yml
+requirements.txt
+
+# External/local checkouts
+openpi/
+
+# Local agent/tooling notes
+CLAUDE.md
