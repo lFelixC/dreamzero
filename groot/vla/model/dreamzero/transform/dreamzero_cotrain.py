@@ -22,6 +22,7 @@ from groot.vla.data.schema import (
 )
 from groot.vla.data.transform.base import InvertibleModalityTransform
 from groot.vla.model.dreamzero.transform.common import formalize_language
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 
 def basic_clean(text):
@@ -284,17 +285,18 @@ class DefaultDataCollator(DataCollatorMixin):
         )
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return collate(
-            features,
-            self.tokenizer,
-            self.num_views,
-            self.embodiment_tag_mapping,
-            num_frames=self.num_frames,
-            max_chunk_size=self.max_chunk_size,
-            num_action_per_block=self.num_action_per_block,
-            num_state_per_block=self.num_state_per_block,
-            droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
-        )
+        with nvtx_range("dreamzero.train.collate"):
+            return collate(
+                features,
+                self.tokenizer,
+                self.num_views,
+                self.embodiment_tag_mapping,
+                num_frames=self.num_frames,
+                max_chunk_size=self.max_chunk_size,
+                num_action_per_block=self.num_action_per_block,
+                num_state_per_block=self.num_state_per_block,
+                droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
+            )
 
 
 class DreamTransform(InvertibleModalityTransform):

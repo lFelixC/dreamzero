@@ -16,6 +16,7 @@
 # This file is modified from https://github.com/haotian-liu/LLaVA/
 
 from abc import ABC
+from collections.abc import Mapping
 import contextlib
 import gc
 import json
@@ -123,8 +124,51 @@ class NVTXTrainerCallback(TrainerCallback):
 
     def __init__(self):
         self._optimizer_step_active = False
+        self._optimizer_step_start = None
+
+    @staticmethod
+    def _timing_enabled() -> bool:
+        return os.environ.get("DREAMZERO_TIMING_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _sync_cuda_for_timing() -> None:
+        if os.environ.get("DREAMZERO_TIMING_SYNC_CUDA", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        } and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @classmethod
+    def _write_timing_event(cls, args, state, event: str, **fields) -> None:
+        if not cls._timing_enabled():
+            return
+        output_dir = Path(args.output_dir)
+        timing_dir = output_dir / "timing"
+        timing_dir.mkdir(parents=True, exist_ok=True)
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        entry = {
+            "event": event,
+            "time": time.time(),
+            "rank": rank,
+            "local_rank": local_rank,
+            "global_step": int(getattr(state, "global_step", -1)),
+        }
+        entry.update(fields)
+        with open(timing_dir / f"timing_rank{rank}_local{local_rank}.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if self._timing_enabled():
+            self._sync_cuda_for_timing()
+            self._optimizer_step_start = time.perf_counter()
         if not nvtx_enabled():
             return control
         torch.cuda.nvtx.range_push("dreamzero.train.optimizer_step")
@@ -135,6 +179,11 @@ class NVTXTrainerCallback(TrainerCallback):
         if self._optimizer_step_active:
             torch.cuda.nvtx.range_pop()
             self._optimizer_step_active = False
+        if self._optimizer_step_start is not None:
+            self._sync_cuda_for_timing()
+            elapsed = time.perf_counter() - self._optimizer_step_start
+            self._optimizer_step_start = None
+            self._write_timing_event(args, state, "optimizer_step", seconds=elapsed)
         return control
 
 
@@ -395,6 +444,28 @@ class BaseTrainer(transformers.Trainer):
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.node_rank = int(os.environ.get("NODE_RANK", "0"))
+        self.timing_debug = os.environ.get("DREAMZERO_TIMING_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.timing_sync_cuda = os.environ.get(
+            "DREAMZERO_TIMING_SYNC_CUDA", "1" if self.timing_debug else "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._timing_log_path = None
+        self._timing_lock = threading.Lock()
+        self._last_batch_fetch_seconds = None
+        self._last_prepare_inputs_seconds = None
+        self._last_forward_seconds = None
+        self._last_loss_logging_seconds = None
+        self._last_backward_seconds = None
+        if self.timing_debug:
+            timing_dir = Path(self.output_dir) / "timing"
+            timing_dir.mkdir(parents=True, exist_ok=True)
+            self._timing_log_path = (
+                timing_dir / f"timing_rank{self.global_rank}_local{self.local_rank}.jsonl"
+            )
 
         # Get distributed info
         self.current_step = 0
@@ -463,15 +534,120 @@ class BaseTrainer(transformers.Trainer):
             return
 
         def wrapped_backward(loss, **kwargs):
+            start = self._timing_start() if self.timing_debug else None
             with nvtx_range("dreamzero.train.backward"):
-                return original_backward(loss, **kwargs)
+                result = original_backward(loss, **kwargs)
+            if start is not None:
+                self._last_backward_seconds = self._timing_elapsed(start)
+            return result
 
         wrapped_backward._dreamzero_nvtx_wrapped = True
         self.accelerator.backward = wrapped_backward
 
+    def _timing_sync(self) -> None:
+        if self.timing_debug and self.timing_sync_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _timing_start(self) -> float:
+        self._timing_sync()
+        return time.perf_counter()
+
+    def _timing_elapsed(self, start: float) -> float:
+        self._timing_sync()
+        return time.perf_counter() - start
+
+    def _write_timing_event(self, event: str, **fields) -> None:
+        if not self.timing_debug or self._timing_log_path is None:
+            return
+        entry = {
+            "event": event,
+            "time": time.time(),
+            "rank": self.global_rank,
+            "local_rank": self.local_rank,
+            "world_size": self.world_size,
+            "global_step": int(getattr(self.state, "global_step", -1)),
+            "current_step": int(getattr(self, "current_step", -1)),
+        }
+        entry.update(fields)
+        with self._timing_lock:
+            with open(self._timing_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
     def get_batch_samples(self, epoch_iterator, num_batches, device):
+        start = time.perf_counter()
         with nvtx_range("dreamzero.train.dataloader_wait"):
-            return super().get_batch_samples(epoch_iterator, num_batches, device)
+            result = super().get_batch_samples(epoch_iterator, num_batches, device)
+        elapsed = time.perf_counter() - start
+        self._last_batch_fetch_seconds = elapsed
+        self._write_timing_event("batch_fetch", seconds=elapsed, num_batches=num_batches)
+        return result
+
+    @staticmethod
+    def _nvtx_input_path(parent: Optional[str], child: object) -> str:
+        child_path = str(child)
+        return f"{parent}.{child_path}" if parent else child_path
+
+    @staticmethod
+    def _nvtx_tensor_label(path: Optional[str], tensor: torch.Tensor) -> str:
+        name = path or "tensor"
+        shape = "x".join(str(dim) for dim in tensor.shape) or "scalar"
+        dtype = str(tensor.dtype).replace("torch.", "")
+        return f"{name}[shape={shape},dtype={dtype},src={tensor.device}]"
+
+    def _prepare_input(self, data, nvtx_path: Optional[str] = None):
+        if not nvtx_enabled() and nvtx_path is None:
+            return super()._prepare_input(data)
+
+        if isinstance(data, Mapping):
+            return type(data)(
+                {
+                    key: self._prepare_input(value, self._nvtx_input_path(nvtx_path, key))
+                    for key, value in data.items()
+                }
+            )
+        if isinstance(data, (tuple, list)):
+            return type(data)(
+                self._prepare_input(value, self._nvtx_input_path(nvtx_path, index))
+                for index, value in enumerate(data)
+            )
+        if isinstance(data, torch.Tensor):
+            target_device = torch.device(self.args.device)
+            transfer_kind = (
+                "h2d" if data.device.type == "cpu" and target_device.type == "cuda" else "to_device"
+            )
+            label = self._nvtx_tensor_label(nvtx_path, data)
+            with nvtx_range(f"dreamzero.train.{transfer_kind}.{label}->dst={target_device}"):
+                kwargs = {"device": self.args.device}
+                if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
+                    kwargs.update(
+                        {"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()}
+                    )
+                return data.to(**kwargs)
+        return data
+
+    def _prepare_inputs(self, inputs):
+        if not nvtx_enabled():
+            if not self.timing_debug:
+                return super()._prepare_inputs(inputs)
+            start = self._timing_start()
+            inputs = super()._prepare_inputs(inputs)
+            self._last_prepare_inputs_seconds = self._timing_elapsed(start)
+            return inputs
+
+        start = self._timing_start() if self.timing_debug else None
+        with nvtx_range("dreamzero.train.prepare_inputs"):
+            inputs = self._prepare_input(inputs, "batch")
+            if len(inputs) == 0:
+                raise ValueError(
+                    "The batch received was empty, your model won't be able to train on it. "
+                    f"Double-check that your training dataset contains keys expected by the model: "
+                    f"{','.join(self._signature_columns)}."
+                )
+            if self.args.past_index >= 0 and self._past is not None:
+                inputs["mems"] = self._past
+            if start is not None:
+                self._last_prepare_inputs_seconds = self._timing_elapsed(start)
+            return inputs
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -490,11 +666,38 @@ class BaseTrainer(transformers.Trainer):
         else:
             profile_context = contextlib.nullcontext()
 
-        start_time = time.time()
+        self._last_prepare_inputs_seconds = None
+        self._last_forward_seconds = None
+        self._last_loss_logging_seconds = None
+        self._last_backward_seconds = None
+        start_time = self._timing_start() if self.timing_debug else time.time()
         with self.timer.with_label("training_step"), nvtx_range("dreamzero.train.training_step"), profile_context as prof:
             output = super().training_step(model, inputs)
 
-        time_taken = time.time() - start_time
+        time_taken = (
+            self._timing_elapsed(start_time) if self.timing_debug else time.time() - start_time
+        )
+        if self.timing_debug:
+            accounted = sum(
+                value
+                for value in (
+                    self._last_prepare_inputs_seconds,
+                    self._last_forward_seconds,
+                    self._last_loss_logging_seconds,
+                    self._last_backward_seconds,
+                )
+                if value is not None
+            )
+            self._write_timing_event(
+                "training_step",
+                seconds=time_taken,
+                batch_fetch_seconds=self._last_batch_fetch_seconds,
+                prepare_inputs_seconds=self._last_prepare_inputs_seconds,
+                forward_seconds=self._last_forward_seconds,
+                loss_logging_seconds=self._last_loss_logging_seconds,
+                backward_seconds=self._last_backward_seconds,
+                unaccounted_seconds=max(time_taken - accounted, 0.0),
+            )
         # print(
         #     f"Rank {self.global_rank} time taken for training_step {self.current_step}: {time_taken:.2f} seconds"
         # )
@@ -512,9 +715,13 @@ class BaseTrainer(transformers.Trainer):
         return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        forward_start = self._timing_start() if self.timing_debug else None
         with self.timer.with_label("model_forward"), nvtx_range("dreamzero.train.model_forward"):
             outputs = model(inputs)
+            if forward_start is not None:
+                self._last_forward_seconds = self._timing_elapsed(forward_start)
 
+        loss_log_start = self._timing_start() if self.timing_debug else None
         loss_aliases = self._loss_aliases(outputs)
         metric_aliases = self._metric_aliases(outputs)
         if model.training:
@@ -547,6 +754,8 @@ class BaseTrainer(transformers.Trainer):
                     if self.current_step % self.loss_queue_size == 0:
                         avg_loss = sum(self.loss_queues[key]) / len(self.loss_queues[key])
                         self.log({f"{key}_avg": avg_loss})
+        if loss_log_start is not None:
+            self._last_loss_logging_seconds = self._timing_elapsed(loss_log_start)
 
         loss = outputs["loss"]
 
@@ -1042,6 +1251,9 @@ class BaseExperiment(ABC):
     def train(self):
         # Start training.
         self.trainer.train(resume_from_checkpoint=self.resume_from_checkpoint)
+        if os.environ.get("DREAMZERO_SKIP_FINAL_SAVE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            mprint("DREAMZERO_SKIP_FINAL_SAVE is enabled; skipping final Trainer state/model save.")
+            return
         self.trainer.save_state()
         safe_save_model_for_hf_trainer(
             trainer=self.trainer, output_dir=self.training_args.output_dir
