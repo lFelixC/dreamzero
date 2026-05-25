@@ -60,8 +60,8 @@ ROBOTWIN_CAMERA_TO_DREAMZERO = {
 }
 ROBOTWIN_CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
 ROBOTWIN_ACTION_DIM = 14
-ROBOTWIN_ACTION_LOW = -1.0
-ROBOTWIN_ACTION_HIGH = 1.0
+ROBOTWIN_ACTION_LOW = -np.inf
+ROBOTWIN_ACTION_HIGH = np.inf
 ROBOTWIN_CAMERA_H = 240
 ROBOTWIN_CAMERA_W = 320
 
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clip-action",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Clip server actions to the live environment action space before stepping.",
     )
     parser.add_argument("--save-video", action="store_true", help="Save an RGB rollout video for live RoboTwin runs.")

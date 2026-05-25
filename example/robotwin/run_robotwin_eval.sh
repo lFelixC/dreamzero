@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified RoboTwin parallel eval launcher.
+# Unified RoboTwin LingBot-style serial eval launcher.
 #
 # Recommended:
-#   SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=8 \
+#   SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer \
 #     bash example/robotwin/run_robotwin_eval.sh
 #
 # Task selection:
@@ -23,7 +23,7 @@ cd "${REPO_ROOT}"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer NUM_ENVS=8 \
+  SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer \
     bash example/robotwin/run_robotwin_eval.sh
 
 Task selection:
@@ -34,10 +34,11 @@ Task selection:
 
 GPU selection:
   SERVER_GPU=6,7  DreamZero websocket server GPUs. SERVER_NPROC defaults to GPU count.
-  CLIENT_GPU=7    RoboTwin env worker GPUs. Multiple workers share/round-robin this list.
+  CLIENT_GPU=7    RoboTwin env worker GPU.
 
 Common knobs:
-  NUM_ENVS=8 EPISODES=8 SAVE_VIDEO=0 OPEN_LOOP_HORIZON=8 PORT=8100
+  EPISODES=8 SAVE_VIDEO=0 PORT=8100
+  EXPERT_FILTER_MAX_CANDIDATES=1000
 
 Legacy aliases still accepted:
   SERVER_CUDA -> SERVER_GPU
@@ -46,7 +47,7 @@ EOF
 }
 
 if (($# > 0)); then
-  echo "Positional MODE arguments are no longer supported; this launcher always runs parallel eval." >&2
+  echo "Positional MODE arguments are no longer supported; this launcher always runs LingBot-style eval." >&2
   usage
   exit 2
 fi
@@ -276,10 +277,10 @@ if [[ "${LIST_TASKS:-0}" == "1" ]]; then
   exit 0
 fi
 
-if [[ -z "${NUM_ENVS+x}" || -z "${NUM_ENVS}" ]]; then
-  NUM_ENVS="8"
-  echo "[eval] NUM_ENVS not set; using default NUM_ENVS=${NUM_ENVS}"
+if [[ -n "${NUM_ENVS:-}" && "${NUM_ENVS}" != "1" ]]; then
+  echo "[eval] LingBot-style eval uses one env/session; ignoring NUM_ENVS=${NUM_ENVS} and using NUM_ENVS=1"
 fi
+NUM_ENVS="1"
 
 SERVER_GPU_VALUE="${SERVER_GPU:-${SERVER_CUDA:-}}"
 CLIENT_GPU_VALUE="${CLIENT_GPU:-${ENV_GPU:-${ENV_CUDA:-${CLIENT_CUDA:-}}}}"
@@ -291,14 +292,18 @@ if [[ -z "${SERVER_GPU_VALUE}" || -z "${CLIENT_GPU_VALUE}" ]]; then
 fi
 
 CKPT_RESOLVED="$(resolve_ckpt "${CKPT:-/data/checkpoints/dreamzero/dreamzero_robotwin}")"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/parallel_eval}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/lingbot_style_eval}"
 EPISODES="${EPISODES:-8}"
-OPEN_LOOP_HORIZON="${OPEN_LOOP_HORIZON:-8}"
+SEED_START="${SEED_START:-0}"
+OPEN_LOOP_HORIZON="${OPEN_LOOP_HORIZON:-24}"
 MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-24}"
 EPISODE_LENGTH="${EPISODE_LENGTH:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
 RESET_RETRIES="${RESET_RETRIES:-5}"
+EXPERT_FILTER="${EXPERT_FILTER:-1}"
+EXPERT_FILTER_MAX_CANDIDATES="${EXPERT_FILTER_MAX_CANDIDATES:-1000}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
+VIDEO_FPS="${VIDEO_FPS:-10}"
 DRY_RUN_ACTIONS="${DRY_RUN_ACTIONS:-0}"
 PROFILE="${PROFILE:-0}"
 CLIENT_IMAGE_RESOLUTION="${CLIENT_IMAGE_RESOLUTION:-none}"
@@ -310,10 +315,6 @@ MASTER_PORT="${MASTER_PORT:-29610}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 
-if [[ "${SAVE_VIDEO}" != "0" ]]; then
-  echo "Parallel eval requires SAVE_VIDEO=0" >&2
-  exit 1
-fi
 if [[ "${SERVER_NPROC}" -le 0 ]]; then
   echo "SERVER_GPU must contain at least one GPU index" >&2
   exit 1
@@ -361,6 +362,7 @@ start_server() {
       --host "${SERVER_HOST}" \
       --port "${PORT}" \
       --max-chunk-size "${MAX_CHUNK_SIZE}" \
+      --output-root "${OUTPUT_ROOT}/server_outputs" \
       > "${server_log}" 2>&1 &
   SERVER_PID="$!"
   if ! wait_for_port "${HOST}" "${PORT}" "${SERVER_TIMEOUT}" "${SERVER_PID}"; then
@@ -375,14 +377,21 @@ start_server() {
 run_controller() {
   local dry_args=()
   local profile_args=()
+  local video_args=()
   if [[ "${DRY_RUN_ACTIONS}" == "1" ]]; then
     dry_args=(--dry-run-actions)
   fi
   if [[ "${PROFILE}" == "1" ]]; then
     profile_args=(--profile)
   fi
+  if [[ "${SAVE_VIDEO}" != "0" ]]; then
+    video_args=(--save-video --video-fps "${VIDEO_FPS}")
+  fi
+  if [[ "${EXPERT_FILTER}" == "0" ]]; then
+    echo "[controller] EXPERT_FILTER=0 ignored; LingBot-style eval always filters expert-success seeds"
+  fi
 
-  echo "[controller] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} client_gpu=${CLIENT_GPU_VALUE}"
+  echo "[controller] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} client_gpu=${CLIENT_GPU_VALUE} expert_filter=${EXPERT_FILTER}"
   CONTROLLER_STARTED_AT="$(now_seconds)"
   PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/lerobot/src:/data/openpi/packages/openpi-client/src:${PYTHONPATH:-}" \
     "${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
@@ -396,12 +405,15 @@ run_controller() {
       --output-dir "${OUTPUT_ROOT}" \
       --episode-length "${EPISODE_LENGTH}" \
       --max-steps "${MAX_STEPS}" \
+      --seed-start "${SEED_START}" \
       --open-loop-horizon "${OPEN_LOOP_HORIZON}" \
       --reset-retries "${RESET_RETRIES}" \
-      --checkpoint-label "dreamzero_robotwin_parallel_eval" \
+      --expert-filter-max-candidates "${EXPERT_FILTER_MAX_CANDIDATES}" \
+      --checkpoint-label "dreamzero_robotwin_lingbot_style_eval" \
       --checkpoint-path "${CKPT_RESOLVED}" \
       --client-image-resolution "${CLIENT_IMAGE_RESOLUTION}" \
       "${profile_args[@]}" \
+      "${video_args[@]}" \
       "${dry_args[@]}"
   CONTROLLER_FINISHED_AT="$(now_seconds)"
   write_timings "${OUTPUT_ROOT}" "${RUN_STARTED_AT}" "${SERVER_READY_AT:-0}" "${CONTROLLER_STARTED_AT}" "${CONTROLLER_FINISHED_AT}"
@@ -410,8 +422,8 @@ run_controller() {
 echo "[eval] ckpt=${CKPT_RESOLVED}"
 echo "[eval] output_root=${OUTPUT_ROOT}"
 echo "[eval] server_gpu=${SERVER_GPU_VALUE} server_nproc=${SERVER_NPROC} client_gpu=${CLIENT_GPU_VALUE} port=${PORT}"
-echo "[eval] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} open_loop_horizon=${OPEN_LOOP_HORIZON}"
-echo "[eval] profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION}"
+echo "[eval] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} seed_start=${SEED_START} open_loop_horizon=${OPEN_LOOP_HORIZON} expert_filter=${EXPERT_FILTER}"
+echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION}"
 
 if [[ "${DRY_RUN_ACTIONS}" == "1" ]]; then
   echo "[server] DRY_RUN_ACTIONS=1, skipping websocket server"

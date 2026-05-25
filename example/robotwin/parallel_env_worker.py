@@ -81,8 +81,14 @@ def main() -> None:
                     seed_start=int(cmd.get("seed_start", 0)),
                     episodes=int(cmd.get("episodes", 1)),
                     reset_retries=int(cmd.get("reset_retries", 0)),
+                    expert_filter=bool(cmd.get("expert_filter", True)),
+                    expert_filter_max_candidates=int(cmd.get("expert_filter_max_candidates", 1000)),
                 )
-                result = runner.reset(int(cmd["episode_index"]))
+                result = runner.reset(
+                    int(cmd["episode_index"]),
+                    video_path=cmd.get("video_path") or None,
+                    video_fps=float(cmd.get("video_fps", 10.0)),
+                )
                 conn.send(ok(type="reset", worker_id=args.worker_id, **result))
                 continue
 
@@ -93,8 +99,16 @@ def main() -> None:
                     cmd["actions"],
                     need_obs=bool(cmd.get("need_obs", True)),
                     clip_action=bool(cmd.get("clip_action", True)),
+                    max_keyframes=int(cmd.get("max_keyframes", 9)),
                 )
                 conn.send(ok(type="step_chunk", worker_id=args.worker_id, **result))
+                continue
+
+            if name == "finish_episode":
+                if runner is None:
+                    raise RuntimeError("finish_episode received before reset")
+                result = runner.finish_episode()
+                conn.send(ok(type="finish_episode", worker_id=args.worker_id, **result))
                 continue
 
             if name == "ping":
