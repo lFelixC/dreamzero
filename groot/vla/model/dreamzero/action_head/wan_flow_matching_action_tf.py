@@ -345,6 +345,9 @@ class WANPolicyHead(ActionHead):
         self.crossattn_cache_neg: KVCacheType | None = None
 
         self.global_step = 0
+        # Saved-video metadata: reset/cache-only calls can return leading
+        # conditioning latents that should not be decoded as predictions.
+        self.last_video_pred_condition_latent_frames = 0
         self.max_steps = 0
         self.lora_rank = config.lora_rank
         self.lora_alpha = config.lora_alpha
@@ -2150,6 +2153,7 @@ class WANPolicyHead(ActionHead):
         rtc_total_steps = len(sample_scheduler.timesteps)
         rtc_guidance_max_steps = max(int(rtc_guidance_max_steps), 0)
         rtc_guidance_step_stride = max(int(rtc_guidance_step_stride), 1)
+        condition_latent_frames = 0
         if inference_video_mode == "cache_only":
             for index, action_timestep in enumerate(sample_scheduler_action.timesteps):
                 start_diffusion_events[index].record()
@@ -2178,6 +2182,7 @@ class WANPolicyHead(ActionHead):
                     return_dict=False,
                 )[0]
             output = image
+            condition_latent_frames = image.shape[1]
         elif inference_video_mode == "decoupled_denoise":
             video_final_noise = self._rescale_video_scheduler_final_noise(sample_scheduler)
             video_refresh_steps = int(getattr(self.config, "mot_decoupled_inference_video_refresh_steps", 8))
@@ -2269,6 +2274,7 @@ class WANPolicyHead(ActionHead):
             output = noisy_input
             if self.current_start_frame == 1:
                 output = torch.cat([image, output], dim=1)
+                condition_latent_frames = image.shape[1]
             if self.ip_rank == 0:
                 print(
                     "[MoT] decoupled_denoise compute: "
@@ -2355,6 +2361,8 @@ class WANPolicyHead(ActionHead):
             output = noisy_input
             if self.current_start_frame == 1:
                 output = torch.cat([image, output], dim=1)
+                condition_latent_frames = image.shape[1]
+        self.last_video_pred_condition_latent_frames = condition_latent_frames
         self.current_start_frame += self.num_frame_per_block
 
         latents_action = noisy_input_action

@@ -634,8 +634,11 @@ class ARDroidRoboarenaPolicy:
             with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_barrier.post_forward"):
                 dist.barrier()
 
-            # Store video predictions for potential saving
-            self.video_across_time.append(video_pred)
+            # Store video predictions for potential saving.
+            if video_pred is not None:
+                video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+                if video_pred_to_save is not None:
+                    self.video_across_time.append(video_pred_to_save)
 
             # Extract and convert action
             with nvtx_range(f"dreamzero.ar.infer[{phase}].action_postprocess"):
@@ -677,6 +680,34 @@ class ARDroidRoboarenaPolicy:
         
         return action
     
+    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        condition_latent_frames = int(
+            getattr(
+                self._policy.trained_model.action_head,
+                "last_video_pred_condition_latent_frames",
+                0,
+            )
+            or 0
+        )
+        if condition_latent_frames <= 0:
+            return video_pred
+        if video_pred.ndim < 3:
+            logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
+            return video_pred
+        if video_pred.shape[2] <= condition_latent_frames:
+            logger.warning(
+                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
+                condition_latent_frames,
+                tuple(video_pred.shape),
+            )
+            return None
+        logger.info(
+            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            condition_latent_frames,
+            tuple(video_pred.shape),
+        )
+        return video_pred[:, :, condition_latent_frames:]
+
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
         
@@ -839,6 +870,34 @@ class WebsocketPolicyServer:
                 logger.warning(f"Failed to save obs key '{key}': {e}")
                 continue
 
+    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        condition_latent_frames = int(
+            getattr(
+                self._policy.trained_model.action_head,
+                "last_video_pred_condition_latent_frames",
+                0,
+            )
+            or 0
+        )
+        if condition_latent_frames <= 0:
+            return video_pred
+        if video_pred.ndim < 3:
+            logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
+            return video_pred
+        if video_pred.shape[2] <= condition_latent_frames:
+            logger.warning(
+                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
+                condition_latent_frames,
+                tuple(video_pred.shape),
+            )
+            return None
+        logger.info(
+            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            condition_latent_frames,
+            tuple(video_pred.shape),
+        )
+        return video_pred[:, :, condition_latent_frames:]
+
 
 
     def serve_forever(self, rank: int = 0) -> None:
@@ -985,11 +1044,16 @@ class WebsocketPolicyServer:
                     print(f"Forward Time: {time.perf_counter() - forward_start_time:.2f} seconds")
 
                     action_chunk_dict = result_batch.act
-                    video_chunk = video_pred
+                    video_chunk = (
+                        self._drop_condition_latents_from_video_pred(video_pred)
+                        if video_pred is not None
+                        else None
+                    )
 
                     print(f"Inference Time: {time.perf_counter() - infer_start_time:.2f} seconds")
 
-                    self.video_across_time.append(video_chunk)
+                    if video_chunk is not None:
+                        self.video_across_time.append(video_chunk)
 
                     if len(self.video_across_time) > 10:
                         frame_list = []
@@ -1051,7 +1115,7 @@ class WebsocketPolicyServer:
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")
-                        self.video_across_time = [video_chunk]
+                        self.video_across_time = [video_chunk] if video_chunk is not None else []
 
                     
                     def batch_to_dict(batch):
@@ -1177,7 +1241,8 @@ def _patch_eval_transform_input_resolution(
         transform.original_resolutions = {
             key: expected_resolution for key in original_resolutions
         }
-        if transform.__class__.__name__ != "VideoCrop":
+        transform_name = transform.__class__.__name__
+        if transform_name not in {"VideoCrop", "VideoResize"}:
             continue
 
         old_size = (getattr(transform, "height", None), getattr(transform, "width", None))
@@ -1205,7 +1270,8 @@ def _patch_eval_transform_input_resolution(
             transform.eval_transform = get_transform(mode="eval")
 
         logger.info(
-            "Patched VideoCrop input resolution from %s to %s and rebuilt cached transforms",
+            "Patched %s input resolution from %s to %s and rebuilt cached transforms",
+            transform_name,
             old_size,
             (image_height, image_width),
         )
@@ -1218,15 +1284,31 @@ def _override_max_chunk_size(policy: GrootSimPolicy, max_chunk_size: int) -> Non
         return
 
     num_frame_per_block = int(getattr(model, "num_frame_per_block", 1))
-    model.local_attn_size = (
+    frame_seqlen = int(getattr(model, "frame_seqlen", 1))
+    new_local_attn_size = (
         int(max_chunk_size) * num_frame_per_block + 1
         if int(max_chunk_size) != -1
         else -1
     )
+    model.local_attn_size = new_local_attn_size
+
+    blocks = getattr(model, "blocks", [])
+    for block in blocks:
+        block.local_attn_size = new_local_attn_size
+        self_attn = getattr(block, "self_attn", None)
+        if self_attn is None:
+            continue
+        self_attn.local_attn_size = new_local_attn_size
+        self_attn.max_attention_size = (
+            21 * frame_seqlen if new_local_attn_size == -1
+            else new_local_attn_size * frame_seqlen
+        )
+
     logger.info(
-        "Overrode inference max_chunk_size=%s -> local_attn_size=%s",
+        "Overrode inference max_chunk_size=%s -> local_attn_size=%s (synced to %d blocks)",
         max_chunk_size,
-        model.local_attn_size,
+        new_local_attn_size,
+        len(blocks),
     )
 
 

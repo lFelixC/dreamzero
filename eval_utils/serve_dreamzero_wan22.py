@@ -289,7 +289,9 @@ class DreamZeroWan225BPolicy(BasePolicy):
                     result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
             if self._save_video_pred and video_pred is not None:
                 with nvtx_range(f"dreamzero.simple.infer[{phase}].video_pred_buffer"):
-                    self._video_pred_latents.append(video_pred.detach())
+                    video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+                    if video_pred_to_save is not None:
+                        self._video_pred_latents.append(video_pred_to_save.detach())
             with nvtx_range(f"dreamzero.simple.infer[{phase}].action_postprocess"):
                 action_dict = {}
                 action_chunk_dict = result_batch.act
@@ -300,6 +302,34 @@ class DreamZeroWan225BPolicy(BasePolicy):
         if self._is_first_call:
             self._is_first_call = False
         return action
+
+    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        condition_latent_frames = int(
+            getattr(
+                self._policy.trained_model.action_head,
+                "last_video_pred_condition_latent_frames",
+                0,
+            )
+            or 0
+        )
+        if condition_latent_frames <= 0:
+            return video_pred
+        if video_pred.ndim < 3:
+            logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
+            return video_pred
+        if video_pred.shape[2] <= condition_latent_frames:
+            logger.warning(
+                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
+                condition_latent_frames,
+                tuple(video_pred.shape),
+            )
+            return None
+        logger.info(
+            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            condition_latent_frames,
+            tuple(video_pred.shape),
+        )
+        return video_pred[:, :, condition_latent_frames:]
 
     def _save_predicted_video(self) -> None:
         """Decode accumulated video prediction latents through the VAE and save as mp4."""
