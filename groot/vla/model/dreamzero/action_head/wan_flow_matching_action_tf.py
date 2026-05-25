@@ -779,10 +779,12 @@ class WANPolicyHead(ActionHead):
             latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
-    def encode_image(self, image, num_frames, height, width):
+    def encode_image(self, image, num_frames, height, width, encode_first_frame_latent=True):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
             clip_context = self.image_encoder.encode_image(image)
+            if not encode_first_frame_latent:
+                return clip_context, None, None
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
             self._ensure_vae_on_device(image_input)
@@ -942,11 +944,22 @@ class WANPolicyHead(ActionHead):
         _, _, num_frames, height, width = videos.shape
         image = videos[:, :, :1].transpose(1, 2)
 
-        clip_feas, ys, _ = self.encode_image(image, num_frames, height, width)
+        needs_first_frame_latent = (
+            getattr(self.model, "model_type", None) == "i2v"
+            or bool(getattr(self.model, "concat_first_frame_latent", False))
+        )
+        clip_feas, ys, _ = self.encode_image(
+            image,
+            num_frames,
+            height,
+            width,
+            encode_first_frame_latent=needs_first_frame_latent,
+        )
 
         latents = latents.to(self._device)
         clip_feas = clip_feas.to(self._device)
-        ys = ys.to(self._device)
+        if ys is not None:
+            ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
 
         # Loss
