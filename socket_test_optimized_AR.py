@@ -237,6 +237,7 @@ class ARDroidRoboarenaPolicy:
         
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
+        self._reset_next_infer = False
         self._current_prompt: str | None = None
         self._warned_single_external_fallback = False
         self._rtc_session_states: dict[str, RTCSessionState] = {}
@@ -284,6 +285,8 @@ class ARDroidRoboarenaPolicy:
             self._frame_buffers[droid_key].extend(list(data))
         else:
             self._frame_buffers[droid_key].append(data)
+        if len(self._frame_buffers[droid_key]) > self.FRAMES_PER_CHUNK:
+            del self._frame_buffers[droid_key][:-self.FRAMES_PER_CHUNK]
 
     @staticmethod
     def _extract_action_dict(action_chunk: Batch | dict) -> dict[str, np.ndarray | torch.Tensor]:
@@ -537,15 +540,22 @@ class ARDroidRoboarenaPolicy:
         """
         # Check for session change - reset state if new session
         session_id = obs.get("session_id", None)
-        should_reset = session_id is not None and session_id != self._current_session_id
+        session_changed = session_id is not None and session_id != self._current_session_id
+        should_reset = self._reset_next_infer or session_changed
         if should_reset:
-            if self._current_session_id is not None:
+            if self._reset_next_infer:
+                logger.info("Applying deferred reset before next inference")
+                with nvtx_range("dreamzero.ar.reset.on_deferred_reset"):
+                    self._reset_state(save_video=False)
+                self._reset_next_infer = False
+            elif self._current_session_id is not None:
                 logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
                 # Reset state for new session
                 with nvtx_range("dreamzero.ar.reset.on_session_change"):
                     self._reset_state()
             else:
                 logger.info(f"New session started: '{session_id}'")
+        if session_id is not None:
             self._current_session_id = session_id
 
         rtc_step_idx = extract_optional_int(obs.get("rtc_step_idx", None))
@@ -725,6 +735,9 @@ class ARDroidRoboarenaPolicy:
         Clears frame buffers and resets call count.
         """
         self._reset_state(save_video=True)
+        self._reset_next_infer = True
+        self._current_session_id = None
+        logger.info("policy reset requested with keys=%s", sorted(reset_info.keys()))
 
 
 class WebsocketPolicyServer:

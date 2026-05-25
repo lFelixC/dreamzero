@@ -289,6 +289,12 @@ def init_mesh(master_port: int | None = None) -> DeviceMesh:
 
 
 class AlohaBimanualPolicy:
+    # Wan2.2 VAE38 maps 9 raw frames to 3 latent frames. After the first
+    # conditioning latent, this gives num_frame_per_block=2 causal latents.
+    RAW_FRAMES_PER_BLOCK = 8
+    FRAMES_PER_CHUNK = RAW_FRAMES_PER_BLOCK + 1
+    VIDEO_KEYS = ("video.cam_high", "video.cam_left", "video.cam_right")
+
     def __init__(
         self,
         groot_policy: GrootSimPolicy,
@@ -321,6 +327,9 @@ class AlohaBimanualPolicy:
         self._video_pred_latents: list[torch.Tensor] = []
         self._current_prompt = ""
         self._rtc_session_states: dict[str, RTCSessionState] = {}
+        self._frame_buffers: dict[str, list[np.ndarray]] = {key: [] for key in self.VIDEO_KEYS}
+        self._frame_buffer_batch_size: int | None = None
+        self._is_first_call = True
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
@@ -336,6 +345,64 @@ class AlohaBimanualPolicy:
         arr = _normalize_image_array(data, model_key if model_key in obs else raw_key)
         arr = _resize_frames_to_resolution(arr, self._image_height, self._image_width)
         return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _video_batch_size(video: np.ndarray) -> int | None:
+        return int(video.shape[0]) if video.ndim == 5 else None
+
+    def _clear_frame_buffers(self) -> None:
+        for key in self._frame_buffers:
+            self._frame_buffers[key].clear()
+        self._frame_buffer_batch_size = None
+
+    def _append_video_to_buffer(self, key: str, video: np.ndarray) -> None:
+        batch_size = self._video_batch_size(video)
+        if self._frame_buffer_batch_size != batch_size:
+            self._clear_frame_buffers()
+            self._frame_buffer_batch_size = batch_size
+
+        if video.ndim == 3:
+            self._frame_buffers[key].append(video)
+        elif video.ndim == 4:
+            self._frame_buffers[key].extend(list(video))
+        elif video.ndim == 5:
+            self._frame_buffers[key].extend([video[:, t] for t in range(video.shape[1])])
+        else:
+            raise ValueError(f"{key} expected 3D, 4D, or 5D video after normalization, got {video.shape}")
+
+        if len(self._frame_buffers[key]) > self.FRAMES_PER_CHUNK:
+            del self._frame_buffers[key][:-self.FRAMES_PER_CHUNK]
+
+    def _window_from_buffer(self, key: str, num_frames: int) -> np.ndarray:
+        buffer = self._frame_buffers[key]
+        if not buffer:
+            raise ValueError(f"No frames buffered for {key}")
+
+        if len(buffer) >= num_frames:
+            frames = buffer[-num_frames:]
+        else:
+            frames = list(buffer)
+            while len(frames) < num_frames:
+                frames.insert(0, buffer[0])
+
+        if self._frame_buffer_batch_size is None:
+            return np.ascontiguousarray(np.stack(frames, axis=0))
+        return np.ascontiguousarray(np.stack(frames, axis=1))
+
+    def _should_start_new_sequence(self, prompt: str) -> bool:
+        if self._is_first_call:
+            return True
+        if self._current_prompt and prompt != self._current_prompt:
+            return True
+
+        action_head = getattr(getattr(self._policy, "trained_model", None), "action_head", None)
+        if action_head is None:
+            return False
+
+        current_start_frame = getattr(action_head, "current_start_frame", 0)
+        model = getattr(action_head, "model", None)
+        local_attn_size = getattr(model, "local_attn_size", -1)
+        return local_attn_size != -1 and current_start_frame >= local_attn_size
 
     def _extract_state(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
         left_joint_key = "state.left_joint_pos"
@@ -361,8 +428,8 @@ class AlohaBimanualPolicy:
         if packed.ndim == 1:
             if packed.shape != (14,):
                 raise ValueError(f"observation.state must have shape (14,), got {packed.shape}")
-            right = packed[:7]
-            left = packed[7:]
+            left = packed[:7]
+            right = packed[7:]
             return {
                 left_joint_key: left[:6].reshape(1, 6),
                 left_gripper_key: left[6:7].reshape(1, 1),
@@ -372,8 +439,8 @@ class AlohaBimanualPolicy:
         if packed.ndim == 2:
             if packed.shape[0] == 1 and packed.shape[1] == 14:
                 packed = packed[0]
-                right = packed[:7]
-                left = packed[7:]
+                left = packed[:7]
+                right = packed[7:]
                 return {
                     left_joint_key: left[:6].reshape(1, 6),
                     left_gripper_key: left[6:7].reshape(1, 1),
@@ -382,8 +449,8 @@ class AlohaBimanualPolicy:
                 }
             if packed.shape[1] != 14:
                 raise ValueError(f"observation.state must have trailing width 14, got {packed.shape}")
-            right = packed[:, :7]
-            left = packed[:, 7:]
+            left = packed[:, :7]
+            right = packed[:, 7:]
             return {
                 left_joint_key: left[:, None, :6],
                 left_gripper_key: left[:, None, 6:7],
@@ -393,8 +460,8 @@ class AlohaBimanualPolicy:
         if packed.ndim == 3:
             if packed.shape[-1] != 14:
                 raise ValueError(f"observation.state must have trailing width 14, got {packed.shape}")
-            right = packed[..., :7]
-            left = packed[..., 7:]
+            left = packed[..., :7]
+            right = packed[..., 7:]
             return {
                 left_joint_key: left[..., :6],
                 left_gripper_key: left[..., 6:7],
@@ -404,19 +471,30 @@ class AlohaBimanualPolicy:
         raise ValueError(f"observation.state must be 1D, 2D, or 3D, got {packed.shape}")
 
     def _convert_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
-        converted: dict[str, Any] = {
+        videos: dict[str, np.ndarray] = {
             "video.cam_high": self._extract_video(obs, "video.cam_high", "observation.images.cam_high"),
             "video.cam_left": self._extract_video(obs, "video.cam_left", "observation.images.cam_left"),
             "video.cam_right": self._extract_video(obs, "video.cam_right", "observation.images.cam_right"),
         }
-        converted.update(self._extract_state(obs))
 
-        is_batched, batch_size = _infer_batch_info_from_converted(converted)
+        for key, video in videos.items():
+            self._append_video_to_buffer(key, video)
+
+        is_batched, batch_size = _infer_batch_info_from_converted(videos)
         prompts = _prompt_values(obs.get("prompt", obs.get("annotation.task", "")), batch_size)
         prompt = prompts[0] if prompts else ""
+        num_frames = 1 if self._should_start_new_sequence(prompt) else self.FRAMES_PER_CHUNK
+
+        converted: dict[str, Any] = {
+            key: self._window_from_buffer(key, num_frames)
+            for key in self.VIDEO_KEYS
+        }
+        converted.update(self._extract_state(obs))
+
         if prompt:
             self._current_prompt = prompt
         converted["annotation.task"] = np.asarray(prompts) if is_batched else prompt
+        self._is_first_call = False
         return converted
 
     def _convert_action(self, action_dict: dict[str, Any]) -> np.ndarray:
@@ -589,6 +667,8 @@ class AlohaBimanualPolicy:
         self._video_pred_latents.clear()
         self._current_prompt = ""
         self._rtc_session_states.clear()
+        self._clear_frame_buffers()
+        self._is_first_call = True
         _reset_model_temporal_state(self._policy)
 
     def flush_pending_video(self) -> None:
