@@ -316,13 +316,13 @@ source /etc/profile.d/dreamzero-uv.sh
 因为第 9 步已经导出了 `PYTHON_BIN`、`DREAMZERO_ROOT`、`DATASET_ROOT` 和 `CHECKPOINT_ROOT`，后续 A800 脚本不需要改代码，可以直接运行：
 
 ```bash
-bash scripts/train/run_dreamzero_mot_multinode.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 如果跑 A800 的 2 节点脚本：
 
 ```bash
-bash scripts/train/a800_train/run_mot_full_video_2node.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 如果你没有执行 `source /etc/profile.d/dreamzero-uv.sh`，那就需要在命令前临时指定：
@@ -332,7 +332,7 @@ PYTHON_BIN=/opt/venvs/dreamzero/bin/python \
 DREAMZERO_ROOT=/2023133163/liuf/dreamzero \
 DATASET_ROOT=/2023133163/datasets/dreamzero \
 CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero \
-bash scripts/train/a800_train/run_mot_full_video_2node.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 ## 12. 保存镜像

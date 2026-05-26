@@ -39,7 +39,7 @@ Freqs are built in `_create_freqs()` from the patch grid size (F, H, W) and conc
 
 ### Tokens, blocks, and chunks
 
-- **Token**: The smallest unit the transformer sees. After **patch_embedding** (stride 1×2×2 on the latent), one frame yields a 2D grid of tokens; the total per frame is **frame_seqlen** (e.g. 50 for 160×320). So one **token** = one patch (e.g. 1×2×2 in latent space).
+- **Token**: The smallest unit the transformer sees. After **patch_embedding** (stride 1×2×2 on the latent), one frame yields a 2D grid of tokens; the total per frame is **frame_seqlen** (e.g. 200 for the current DROID 320×640 composite). So one **token** = one patch (e.g. 1×2×2 in latent space).
 
 - **Block (image block)**: A group of consecutive **frames**, not tokens. **num_frame_per_block** (e.g. 2) frames form one “image block.” So with 33 frames you get multiple blocks. **num_image_blocks** = `(num_frames - 1) // num_frame_per_block`. Blocks are used for blockwise causal attention and to align video with action/state.
 
@@ -83,12 +83,12 @@ The **inference algorithm and API stay the same** for 14B vs 5B:
 
 - Same **block/chunk layout**: `num_frame_per_block`, `num_action_per_block`, `num_state_per_block` (and thus one block → one chunk) are defined by config and data; they do not depend on which backbone (14B vs 5B) you use.
 - Same **closed-loop flow**: `lazy_joint_video_action`, KV cache, `current_start_frame`, and the denoising loop are in the **action head** and are shared. The policy still calls the same methods (`get_action`, `lazy_joint_video_action`, etc.).
-- Same **backbone role**: The backbone only produces conditioning (e.g. text embeddings). The action head owns the DiT, VAE, and action/state encoders. So “swapping to 5B” means swapping the **action head config** (and checkpoints) to the Wan22 5B DiT + VAE38 + 160×320; the high-level inference path (backbone → action_head → one chunk) is unchanged.
+- Same **backbone role**: The backbone only produces conditioning (e.g. text embeddings). The action head owns the DiT, VAE, and action/state encoders. So “swapping to 5B” means swapping the **action head config** (and checkpoints) to the Wan22 5B DiT + VAE38; the high-level inference path (backbone → action_head → one chunk) is unchanged.
 
 What **does** change with 5B:
 
-- **DiT size and layout**: 5B uses a smaller DiT (dim 3072, 30 layers, 24 heads), **frame_seqlen = 50** (for 160×320), and **no** first-frame latent concat (`concat_first_frame_latent=False`). First frame is conditioned via **CLIP** in the context, not as extra channel in the latent.
-- **VAE and resolution**: 5B uses **WanVideoVAE38** (48 channels, 16× spatial) and **160×320** video. So latent is 10×20; tokens per frame = 50.
+- **DiT size and layout**: 5B uses a smaller DiT (dim 3072, 30 layers, 24 heads) and **no** first-frame latent concat (`concat_first_frame_latent=False`). First frame is conditioned via **CLIP** in the context, not as extra channel in the latent.
+- **VAE and resolution**: 5B uses **WanVideoVAE38** (48 channels, 16× spatial). Current DROID training keeps the composed 320×640 video grid, so latent is 20×40 and tokens per frame = 200.
 - **Conditioning**: 5B uses CLIP image embedding for the first frame in the context; 14B can concatenate the first-frame latent to the DiT input. The action head handles this inside the same `_forward_inference` / `_forward_blocks`; no change to the external inference API.
 
 So: **blocks and chunks** are used the same way for predicting actions at inference; **closed-loop** is the same loop of “observe → predict one chunk → execute → repeat” with KV cache; **swapping to 5B** keeps that flow and only changes the internal model (DiT/VAE) and resolution/conditioning.
@@ -120,23 +120,25 @@ export WAN22_CKPT_DIR=./checkpoints/Wan2.2-TI2V-5B
 export IMAGE_ENCODER_DIR=./checkpoints/Wan2.1-I2V-14B-480P  # for CLIP only
 export DROID_DATA_ROOT=./data/droid_lerobot
 
-# Run training
-bash scripts/train/droid_training_wan22.sh
+# Run current DROID training recipes
+bash scripts/train/droid_wan22_joint_fseq200.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 ## Configuration Details
 
-The Wan2.2 config (`wan_flow_matching_action_tf_wan22.yaml`) overrides:
+The base Wan2.2 config (`wan_flow_matching_action_tf_wan22.yaml`) overrides:
 
 - **model/dreamzero/action_head**: `wan_flow_matching_action_tf_wan22`
 - **diffusion_model_cfg**: Wan2.2 architecture (dim=3072, in_dim=48, out_dim=48, etc.)
 - **vae_cfg**: `WanVideoVAE38` (48-channel Wan2.2 VAE)
-- **frame_seqlen**: 50 (patch output per frame)
-- **target_video_height / target_video_width**: 160 and 320 so latent spatial size is **even** (10×20 after VAE38 16×), avoiding a dynamics-loss crop. Previously 176×320 gave latent 11×20 (odd height); we use **160×320** (H×W) so both latent dimensions are even after the DiT’s stride-(1,2,2) patch embedding.
+- **frame_seqlen**: 50 in the bare config, or 200 in the current DROID 320×640 training launchers.
+- **target_video_height / target_video_width**: 160 and 320 in the bare config. Current DROID training scripts override these to 320 and 640 so the DROID multi-view grid is not shrunk back to 160×320.
 
 For other resolutions, `frame_seqlen` must match patch output per frame; use H and W divisible by 32 for even latent:
 - 160×320 (H×W): latent 10×20 → 50
 - 176×320: latent 11×20 → 50 (odd H; loss uses crop)
+- 320×640: latent 20×40 → 200
 - 640×352: 220
 
 ## Using with Custom Training Scripts
@@ -150,7 +152,13 @@ text_encoder_pretrained_path=$WAN22_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth \
 image_encoder_pretrained_path=$IMAGE_ENCODER_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
 vae_pretrained_path=$WAN22_CKPT_DIR/Wan2.2_VAE.pth
 ```
-(Do not pass `frame_seqlen`; the Wan22 config uses 50.)
+For DROID 320×640 training, also pass:
+
+```bash
+frame_seqlen=200 \
+action_head_cfg.config.target_video_height=320 \
+action_head_cfg.config.target_video_width=640
+```
 
 ## File Layout
 
@@ -160,8 +168,9 @@ dreamzero/
 │   ├── wan_flow_matching_action_tf.yaml      # Wan2.1 (default)
 │   └── wan_flow_matching_action_tf_wan22.yaml  # Wan2.2-TI2V-5B
 ├── scripts/train/
-│   ├── droid_training.sh           # Wan2.1 backbone
-│   └── droid_training_wan22.sh     # Wan2.2 backbone
+│   ├── droid_wan22_joint_fseq200.sh  # DROID Joint, 320x640, frame_seqlen=200
+│   ├── droid_wan22_mot_fseq200.sh    # DROID MoT, 320x640, frame_seqlen=200
+│   └── README_DROID.md
 └── docs/
     └── WAN22_BACKBONE.md          # This file
 ```

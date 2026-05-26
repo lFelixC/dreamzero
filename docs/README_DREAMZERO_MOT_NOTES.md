@@ -76,10 +76,10 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 
 ## 训练入口
 
-保留的 MoT 训练脚本：
+推荐的 MoT 训练脚本：
 
 ```bash
-bash scripts/train/droid_wan22_mot_full.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 常用可配环境变量仍保留：
@@ -227,7 +227,7 @@ MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=8 \
 OUTPUT_DIR=/data/checkpoints/dreamzero/dreamzero_droid_wan22_mot_decoupled_smoke \
 WANDB_MODE=offline \
 SWANLAB_SYNC_WANDB=0 \
-bash scripts/train/droid_wan22_mot_full.sh
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 训练成功时日志里应看到：

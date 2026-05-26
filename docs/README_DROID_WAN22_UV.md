@@ -6,7 +6,8 @@ It is distilled from:
 
 - `README.md`
 - `docs/WAN22_BACKBONE.md`
-- `scripts/train/droid_training_wan22.sh`
+- `scripts/train/droid_wan22_joint_fseq200.sh`
+- `scripts/train/droid_wan22_mot_fseq200.sh`
 
 Compared with the main README, this version is focused on **training** and intentionally skips **TensorRT / ModelOpt** inference-only packages.
 
@@ -257,42 +258,55 @@ export DROID_DATA_ROOT=/data/dreamzero/data/droid_lerobot
 export WAN22_CKPT_DIR=/data/dreamzero/checkpoints/Wan2.2-TI2V-5B
 export IMAGE_ENCODER_DIR=/data/dreamzero/checkpoints/Wan2.1-I2V-14B-480P
 export TOKENIZER_DIR=/data/dreamzero/checkpoints/umt5-xxl
-export OUTPUT_DIR=/data/dreamzero/checkpoints/dreamzero_droid_wan22_lora
+export OUTPUT_DIR=/data/dreamzero/checkpoints/dreamzero_droid_wan22_joint_fseq200
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NUM_GPUS=4
 ```
 
-### 6.2 LoRA / smoke-test style run
+### 6.2 Joint smoke-test style run
 
-This is the closest match to the current Wan2.2 README path and is useful to validate that the environment is correct.
+Use a short run to validate that data loading, model loading, and distributed launch all work.
 
 ```bash
 cd /data/dreamzero
 source .venv/bin/activate
 
-bash scripts/train/droid_training_wan22.sh
+MAX_STEPS=100 bash scripts/train/droid_wan22_joint_fseq200.sh
 ```
 
 Notes:
 
-- This script currently uses `train_architecture=lora`
-- It is configured as a short run (`max_steps=100`)
-- It is good for confirming that data loading, model loading, and distributed launch all work
+- This uses the current 320x640 / `frame_seqlen=200` DROID setup.
+- Add `TRAIN_ARCHITECTURE=lora SAVE_LORA_ONLY=true` if you specifically want a LoRA smoke run.
 
-### 6.3 Full training run
+### 6.3 Full training runs
 
-If you want the longer full-finetuning recipe:
+Joint:
 
 ```bash
 cd /data/dreamzero
 source .venv/bin/activate
 
-export OUTPUT_DIR=/data/dreamzero/checkpoints/dreamzero_droid_wan22_full_finetune
+export OUTPUT_DIR=/data/dreamzero/checkpoints/dreamzero_droid_wan22_joint_fseq200
 export PER_DEVICE_BS=1
 export GLOBAL_BATCH_SIZE=4
 export DEEPSPEED_CFG=zero2_offload
 
-bash scripts/train/droid_training_full_finetune_wan22.sh
+bash scripts/train/droid_wan22_joint_fseq200.sh
+```
+
+MoT:
+
+```bash
+cd /data/dreamzero
+source .venv/bin/activate
+
+export OUTPUT_DIR=/data/dreamzero/checkpoints/dreamzero_droid_wan22_mot_fseq200
+export PER_DEVICE_BS=1
+export GLOBAL_BATCH_SIZE=4
+export DEEPSPEED_CFG=zero2_offload
+
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
 ## 7. What Is Different From the Main README

@@ -1,6 +1,9 @@
 # A800 Multi-Node Training Scripts
 
-这个目录保留 A800 多机训练入口。所有脚本都是自包含的，可以直接运行，不依赖其它训练启动脚本或环境 helper。
+这个目录保留 A800 多机训练入口。DROID 的推荐入口已经整理到
+`scripts/train/droid_wan22_joint_fseq200.sh` 和
+`scripts/train/droid_wan22_mot_fseq200.sh`；这里的脚本主要用于保留
+A800 集群上的历史启动方式。
 
 默认环境固定为：
 
@@ -18,9 +21,8 @@ CHECKPOINT_ROOT=/2023133163/checkpoints/dreamzero
 
 | Script | Experiment | Default port | Default output |
 | --- | --- | --- | --- |
-| `run_mot_full_video_2node.sh` | MoT full-video attention | `29420` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_2node` |
-| `run_mot_full_video_decoupled_2node.sh` | MoT full-video attention + decoupled video/action noise | `29430` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_mot_a800_full_video_decoupled_2node` |
-| `run_joint_drop_2node.sh` | joint baseline + DROID exterior-view drop | `29440` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_a800_2node` |
+| `run_mot_full_video_2node.sh` | MoT full-video attention, `frame_seqlen=200` | `29420` | `${CHECKPOINT_ROOT}/mot_seq200_ki_off` |
+| `run_joint_drop_2node.sh` | joint baseline + DROID exterior-view drop, `frame_seqlen=200` | `29440` | `${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_fseq200_a800_2node` |
 | `run_robotwin_joint_no_infra_2node.sh` | RoboTwin joint baseline | `29445` | `${CHECKPOINT_ROOT}/dreamzero_robotwin_wan22_joint_no_infra_a800_2node` |
 
 ## 首次进入容器检查
@@ -119,7 +121,6 @@ bash scripts/train/a800_train/run_mot_full_video_2node.sh
 更换实验时只需要换脚本名：
 
 ```bash
-bash scripts/train/a800_train/run_mot_full_video_decoupled_2node.sh
 bash scripts/train/a800_train/run_joint_drop_2node.sh
 bash scripts/train/a800_train/run_robotwin_joint_no_infra_2node.sh
 ```
@@ -152,14 +153,16 @@ bash scripts/train/a800_train/run_mot_full_video_2node.sh
 
 ## 实验参数
 
-Decoupled 脚本可覆盖：
+MoT decoupled video/action noise 可以直接通过 `run_mot_full_video_2node.sh`
+覆盖：
 
 ```bash
+MOT_DECOUPLE_VIDEO_ACTION_NOISE=true \
 MOT_VIDEO_NOISE_BETA_ALPHA=5.0 \
 MOT_VIDEO_NOISE_BETA_BETA=1.0 \
 MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE=0.85 \
 MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=6 \
-bash scripts/train/a800_train/run_mot_full_video_decoupled_2node.sh
+bash scripts/train/a800_train/run_mot_full_video_2node.sh
 ```
 
 Joint-drop 脚本默认：
@@ -196,9 +199,9 @@ WANDB_MODE=offline
 cd /2023133163/liuf/dreamzero
 
 python scripts/train/a800_train/upload_trainer_state_to_swanlab.py \
-  /2023133163/checkpoints/dreamzero/dreamzero_droid_wan22_joint_drop_a800_2node \
+  /2023133163/checkpoints/dreamzero/dreamzero_droid_wan22_joint_drop_fseq200_a800_2node \
   --project dreamzero \
-  --experiment-name dreamzero_droid_wan22_joint_drop_a800_2node
+  --experiment-name dreamzero_droid_wan22_joint_drop_fseq200_a800_2node
 ```
 
 脚本会自动读取 `OUTPUT_DIR/trainer_state.json` 或最新 `checkpoint-*/trainer_state.json`。如果确实需要训练时实时同步，可以在启动命令前覆盖：

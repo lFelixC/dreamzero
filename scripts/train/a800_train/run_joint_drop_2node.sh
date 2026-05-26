@@ -23,7 +23,7 @@ EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experimen
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
 IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${WAN22_CKPT_DIR}}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
-OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_a800_2node}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_droid_wan22_joint_drop_fseq200_a800_2node}"
 
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
 PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
@@ -46,11 +46,11 @@ DATASET_SHARD_SAMPLING_STRATEGY="${DATASET_SHARD_SAMPLING_STRATEGY:-random}"
 DATASET_SHARD_SAMPLING_BLOCK_SIZE="${DATASET_SHARD_SAMPLING_BLOCK_SIZE:-64}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 
-# DROID views are first composed as a 320x640 canvas, then resized back to
-# the Wan2.2 5B default 160x320 resolution inside the action head.
-MODEL_TARGET_HEIGHT="${MODEL_TARGET_HEIGHT:-160}"
-MODEL_TARGET_WIDTH="${MODEL_TARGET_WIDTH:-320}"
-MODEL_FRAME_SEQLEN="${MODEL_FRAME_SEQLEN:-50}"
+# DROID views are composed into a 320x640 canvas and kept at that resolution
+# inside the Wan2.2 action head.
+MODEL_TARGET_HEIGHT="${MODEL_TARGET_HEIGHT:-320}"
+MODEL_TARGET_WIDTH="${MODEL_TARGET_WIDTH:-640}"
+MODEL_FRAME_SEQLEN="${MODEL_FRAME_SEQLEN:-200}"
 
 # Enabled by default for this experiment. Override to 1.0 to drop exactly one
 # exterior view on every training sample, or to 0.0 to disable.
@@ -245,7 +245,7 @@ TRAIN_OVERRIDES=(
   "global_batch_size=${GLOBAL_BATCH_SIZE}"
   "max_steps=${MAX_STEPS}"
   "save_steps=${SAVE_STEPS}"
-  "eval_strategy=no"
+  "eval_strategy=\"no\""
   "eval_steps=${EVAL_STEPS}"
   "do_eval=false"
   "weight_decay=1e-5"

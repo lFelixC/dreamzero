@@ -258,13 +258,22 @@ uint8 video
 frame_seqlen = (latent_height // 2) * (latent_width // 2)
 ```
 
-Wan2.2 5B 常用 `160x320` 输入：
+Wan2.2 5B base config 使用 `160x320` 输入：
 
 ```text
 VAE38 spatial downscale 16x
 160x320 -> latent 10x20
 patch stride (1,2,2) -> 5x10 tokens
 frame_seqlen = 50
+```
+
+当前 DROID/Wan2.2 训练入口默认保留 composed grid 为 `320x640`：
+
+```text
+VAE38 spatial downscale 16x
+320x640 -> latent 20x40
+patch stride (1,2,2) -> 10x20 tokens
+frame_seqlen = 200
 ```
 
 ### Action Flow Matching
@@ -365,8 +374,8 @@ first call 和 later call 语义不同：
 | DiT dim | 5120 | 3072 |
 | VAE latent channels | 16 | 48 |
 | VAE class | `WanVideoVAE` | `WanVideoVAE38` |
-| common resolution | config-dependent | `160x320` in current Wan22 config |
-| common `frame_seqlen` | config-dependent | `50` |
+| common resolution | config-dependent | base config `160x320`; current DROID training scripts override to `320x640` |
+| common `frame_seqlen` | config-dependent | base config `50`; current DROID training scripts use `200` |
 | first-frame handling | may concat first-frame latent | CLIP first-frame conditioning, no latent concat |
 
 不要把 backbone swap 当成外部接口变化。算法外壳仍然是：

@@ -209,18 +209,22 @@ If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (o
 ```bash
 # Configure paths (override defaults as needed)
 export DROID_DATA_ROOT="./data/droid_lerobot"
-export OUTPUT_DIR="./checkpoints/dreamzero_droid"
-export NUM_GPUS=4
+export OUTPUT_DIR="./checkpoints/dreamzero_droid_wan22_joint_fseq200"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # Point to your downloaded model weights (if not using default paths)
-export WAN_CKPT_DIR="./checkpoints/Wan2.1-I2V-14B-480P"
+export WAN22_CKPT_DIR="./checkpoints/Wan2.2-TI2V-5B"
+export IMAGE_ENCODER_DIR="./checkpoints/Wan2.1-I2V-14B-480P"
 export TOKENIZER_DIR="./checkpoints/umt5-xxl"
 
-# Launch training
-bash scripts/train/droid_training.sh
+# Joint baseline, 320x640 composite, frame_seqlen=200
+bash scripts/train/droid_wan22_joint_fseq200.sh
+
+# MoT baseline with the same 200-token video setup
+bash scripts/train/droid_wan22_mot_fseq200.sh
 ```
 
-**Using Wan2.2-TI2V-5B backbone (5B params, lower VRAM):** To train with the smaller Wan2.2-TI2V-5B model instead of Wan2.1-I2V-14B, see [docs/WAN22_BACKBONE.md](docs/WAN22_BACKBONE.md) and run `bash scripts/train/droid_training_wan22.sh`.
+For the Wan2.2 DROID setup and the Joint/MoT script split, see [docs/WAN22_BACKBONE.md](docs/WAN22_BACKBONE.md) and [scripts/train/README_DROID.md](scripts/train/README_DROID.md).
 
 ### Training Configuration
 
@@ -231,17 +235,20 @@ The training script uses Hydra for configuration and DeepSpeed ZeRO Stage 2 for 
 | `NUM_GPUS` | 4 | Number of GPUs |
 | `per_device_train_batch_size` | 1 | Batch size per GPU |
 | `learning_rate` | 1e-5 | Learning rate |
-| `max_steps` | 10 | Max training steps (increase for full training) |
+| `max_steps` | 50000 | Max training steps |
 | `warmup_ratio` | 0.05 | Warmup ratio |
 | `weight_decay` | 1e-5 | Weight decay |
 | `image_resolution_width` | 320 | Image width |
-| `image_resolution_height` | 176 | Image height |
+| `image_resolution_height` | 160 | Per-camera image height before DROID grid composition |
+| `target_video_height` | 320 | Final action-head video height |
+| `target_video_width` | 640 | Final action-head video width |
+| `frame_seqlen` | 200 | Tokens per latent video frame |
 | `num_frames` | 33 | Number of video frames |
 | `action_horizon` | 24 | Action prediction horizon |
-| `save_lora_only` | true | Only save LoRA weights |
+| `save_lora_only` | false | Save full weights |
 | `bf16` | true | Use bfloat16 precision |
 
-> **Note:** `max_steps=10` is set for a quick sanity check. For full training, increase this to your desired number of steps and configure `save_steps` / `save_strategy` accordingly.
+> **Note:** For a short smoke test, run with `MAX_STEPS=100` and a separate `OUTPUT_DIR`.
 
 
 ## Citation

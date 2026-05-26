@@ -15,7 +15,7 @@
 - checkpoint 必须是 `mot_action_video_attention=full_video` 训练出来的。
 - 推理关闭 DiT 跳步：`NUM_DIT_STEPS=16`，`MOT_INFERENCE_VIDEO_MODE=denoise`。
 - 数据：DROID held-out 50-100 条，覆盖 pick/place、drawer、wipe 等，成功/失败各半。
-- 模型：Wan22 5B MoT，160x320，33 frames，3 views，latent grid 5x10 per frame。
+- 模型：Wan22 5B MoT，DROID 320x640 composed grid，`frame_seqlen=200`，33 frames，3 views，latent token grid 10x20 per frame。
 
 ## 实验一：Action-to-Video Attention 记录 + ROI 分析
 
