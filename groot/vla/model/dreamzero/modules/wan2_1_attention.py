@@ -243,10 +243,9 @@ def _torch_scaled_dot_product_attention(
 
     if attn_mask is not None:
         empty_rows = ~attn_mask.any(dim=-1, keepdim=True)
-        if empty_rows.any():
-            first_key = torch.zeros_like(attn_mask)
-            first_key[..., :1] = True
-            attn_mask = attn_mask | (empty_rows & first_key)
+        first_key = torch.zeros_like(attn_mask)
+        first_key[..., :1] = True
+        attn_mask = attn_mask | (empty_rows & first_key)
 
     out = torch.nn.functional.scaled_dot_product_attention(
         q,

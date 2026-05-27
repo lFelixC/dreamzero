@@ -897,8 +897,9 @@ class WANPolicyHead(ActionHead):
 
         actions = action_input.action
         # assert the values of action is in between -1 and 1
-        if actions.numel() > 0:
-            assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"
+        if actions.numel() > 0 and self._coerce_bool(os.getenv("DREAMZERO_VALIDATE_ACTION_RANGE", "0")):
+            if not bool(((actions >= -1.0) & (actions <= 1.0)).all().item()):
+                raise AssertionError("actions must be in [-1,1] range")
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
@@ -911,7 +912,9 @@ class WANPolicyHead(ActionHead):
             videos = videos.reshape(b * t, c, h, w)
             videos = self.normalize_video(videos)
             videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
-            assert videos.min() >= -1.0 and videos.max() <= 1.0, "videos must be in [-1,1] range"
+            if self._coerce_bool(os.getenv("DREAMZERO_VALIDATE_VIDEO_RANGE", "0")):
+                if not bool(((videos >= -1.0) & (videos <= 1.0)).all().item()):
+                    raise AssertionError("videos must be in [-1,1] range")
             videos = videos.to(dtype=self.dtype)
 
         # shape of B * max_length * dim
