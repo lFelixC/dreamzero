@@ -18,6 +18,7 @@ from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import 
     CausalWanModel,
     MultiEmbodimentActionEncoder,
 )
+from groot.vla.utils.nvtx_utils import nvtx_range
 
 MoTActionVideoAttention = Literal["first_frame", "full_video", "none"]
 
@@ -895,33 +896,37 @@ class MoTCausalWanModel(CausalWanModel):
         is_tf: bool,
         key_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._align_wan_modulation(
-            block,
-            e,
-            x.shape[1],
-        )
-        attn_input = block.norm1(x) * (1 + scale_msa) + shift_msa
-        y, video_k, video_v = self._video_self_attention_with_kv(
-            self_attn=block.self_attn,
-            x=attn_input,
-            freqs=freqs,
-            is_tf=is_tf,
-            key_mask=key_mask,
-        )
-        y = block.self_attn.o(y)
-        x = x + y * gate_msa
-        if self.model_type == "t2v":
-            context_lens = torch.full(
-                (x.shape[0],),
-                context.shape[1],
-                dtype=torch.long,
-                device=x.device,
+        with nvtx_range("dreamzero.mot.video_expert.modulation"):
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._align_wan_modulation(
+                block,
+                e,
+                x.shape[1],
             )
-            x = x + block.cross_attn(block.norm3(x), context, context_lens)
-        else:
-            x = x + block.cross_attn(block.norm3(x), context)
-        y = block.ffn(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
-        x = x + y * gate_mlp
+            attn_input = block.norm1(x) * (1 + scale_msa) + shift_msa
+        with nvtx_range("dreamzero.mot.video_expert.self_attn"):
+            y, video_k, video_v = self._video_self_attention_with_kv(
+                self_attn=block.self_attn,
+                x=attn_input,
+                freqs=freqs,
+                is_tf=is_tf,
+                key_mask=key_mask,
+            )
+            y = block.self_attn.o(y)
+            x = x + y * gate_msa
+        with nvtx_range("dreamzero.mot.video_expert.cross_attn"):
+            if self.model_type == "t2v":
+                context_lens = torch.full(
+                    (x.shape[0],),
+                    context.shape[1],
+                    dtype=torch.long,
+                    device=x.device,
+                )
+                x = x + block.cross_attn(block.norm3(x), context, context_lens)
+            else:
+                x = x + block.cross_attn(block.norm3(x), context)
+        with nvtx_range("dreamzero.mot.video_expert.ffn"):
+            y = block.ffn(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
+            x = x + y * gate_mlp
         return x, video_k, video_v
 
     def _select_video_kv_for_action(
@@ -1064,12 +1069,13 @@ class MoTCausalWanModel(CausalWanModel):
             state_end = state_start + num_state_per_block
             if num_state_per_block > 0:
                 state_mask = self._slice_optional_key_mask(action_key_mask, state_start, state_end)
-                mixed[:, state_start:state_end] = block.attn(
-                    q_action[:, state_start:state_end],
-                    k_action[:, state_start:state_end],
-                    v_action[:, state_start:state_end],
-                    key_mask=self._drop_full_true_mask(state_mask),
-                )
+                with nvtx_range(f"dreamzero.mot.action_joint.block.{block_idx}.state_attn"):
+                    mixed[:, state_start:state_end] = block.attn(
+                        q_action[:, state_start:state_end],
+                        k_action[:, state_start:state_end],
+                        v_action[:, state_start:state_end],
+                        key_mask=self._drop_full_true_mask(state_mask),
+                    )
 
             action_start = state_length + block_idx * self.num_action_per_block
             action_end = action_start + self.num_action_per_block
@@ -1117,18 +1123,22 @@ class MoTCausalWanModel(CausalWanModel):
             v_parts.append(v_action[:, action_start:action_end])
             key_masks.append(self._slice_optional_key_mask(action_key_mask, action_start, action_end))
 
-            key_mask = self._concat_key_masks(
-                key_masks,
-                [part.shape[1] for part in k_parts],
-                batch_size=batch_size,
-                device=device,
-            )
-            mixed[:, action_start:action_end] = block.attn(
-                q_action[:, action_start:action_end],
-                torch.cat(k_parts, dim=1),
-                torch.cat(v_parts, dim=1),
-                key_mask=key_mask,
-            )
+            with nvtx_range(f"dreamzero.mot.action_joint.block.{block_idx}.concat_masks"):
+                key_mask = self._concat_key_masks(
+                    key_masks,
+                    [part.shape[1] for part in k_parts],
+                    batch_size=batch_size,
+                    device=device,
+                )
+                k_context = torch.cat(k_parts, dim=1)
+                v_context = torch.cat(v_parts, dim=1)
+            with nvtx_range(f"dreamzero.mot.action_joint.block.{block_idx}.action_attn"):
+                mixed[:, action_start:action_end] = block.attn(
+                    q_action[:, action_start:action_end],
+                    k_context,
+                    v_context,
+                    key_mask=key_mask,
+                )
 
         return mixed.flatten(2)
 
@@ -1217,64 +1227,67 @@ class MoTCausalWanModel(CausalWanModel):
     ) -> torch.Tensor:
         action_register_length = tokens.shape[1]
         num_state_per_block = self._infer_action_state_per_block(action_register_length)
-        (
-            q_action,
-            k_action,
-            v_action,
-            residual_tokens,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = block.build_mixed_attention_io(
-            x=tokens,
-            e=e,
-            freqs_action=self.freqs_action,
-            freqs_state=self.freqs_state,
-            action_register_length=action_register_length,
-            num_action_per_block=self.num_action_per_block,
-            num_state_per_block=num_state_per_block,
-        )
-
-        if self.mot_action_video_attention == "full_video":
-            mixed = self._run_action_expert_block_joint_causal(
-                block=block,
-                q_action=q_action,
-                k_action=k_action,
-                v_action=v_action,
-                video_kv=video_kv,
-                action_key_mask=action_key_mask,
-                video_key_mask=video_key_mask,
+        with nvtx_range("dreamzero.mot.action_expert.build_io"):
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_tokens,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = block.build_mixed_attention_io(
+                x=tokens,
+                e=e,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=action_register_length,
+                num_action_per_block=self.num_action_per_block,
                 num_state_per_block=num_state_per_block,
-                clean_seq_len=clean_seq_len,
-                cached_current_start_frame=None,
             )
-        else:
-            if video_kv is None:
-                k_context = k_action
-                v_context = v_action
-                key_mask = self._drop_full_true_mask(action_key_mask)
-            else:
-                video_k, video_v = video_kv
-                k_context = torch.cat([video_k, k_action], dim=1)
-                v_context = torch.cat([video_v, v_action], dim=1)
-                key_mask = self._concat_key_masks(
-                    [video_key_mask, action_key_mask],
-                    [video_k.shape[1], k_action.shape[1]],
-                    batch_size=tokens.shape[0],
-                    device=tokens.device,
-                )
 
-            mixed = block.attn(q_action, k_context, v_context, key_mask=key_mask).flatten(2)
-        return block.apply_mixed_attention_output(
-            residual_x=residual_tokens,
-            mixed_attn_out=mixed,
-            gate_msa=gate_msa,
-            shift_mlp=shift_mlp,
-            scale_mlp=scale_mlp,
-            gate_mlp=gate_mlp,
-            context=context,
-        )
+        with nvtx_range("dreamzero.mot.action_expert.mixed_attn"):
+            if self.mot_action_video_attention == "full_video":
+                mixed = self._run_action_expert_block_joint_causal(
+                    block=block,
+                    q_action=q_action,
+                    k_action=k_action,
+                    v_action=v_action,
+                    video_kv=video_kv,
+                    action_key_mask=action_key_mask,
+                    video_key_mask=video_key_mask,
+                    num_state_per_block=num_state_per_block,
+                    clean_seq_len=clean_seq_len,
+                    cached_current_start_frame=None,
+                )
+            else:
+                if video_kv is None:
+                    k_context = k_action
+                    v_context = v_action
+                    key_mask = self._drop_full_true_mask(action_key_mask)
+                else:
+                    video_k, video_v = video_kv
+                    k_context = torch.cat([video_k, k_action], dim=1)
+                    v_context = torch.cat([video_v, v_action], dim=1)
+                    key_mask = self._concat_key_masks(
+                        [video_key_mask, action_key_mask],
+                        [video_k.shape[1], k_action.shape[1]],
+                        batch_size=tokens.shape[0],
+                        device=tokens.device,
+                    )
+
+                mixed = block.attn(q_action, k_context, v_context, key_mask=key_mask).flatten(2)
+        with nvtx_range("dreamzero.mot.action_expert.output_ffn"):
+            return block.apply_mixed_attention_output(
+                residual_x=residual_tokens,
+                mixed_attn_out=mixed,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                context=context,
+            )
 
     def _run_action_expert_block_cached(
         self,
@@ -1582,20 +1595,22 @@ class MoTCausalWanModel(CausalWanModel):
         if y is not None and self.concat_first_frame_latent:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
 
-        x = self.patch_embedding(x)
-        grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
-        freqs = self._create_freqs(grid_size=grid_size, start_frame=0)
+        with nvtx_range("dreamzero.mot.train.patch_embedding"):
+            x = self.patch_embedding(x)
+            grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
+            freqs = self._create_freqs(grid_size=grid_size, start_frame=0)
 
         x = x.flatten(start_dim=2).transpose(1, 2)
         assert x.shape[1] == seq_len
         batch_size = x.shape[0]
         video_frames = timestep.shape[1]
-        video_token_mask = self._build_video_token_mask(
-            video_frame_mask=video_frame_mask,
-            video_frames=video_frames,
-            seq_len=seq_len,
-            device=x.device,
-        )
+        with nvtx_range("dreamzero.mot.train.build_video_mask"):
+            video_token_mask = self._build_video_token_mask(
+                video_frame_mask=video_frame_mask,
+                video_frames=video_frames,
+                seq_len=seq_len,
+                device=x.device,
+            )
         video_attention_mask = video_token_mask
 
         timestep_video = timestep.unsqueeze(-1).expand(
@@ -1615,36 +1630,38 @@ class MoTCausalWanModel(CausalWanModel):
             embodiment_id = torch.zeros(batch_size, device=x.device, dtype=torch.long)
         elif embodiment_id is None and state is not None:
             embodiment_id = torch.zeros(batch_size, device=x.device, dtype=torch.long)
-        text_image_context = self._build_text_image_context(context, clip_feature)
-        state_context = self._build_state_context(
-            state=state,
-            embodiment_id=embodiment_id,
-            batch_size=batch_size,
-            device=x.device,
-        )
-        text_context = self._build_video_context(text_image_context, state_context)
+        with nvtx_range("dreamzero.mot.train.build_context"):
+            text_image_context = self._build_text_image_context(context, clip_feature)
+            state_context = self._build_state_context(
+                state=state,
+                embodiment_id=embodiment_id,
+                batch_size=batch_size,
+                device=x.device,
+            )
+            text_context = self._build_video_context(text_image_context, state_context)
 
         clean_seq_len = 0
         if clean_x is not None:
-            if y is not None and self.concat_first_frame_latent:
-                clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
-            clean_x = self.patch_embedding(clean_x)
-            clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
-            assert clean_x.shape[1] == seq_len
+            with nvtx_range("dreamzero.mot.train.clean_video_condition"):
+                if y is not None and self.concat_first_frame_latent:
+                    clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
+                clean_x = self.patch_embedding(clean_x)
+                clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
+                assert clean_x.shape[1] == seq_len
 
-            x = torch.cat([clean_x, x], dim=1)
-            clean_seq_len = clean_x.shape[1]
-            if video_token_mask is not None:
-                video_attention_mask = torch.cat([video_token_mask, video_token_mask], dim=1)
+                x = torch.cat([clean_x, x], dim=1)
+                clean_seq_len = clean_x.shape[1]
+                if video_token_mask is not None:
+                    video_attention_mask = torch.cat([video_token_mask, video_token_mask], dim=1)
 
-            if aug_t is None:
-                aug_t = torch.zeros_like(timestep_original)
-            e_clean = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x)
-            )
-            e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
-            e0_clean = self.time_projection(e_clean).unflatten(dim=2, sizes=(6, self.dim))
-            e0 = torch.cat([e0_clean, e0], dim=1)
+                if aug_t is None:
+                    aug_t = torch.zeros_like(timestep_original)
+                e_clean = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x)
+                )
+                e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
+                e0_clean = self.time_projection(e_clean).unflatten(dim=2, sizes=(6, self.dim))
+                e0 = torch.cat([e0_clean, e0], dim=1)
 
         action_tokens = None
         action_e = None
@@ -1654,34 +1671,36 @@ class MoTCausalWanModel(CausalWanModel):
         if action is not None:
             assert timestep_action is not None
             assert state is not None
-            action_tokens, action_e, action_start, action_length = self.action_expert.build_action_inputs(
-                action=action,
-                timestep_action=timestep_action,
-                state=state,
-                embodiment_id=embodiment_id,
-            )
-            state_mask = self._align_token_mask(state_token_mask, action_start, x.device)
-            action_mask = self._align_token_mask(action_token_mask, action_length, x.device)
-            action_register_mask = self._concat_key_masks(
-                [state_mask, action_mask],
-                [action_start, action_length],
-                batch_size=batch_size,
-                device=x.device,
-            )
+            with nvtx_range("dreamzero.mot.train.build_action_inputs"):
+                action_tokens, action_e, action_start, action_length = self.action_expert.build_action_inputs(
+                    action=action,
+                    timestep_action=timestep_action,
+                    state=state,
+                    embodiment_id=embodiment_id,
+                )
+                state_mask = self._align_token_mask(state_token_mask, action_start, x.device)
+                action_mask = self._align_token_mask(action_token_mask, action_length, x.device)
+                action_register_mask = self._concat_key_masks(
+                    [state_mask, action_mask],
+                    [action_start, action_length],
+                    batch_size=batch_size,
+                    device=x.device,
+                )
 
         is_tf = clean_x is not None
         for layer_idx, block in enumerate(self.blocks):
             if action_tokens is None:
-                def run_video(video_tokens, _block=block):
-                    video_tokens, _, _ = self._run_video_expert_block(
-                        block=_block,
-                        x=video_tokens,
-                        e=e0,
-                        freqs=freqs,
-                        context=text_context,
-                        is_tf=is_tf,
-                        key_mask=video_attention_mask,
-                    )
+                def run_video(video_tokens, _block=block, _layer_idx=layer_idx):
+                    with nvtx_range(f"dreamzero.mot.layer.{_layer_idx}.video_only"):
+                        video_tokens, _, _ = self._run_video_expert_block(
+                            block=_block,
+                            x=video_tokens,
+                            e=e0,
+                            freqs=freqs,
+                            context=text_context,
+                            is_tf=is_tf,
+                            key_mask=video_attention_mask,
+                        )
                     return video_tokens
 
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1693,39 +1712,42 @@ class MoTCausalWanModel(CausalWanModel):
             assert action_e is not None
             action_block = self.action_expert.blocks[layer_idx]
 
-            def run_mot_layer(video_tokens, action_tokens_in, _block=block, _action_block=action_block):
-                video_tokens, video_k, video_v = self._run_video_expert_block(
-                    block=_block,
-                    x=video_tokens,
-                    e=e0,
-                    freqs=freqs,
-                    context=text_context,
-                    is_tf=is_tf,
-                    key_mask=video_attention_mask,
-                )
-                video_kv = self._select_video_kv_for_action(
-                    video_k=video_k,
-                    video_v=video_v,
-                    seq_len=seq_len,
-                    clean_seq_len=clean_seq_len,
-                )
-                video_kv_mask = self._select_video_mask_for_action(
-                    video_attention_mask,
-                    seq_len=seq_len,
-                    clean_seq_len=clean_seq_len,
-                )
-                if self.mot_action_video_ki:
-                    video_kv = self._detach_video_kv(video_kv)
-                action_tokens_out = self._run_action_expert_block(
-                    block=_action_block,
-                    tokens=action_tokens_in,
-                    e=action_e,
-                    context=None,
-                    video_kv=video_kv,
-                    action_key_mask=action_register_mask,
-                    video_key_mask=video_kv_mask,
-                    clean_seq_len=clean_seq_len,
-                )
+            def run_mot_layer(video_tokens, action_tokens_in, _block=block, _action_block=action_block, _layer_idx=layer_idx):
+                with nvtx_range(f"dreamzero.mot.layer.{_layer_idx}.video_expert"):
+                    video_tokens, video_k, video_v = self._run_video_expert_block(
+                        block=_block,
+                        x=video_tokens,
+                        e=e0,
+                        freqs=freqs,
+                        context=text_context,
+                        is_tf=is_tf,
+                        key_mask=video_attention_mask,
+                    )
+                with nvtx_range(f"dreamzero.mot.layer.{_layer_idx}.select_video_kv"):
+                    video_kv = self._select_video_kv_for_action(
+                        video_k=video_k,
+                        video_v=video_v,
+                        seq_len=seq_len,
+                        clean_seq_len=clean_seq_len,
+                    )
+                    video_kv_mask = self._select_video_mask_for_action(
+                        video_attention_mask,
+                        seq_len=seq_len,
+                        clean_seq_len=clean_seq_len,
+                    )
+                    if self.mot_action_video_ki:
+                        video_kv = self._detach_video_kv(video_kv)
+                with nvtx_range(f"dreamzero.mot.layer.{_layer_idx}.action_expert"):
+                    action_tokens_out = self._run_action_expert_block(
+                        block=_action_block,
+                        tokens=action_tokens_in,
+                        e=action_e,
+                        context=None,
+                        video_kv=video_kv,
+                        action_key_mask=action_register_mask,
+                        video_key_mask=video_kv_mask,
+                        clean_seq_len=clean_seq_len,
+                    )
                 return video_tokens, action_tokens_out
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1741,21 +1763,23 @@ class MoTCausalWanModel(CausalWanModel):
         if clean_x is not None:
             x = x[:, clean_seq_len:]
 
-        x_video = x[:, :seq_len]
-        e_video = e[:, :seq_len]
-        x_video = self.head(x_video, e_video.unsqueeze(2))
-        video_noise_pred = self.unpatchify(x_video, grid_size)
+        with nvtx_range("dreamzero.mot.train.video_head"):
+            x_video = x[:, :seq_len]
+            e_video = e[:, :seq_len]
+            x_video = self.head(x_video, e_video.unsqueeze(2))
+            video_noise_pred = self.unpatchify(x_video, grid_size)
 
         action_noise_pred = None
         if action_tokens is not None:
             assert action_start is not None
             assert action_length is not None
             assert embodiment_id is not None
-            action_noise_pred = self.action_expert.decode_action(
-                tokens=action_tokens,
-                action_start=action_start,
-                action_length=action_length,
-                embodiment_id=embodiment_id,
-            )
+            with nvtx_range("dreamzero.mot.train.action_decode"):
+                action_noise_pred = self.action_expert.decode_action(
+                    tokens=action_tokens,
+                    action_start=action_start,
+                    action_length=action_length,
+                    embodiment_id=embodiment_id,
+                )
 
         return video_noise_pred, action_noise_pred

@@ -1,0 +1,113 @@
+#!/bin/bash
+set -euo pipefail
+
+# Short local 2-GPU Nsight Systems profile for the full-video MoT training setup.
+# This intentionally delegates the actual training command to the A800 2-node
+# script so the model/data overrides stay aligned with that experiment.
+
+DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero}"
+PROFILE_ROOT="${PROFILE_ROOT:-/data/checkpoints/dreamzero/nsys}"
+RUN_ID="${RUN_ID:-nsys_mot_full_video_dual_$(date -u +%Y%m%d_%H%M%S)}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-${DREAMZERO_ROOT}/scripts/train/a800_train/run_mot_full_video_2node.sh}"
+
+export VIRTUAL_ENV="${VIRTUAL_ENV:-${DREAMZERO_ROOT}/.venv}"
+export PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV}/bin/python}"
+export DREAMZERO_ROOT
+export DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero}"
+export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
+export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
+export PATH="${VIRTUAL_ENV}/bin:/usr/local/bin:/root/.local/bin:${PATH:-}"
+
+export NNODES="${NNODES:-1}"
+export NODE_RANK="${NODE_RANK:-0}"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-29423}"
+export GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1}}"
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+
+IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+export NUM_GPUS="${NUM_GPUS:-${#_GPU_ID_ARRAY[@]}}"
+
+export PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
+export MAX_STEPS="${MAX_STEPS:-20}"
+export SAVE_STEPS="${SAVE_STEPS:-100000}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${PROFILE_ROOT}/${RUN_ID}_train}"
+export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-nsys_mot_full_video}"
+export WANDB_NAME="${WANDB_NAME:-${RUN_ID}}"
+export USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
+
+export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-0}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export DREAMZERO_ENABLE_NVTX="${DREAMZERO_ENABLE_NVTX:-1}"
+export DREAMZERO_TIMING_DEBUG="${DREAMZERO_TIMING_DEBUG:-0}"
+export DREAMZERO_SKIP_FINAL_SAVE="${DREAMZERO_SKIP_FINAL_SAVE:-1}"
+export DREAMZERO_DISABLE_VIDEO_ATTENTION_MASK="${DREAMZERO_DISABLE_VIDEO_ATTENTION_MASK:-0}"
+export DREAMZERO_ENABLE_ACTION_STATE_ATTENTION_MASKS="${DREAMZERO_ENABLE_ACTION_STATE_ATTENTION_MASKS:-1}"
+export DREAMZERO_VALIDATE_ACTION_RANGE="${DREAMZERO_VALIDATE_ACTION_RANGE:-0}"
+export DREAMZERO_VALIDATE_VIDEO_RANGE="${DREAMZERO_VALIDATE_VIDEO_RANGE:-0}"
+export DREAMZERO_DUMP_BATCH_META="${DREAMZERO_DUMP_BATCH_META:-0}"
+export DREAMZERO_EMIT_SAMPLE_META="${DREAMZERO_EMIT_SAMPLE_META:-${DREAMZERO_DUMP_BATCH_META}}"
+export DREAMZERO_BATCH_DEBUG_STEPS="${DREAMZERO_BATCH_DEBUG_STEPS:-7,8,16,17}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,cublas,cudnn}"
+NSYS_GPU_METRICS_DEVICES="${NSYS_GPU_METRICS_DEVICES:-cuda-visible}"
+NSYS_OSRT_THRESHOLD="${NSYS_OSRT_THRESHOLD:-10000}"
+NSYS_CUDA_EVENT_TRACE="${NSYS_CUDA_EVENT_TRACE:-false}"
+NSYS_OUTPUT="${NSYS_OUTPUT:-${PROFILE_ROOT}/${RUN_ID}}"
+NSYS_LAUNCH_LOG="${NSYS_LAUNCH_LOG:-${PROFILE_ROOT}/${RUN_ID}_launch.log}"
+NSYS_WRITE_LAUNCH_LOG="${NSYS_WRITE_LAUNCH_LOG:-1}"
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "ERROR: Python not found or not executable at ${PYTHON_BIN}"
+  exit 1
+fi
+
+if [[ ! -f "${TRAIN_SCRIPT}" ]]; then
+  echo "ERROR: Training script not found at ${TRAIN_SCRIPT}"
+  exit 1
+fi
+
+mkdir -p "${PROFILE_ROOT}" "${OUTPUT_DIR}"
+
+if [[ "${NSYS_WRITE_LAUNCH_LOG}" =~ ^(1|true|yes|on)$ ]]; then
+  exec > >(tee -a "${NSYS_LAUNCH_LOG}") 2>&1
+fi
+
+echo "========== short nsys full-video MoT profile =========="
+echo "RUN_ID=${RUN_ID}"
+echo "DREAMZERO_ROOT=${DREAMZERO_ROOT}"
+echo "TRAIN_SCRIPT=${TRAIN_SCRIPT}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "NUM_GPUS=${NUM_GPUS}"
+echo "PER_DEVICE_BS=${PER_DEVICE_BS}"
+echo "MAX_STEPS=${MAX_STEPS}"
+echo "USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING}"
+echo "DREAMZERO_DISABLE_VIDEO_ATTENTION_MASK=${DREAMZERO_DISABLE_VIDEO_ATTENTION_MASK}"
+echo "DREAMZERO_ENABLE_ACTION_STATE_ATTENTION_MASKS=${DREAMZERO_ENABLE_ACTION_STATE_ATTENTION_MASKS}"
+echo "DREAMZERO_VALIDATE_ACTION_RANGE=${DREAMZERO_VALIDATE_ACTION_RANGE}"
+echo "DREAMZERO_VALIDATE_VIDEO_RANGE=${DREAMZERO_VALIDATE_VIDEO_RANGE}"
+echo "DREAMZERO_EMIT_SAMPLE_META=${DREAMZERO_EMIT_SAMPLE_META}"
+echo "DREAMZERO_DUMP_BATCH_META=${DREAMZERO_DUMP_BATCH_META}"
+echo "DREAMZERO_BATCH_DEBUG_STEPS=${DREAMZERO_BATCH_DEBUG_STEPS}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
+echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+echo "NSYS_OUTPUT=${NSYS_OUTPUT}.nsys-rep"
+echo "NSYS_LAUNCH_LOG=${NSYS_LAUNCH_LOG}"
+echo "NSYS_TRACE=${NSYS_TRACE}"
+echo "NSYS_GPU_METRICS_DEVICES=${NSYS_GPU_METRICS_DEVICES}"
+echo "NSYS_CUDA_EVENT_TRACE=${NSYS_CUDA_EVENT_TRACE}"
+echo "======================================================="
+
+exec nsys profile \
+  --force-overwrite=true \
+  --trace="${NSYS_TRACE}" \
+  --cuda-event-trace="${NSYS_CUDA_EVENT_TRACE}" \
+  --sample=none \
+  --cpuctxsw=none \
+  --osrt-threshold="${NSYS_OSRT_THRESHOLD}" \
+  --gpu-metrics-devices="${NSYS_GPU_METRICS_DEVICES}" \
+  --output="${NSYS_OUTPUT}" \
+  bash "${TRAIN_SCRIPT}" \
+    save_strategy=no \
+    "$@"

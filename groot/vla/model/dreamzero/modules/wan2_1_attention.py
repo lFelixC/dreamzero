@@ -34,6 +34,8 @@ except ModuleNotFoundError:
 
 import warnings
 
+from groot.vla.utils.nvtx_utils import nvtx_range
+
 
 def _gpu_supports_flash_attention():
     """FlashAttention requires Ampere (compute capability 8.0) or newer."""
@@ -223,39 +225,42 @@ def _torch_scaled_dot_product_attention(
 
     attn_mask = None
     empty_rows = None
-    if key_mask is not None:
-        if key_mask.ndim != 2:
-            raise ValueError(f"key_mask must have shape [B, Lk], got {tuple(key_mask.shape)}")
-        if key_mask.shape != (q.shape[0], k.shape[-2]):
-            raise ValueError(
-                "key_mask shape must match attention keys: "
-                f"got {tuple(key_mask.shape)}, expected {(q.shape[0], k.shape[-2])}"
-            )
-        attn_mask = key_mask.to(device=q.device, dtype=torch.bool)[:, None, None, :]
+    with nvtx_range("dreamzero.attn.torch_sdpa.prepare_mask"):
+        if key_mask is not None:
+            if key_mask.ndim != 2:
+                raise ValueError(f"key_mask must have shape [B, Lk], got {tuple(key_mask.shape)}")
+            if key_mask.shape != (q.shape[0], k.shape[-2]):
+                raise ValueError(
+                    "key_mask shape must match attention keys: "
+                    f"got {tuple(key_mask.shape)}, expected {(q.shape[0], k.shape[-2])}"
+                )
+            attn_mask = key_mask.to(device=q.device, dtype=torch.bool)[:, None, None, :]
 
-    if causal and attn_mask is not None:
-        causal_mask = torch.ones(
-            (q.shape[-2], k.shape[-2]),
-            device=q.device,
-            dtype=torch.bool,
-        ).tril()
-        attn_mask = attn_mask & causal_mask[None, None, :, :]
+        if causal and attn_mask is not None:
+            causal_mask = torch.ones(
+                (q.shape[-2], k.shape[-2]),
+                device=q.device,
+                dtype=torch.bool,
+            ).tril()
+            attn_mask = attn_mask & causal_mask[None, None, :, :]
 
-    if attn_mask is not None:
-        empty_rows = ~attn_mask.any(dim=-1, keepdim=True)
-        first_key = torch.zeros_like(attn_mask)
-        first_key[..., :1] = True
-        attn_mask = attn_mask | (empty_rows & first_key)
+        if attn_mask is not None:
+            empty_rows = ~attn_mask.any(dim=-1, keepdim=True)
+            first_key = torch.zeros_like(attn_mask)
+            first_key[..., :1] = True
+            attn_mask = attn_mask | (empty_rows & first_key)
 
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        is_causal=causal and attn_mask is None,
-        dropout_p=dropout_p,
-        scale=softmax_scale,
-    )
+    sdpa_range = "dreamzero.attn.torch_sdpa.masked" if attn_mask is not None else "dreamzero.attn.torch_sdpa.unmasked"
+    with nvtx_range(sdpa_range):
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=causal and attn_mask is None,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        )
     if empty_rows is not None:
         out = out.masked_fill(empty_rows, 0)
 

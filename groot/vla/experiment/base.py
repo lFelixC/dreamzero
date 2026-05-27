@@ -984,6 +984,158 @@ class BaseTrainer(transformers.Trainer):
                 self._last_prepare_inputs_seconds = self._timing_elapsed(start)
             return inputs
 
+    @staticmethod
+    def _debug_env_enabled(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _should_dump_batch_debug(self) -> bool:
+        if not self._debug_env_enabled("DREAMZERO_DUMP_BATCH_META"):
+            return False
+        steps = os.environ.get("DREAMZERO_BATCH_DEBUG_STEPS", "").strip()
+        if not steps:
+            return True
+        try:
+            wanted_steps = {int(step.strip()) for step in steps.split(",") if step.strip()}
+        except ValueError:
+            return False
+        return int(self.current_step) in wanted_steps
+
+    @staticmethod
+    def _debug_tensor_values(value, *, max_items: int = 64):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.ndim == 0:
+                return value.cpu().item()
+            return value.flatten()[:max_items].cpu().tolist()
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value.item()
+            return value.reshape(-1)[:max_items].tolist()
+        return value
+
+    @staticmethod
+    def _debug_tensor_stats(value):
+        if value is None or not isinstance(value, torch.Tensor):
+            return None
+
+        value = value.detach()
+        stats = {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "numel": int(value.numel()),
+        }
+        if value.numel() == 0:
+            return stats
+
+        if value.dtype == torch.bool:
+            stats["true_count"] = int(value.sum().cpu().item())
+            return stats
+
+        if torch.is_floating_point(value):
+            finite_mask = torch.isfinite(value)
+            nonfinite = (~finite_mask).sum()
+            stats["nonfinite_count"] = int(nonfinite.cpu().item())
+            if value.ndim > 0:
+                sample_nonfinite = (~finite_mask).reshape(value.shape[0], -1).sum(dim=1)
+                stats["nonfinite_per_sample"] = sample_nonfinite.cpu().tolist()
+            if finite_mask.any().cpu().item():
+                finite_values = value[finite_mask].float()
+                stats["min"] = float(finite_values.min().cpu().item())
+                stats["max"] = float(finite_values.max().cpu().item())
+                stats["mean"] = float(finite_values.mean().cpu().item())
+            return stats
+
+        stats["min"] = int(value.min().cpu().item())
+        stats["max"] = int(value.max().cpu().item())
+        return stats
+
+    def _dump_batch_debug(self, inputs) -> None:
+        if not self._should_dump_batch_debug():
+            return
+        sample_keys = [
+            "_sample_dataset_index",
+            "_sample_shard_index",
+            "_sample_schedule_index",
+            "_sample_trajectory_id",
+            "_sample_step_index",
+        ]
+        if not any(key in inputs for key in sample_keys):
+            return
+
+        payload = {
+            "rank": int(self.global_rank),
+            "step": int(self.current_step),
+        }
+        for key in sample_keys:
+            if key in inputs:
+                payload[key.removeprefix("_sample_")] = self._debug_tensor_values(inputs[key])
+
+        if "images_mask" in inputs:
+            images_mask = inputs["images_mask"].detach().to(dtype=torch.bool)
+            payload["images_valid_frames"] = images_mask.sum(dim=1).cpu().tolist()
+        if "action_mask" in inputs:
+            action_mask = inputs["action_mask"].detach().to(dtype=torch.bool)
+            payload["action_valid_tokens"] = action_mask.any(dim=2).sum(dim=1).cpu().tolist()
+            payload["action_valid_dims"] = action_mask.sum(dim=2).flatten()[:64].cpu().tolist()
+        if "state_mask" in inputs:
+            state_mask = inputs["state_mask"].detach().to(dtype=torch.bool)
+            payload["state_valid_tokens"] = state_mask.any(dim=2).sum(dim=1).cpu().tolist()
+            payload["state_valid_dims"] = state_mask.sum(dim=2).flatten()[:64].cpu().tolist()
+        if "text_attention_mask" in inputs:
+            text_mask = inputs["text_attention_mask"].detach().to(dtype=torch.bool)
+            payload["text_valid_tokens"] = text_mask.sum(dim=1).cpu().tolist()
+        if "has_real_action" in inputs:
+            payload["has_real_action"] = self._debug_tensor_values(inputs["has_real_action"])
+
+        tensor_stats = {}
+        for key in (
+            "images",
+            "images_mask",
+            "action",
+            "action_mask",
+            "state",
+            "state_mask",
+            "lapa_action",
+            "segmentation_target",
+        ):
+            if key in inputs:
+                tensor_stats[key] = self._debug_tensor_stats(inputs[key])
+        if tensor_stats:
+            payload["tensor_stats"] = tensor_stats
+
+        output_path = Path(self.args.output_dir) / f"batch_debug_rank{self.global_rank}.jsonl"
+        with output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, allow_nan=True) + "\n")
+
+    def _dump_forward_debug(self, outputs) -> None:
+        if not self._should_dump_batch_debug():
+            return
+        if not hasattr(outputs, "items"):
+            return
+
+        payload = {
+            "rank": int(self.global_rank),
+            "step": int(self.current_step),
+            "outputs_type": type(outputs).__name__,
+            "outputs": {},
+        }
+        for key, value in outputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0 or "loss" in key or "metric" in key:
+                    payload["outputs"][key] = self._debug_tensor_stats(value)
+            elif isinstance(value, (float, int, bool)):
+                payload["outputs"][key] = value
+
+        if not payload["outputs"]:
+            return
+
+        output_path = Path(self.args.output_dir) / f"forward_debug_rank{self.global_rank}.jsonl"
+        with output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, allow_nan=True) + "\n")
+
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
 
@@ -1050,9 +1202,11 @@ class BaseTrainer(transformers.Trainer):
         return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        self._dump_batch_debug(inputs)
         forward_start = self._timing_start() if self.timing_debug else None
         with self.timer.with_label("model_forward"), nvtx_range("dreamzero.train.model_forward"):
             outputs = model(inputs)
+            self._dump_forward_debug(outputs)
             if forward_start is not None:
                 self._last_forward_seconds = self._timing_elapsed(forward_start)
 

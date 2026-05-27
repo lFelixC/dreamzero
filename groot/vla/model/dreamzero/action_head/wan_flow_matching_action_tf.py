@@ -19,6 +19,8 @@ from safetensors import safe_open
 import json
 from huggingface_hub import hf_hub_download
 
+from groot.vla.utils.nvtx_utils import nvtx_range
+
 
 logger = logging.getLogger(__name__)
 
@@ -906,19 +908,21 @@ class WANPolicyHead(ActionHead):
 
 
         if videos.dtype == torch.uint8:
-            videos = videos.float() / 255.0
-            b, c, t, h, w = videos.shape
-            videos = videos.permute(0, 2, 1, 3, 4)  # [b, t, c, h, w]
-            videos = videos.reshape(b * t, c, h, w)
-            videos = self.normalize_video(videos)
-            videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
-            if self._coerce_bool(os.getenv("DREAMZERO_VALIDATE_VIDEO_RANGE", "0")):
-                if not bool(((videos >= -1.0) & (videos <= 1.0)).all().item()):
-                    raise AssertionError("videos must be in [-1,1] range")
-            videos = videos.to(dtype=self.dtype)
+            with nvtx_range("dreamzero.forward.normalize_video"):
+                videos = videos.float() / 255.0
+                b, c, t, h, w = videos.shape
+                videos = videos.permute(0, 2, 1, 3, 4)  # [b, t, c, h, w]
+                videos = videos.reshape(b * t, c, h, w)
+                videos = self.normalize_video(videos)
+                videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
+                if self._coerce_bool(os.getenv("DREAMZERO_VALIDATE_VIDEO_RANGE", "0")):
+                    if not bool(((videos >= -1.0) & (videos <= 1.0)).all().item()):
+                        raise AssertionError("videos must be in [-1,1] range")
+                videos = videos.to(dtype=self.dtype)
 
         # shape of B * max_length * dim
-        prompt_embs = self.encode_prompt(data["text"], data["text_attention_mask"])
+        with nvtx_range("dreamzero.forward.encode_prompt"):
+            prompt_embs = self.encode_prompt(data["text"], data["text_attention_mask"])
 
         # Wan 5B: resize to target resolution so latent tokens/frame matches DiT. Use config target when set
         # (e.g. 160x320 so latent is 10x20 with VAE38 16x → even H,W, no crop in dynamics loss); else 176x320.
@@ -932,21 +936,24 @@ class WANPolicyHead(ActionHead):
         if target_h is not None and target_w is not None:
             _, _, _, h, w = videos.shape
             if (h, w) != (target_h, target_w):
-                b, c, t, _, _ = videos.shape
-                videos = torch.nn.functional.interpolate(
-                    videos.reshape(b * t, c, h, w),
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(b, c, t, target_h, target_w)
+                with nvtx_range("dreamzero.forward.resize_video"):
+                    b, c, t, _, _ = videos.shape
+                    videos = torch.nn.functional.interpolate(
+                        videos.reshape(b * t, c, h, w),
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).reshape(b, c, t, target_h, target_w)
 
-        latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
+        with nvtx_range("dreamzero.forward.encode_video_vae"):
+            latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
         latent_frame_mask = None
         if video_frame_mask is not None:
-            latent_frame_mask = self._video_mask_to_latent_mask(
-                video_frame_mask.to(device=latents.device, dtype=torch.bool),
-                latents.shape[2],
-            )
+            with nvtx_range("dreamzero.forward.video_mask_to_latent"):
+                latent_frame_mask = self._video_mask_to_latent_mask(
+                    video_frame_mask.to(device=latents.device, dtype=torch.bool),
+                    latents.shape[2],
+                )
 
         # print("latents shape", latents.shape, self.dtype)
         _, _, num_frames, height, width = videos.shape
@@ -956,13 +963,14 @@ class WANPolicyHead(ActionHead):
             getattr(self.model, "model_type", None) == "i2v"
             or bool(getattr(self.model, "concat_first_frame_latent", False))
         )
-        clip_feas, ys, _ = self.encode_image(
-            image,
-            num_frames,
-            height,
-            width,
-            encode_first_frame_latent=needs_first_frame_latent,
-        )
+        with nvtx_range("dreamzero.forward.encode_image_condition"):
+            clip_feas, ys, _ = self.encode_image(
+                image,
+                num_frames,
+                height,
+                width,
+                encode_first_frame_latent=needs_first_frame_latent,
+            )
 
         latents = latents.to(self._device)
         clip_feas = clip_feas.to(self._device)
@@ -970,66 +978,67 @@ class WANPolicyHead(ActionHead):
             ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
 
-        # Loss
-        noise = torch.randn_like(latents)
+        with nvtx_range("dreamzero.forward.sample_noise_timesteps"):
+            # Loss
+            noise = torch.randn_like(latents)
 
-        # specific to autoregressive
-        noise = noise.transpose(1, 2)
-        latents = latents.transpose(1, 2)
+            # specific to autoregressive
+            noise = noise.transpose(1, 2)
+            latents = latents.transpose(1, 2)
 
-        if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
-            # MoT decoupled mode: train action against full-video K/V while keeping
-            # video at a higher-noise distribution, matching decoupled inference.
-            video_noise_ratio = self.video_beta_dist.sample([noise.shape[0], noise.shape[1]])
-            timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
-            timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
-            noise_mode = "MOT_DECOUPLED"
-        else:
-            # Video/action use the production coupled timestep schedule.
-            timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
-            noise_mode = "STANDARD"
-
-        timestep_id_block = timestep_id[:, 1:].reshape(
-                    timestep_id.shape[0], -1, self.num_frame_per_block)
-        timestep_id_block[:, :, 1:] = timestep_id_block[:, :, 0:1]
-
-        if actions.numel() > 0:
-            noise_action = torch.randn_like(actions)
-            assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
-            assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
-
-            if noise_mode == "MOT_DECOUPLED":
-                timestep_action_id = torch.randint(
-                    0,
-                    self.scheduler.num_train_timesteps,
-                    (actions.shape[0], actions.shape[1]),
-                )
-                action_mode = "INDEPENDENT"
+            if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
+                # MoT decoupled mode: train action against full-video K/V while keeping
+                # video at a higher-noise distribution, matching decoupled inference.
+                video_noise_ratio = self.video_beta_dist.sample([noise.shape[0], noise.shape[1]])
+                timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
+                timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
+                noise_mode = "MOT_DECOUPLED"
             else:
-                timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
-                timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
-                action_mode = "COUPLED"
+                # Video/action use the production coupled timestep schedule.
+                timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
+                noise_mode = "STANDARD"
 
-            # Log noise mode once
-            if not self._noise_logged:
-                video_mean = timestep_id.float().mean().item()
-                action_mean = timestep_action_id.float().mean().item()
+            timestep_id_block = timestep_id[:, 1:].reshape(
+                        timestep_id.shape[0], -1, self.num_frame_per_block)
+            timestep_id_block[:, :, 1:] = timestep_id_block[:, :, 0:1]
+
+            if actions.numel() > 0:
+                noise_action = torch.randn_like(actions)
+                assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
+                assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
+
                 if noise_mode == "MOT_DECOUPLED":
-                    print(
-                        "[NOISE] Mode=MOT_DECOUPLED | "
-                        f"Video: Beta({self.config.mot_video_noise_beta_alpha},"
-                        f"{self.config.mot_video_noise_beta_beta}) mean_t={video_mean:.0f} | "
-                        f"Action: {action_mode} Uniform mean_t={action_mean:.0f}"
+                    timestep_action_id = torch.randint(
+                        0,
+                        self.scheduler.num_train_timesteps,
+                        (actions.shape[0], actions.shape[1]),
                     )
+                    action_mode = "INDEPENDENT"
                 else:
-                    print(
-                        f"[NOISE] Mode=STANDARD | Video+Action: Uniform mean_t={video_mean:.0f} | "
-                        f"Action: {action_mode} mean_t={action_mean:.0f}"
-                    )
-                self._noise_logged = True
-        else:
-            noise_action = None
-            timestep_action_id = None
+                    timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
+                    timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
+                    action_mode = "COUPLED"
+
+                # Log noise mode once
+                if not self._noise_logged:
+                    video_mean = timestep_id.float().mean().item()
+                    action_mean = timestep_action_id.float().mean().item()
+                    if noise_mode == "MOT_DECOUPLED":
+                        print(
+                            "[NOISE] Mode=MOT_DECOUPLED | "
+                            f"Video: Beta({self.config.mot_video_noise_beta_alpha},"
+                            f"{self.config.mot_video_noise_beta_beta}) mean_t={video_mean:.0f} | "
+                            f"Action: {action_mode} Uniform mean_t={action_mean:.0f}"
+                        )
+                    else:
+                        print(
+                            f"[NOISE] Mode=STANDARD | Video+Action: Uniform mean_t={video_mean:.0f} | "
+                            f"Action: {action_mode} mean_t={action_mean:.0f}"
+                        )
+                    self._noise_logged = True
+            else:
+                noise_action = None
+                timestep_action_id = None
 
         timestep_id_block = timestep_id_block.reshape(timestep_id_block.shape[0], -1)
         timestep_id = torch.concat([timestep_id[:, :1], timestep_id_block], dim=1)
@@ -1039,58 +1048,68 @@ class WANPolicyHead(ActionHead):
         seq_len = num_frames * tokens_per_frame
 
         timestep = self.scheduler.timesteps[timestep_id].to(self._device)
-        noisy_latents = self.scheduler.add_noise(latents.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1]))
-        training_target = self.scheduler.training_target(latents, noise, timestep).transpose(1, 2)
+        with nvtx_range("dreamzero.forward.add_video_noise"):
+            noisy_latents = self.scheduler.add_noise(latents.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1]))
+        with nvtx_range("dreamzero.forward.video_training_target"):
+            training_target = self.scheduler.training_target(latents, noise, timestep).transpose(1, 2)
 
         if actions.numel() > 0:
             timestep_action = self.scheduler.timesteps[timestep_action_id].to(self._device)
-            noisy_actions = self.scheduler.add_noise(
-                actions.flatten(0, 1),
-                noise_action.flatten(0, 1),
-                timestep_action.flatten(0, 1),
-            ).unflatten(0, (noise_action.shape[0], noise_action.shape[1]))
-            training_target_action = self.scheduler.training_target(actions, noise_action, timestep_action)
+            with nvtx_range("dreamzero.forward.add_action_noise"):
+                noisy_actions = self.scheduler.add_noise(
+                    actions.flatten(0, 1),
+                    noise_action.flatten(0, 1),
+                    timestep_action.flatten(0, 1),
+                ).unflatten(0, (noise_action.shape[0], noise_action.shape[1]))
+            with nvtx_range("dreamzero.forward.action_training_target"):
+                training_target_action = self.scheduler.training_target(actions, noise_action, timestep_action)
         else:
             timestep_action = None
             noisy_actions = None
             training_target_action = None
 
         model_mask_kwargs = {}
-        if getattr(self.config, "architecture", "joint") == "mot" or getattr(self.model, "is_mot_wam", False):
-            if latent_frame_mask is not None:
-                model_mask_kwargs["video_frame_mask"] = latent_frame_mask.to(
-                    device=self._device,
-                    dtype=torch.bool,
+        with nvtx_range("dreamzero.forward.build_mot_attention_masks"):
+            if getattr(self.config, "architecture", "joint") == "mot" or getattr(self.model, "is_mot_wam", False):
+                disable_video_attention_mask = self._coerce_bool(os.getenv("DREAMZERO_DISABLE_VIDEO_ATTENTION_MASK", "0"))
+                enable_action_state_attention_masks = self._coerce_bool(
+                    os.getenv("DREAMZERO_ENABLE_ACTION_STATE_ATTENTION_MASKS", "1")
                 )
-            if action_mask is not None:
-                model_mask_kwargs["action_token_mask"] = action_mask.to(
-                    device=self._device,
-                    dtype=torch.bool,
-                ).any(dim=2)
-            if state_mask is not None:
-                model_mask_kwargs["state_token_mask"] = state_mask.to(
-                    device=self._device,
-                    dtype=torch.bool,
-                ).any(dim=2)
+                if latent_frame_mask is not None and not disable_video_attention_mask:
+                    model_mask_kwargs["video_frame_mask"] = latent_frame_mask.to(
+                        device=self._device,
+                        dtype=torch.bool,
+                    )
+                if action_mask is not None and enable_action_state_attention_masks:
+                    model_mask_kwargs["action_token_mask"] = action_mask.to(
+                        device=self._device,
+                        dtype=torch.bool,
+                    ).any(dim=2)
+                if state_mask is not None and enable_action_state_attention_masks:
+                    model_mask_kwargs["state_token_mask"] = state_mask.to(
+                        device=self._device,
+                        dtype=torch.bool,
+                    ).any(dim=2)
 
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
-            if actions.numel() > 0:
-                video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
-                    state=state_features, embodiment_id=embodiment_id,
-                    action=noisy_actions, timestep_action=timestep_action,
-                    clean_x=latents.transpose(1, 2),
-                    **model_mask_kwargs,
-                )
-            else:
-                video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
-                    clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
-                    state=state_features, embodiment_id=embodiment_id,
-                    clean_x=latents.transpose(1, 2),
-                    **model_mask_kwargs,
-                )
+            with nvtx_range("dreamzero.forward.mot_model"):
+                if actions.numel() > 0:
+                    video_noise_pred, action_noise_pred = self.model(
+                        noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
+                        state=state_features, embodiment_id=embodiment_id,
+                        action=noisy_actions, timestep_action=timestep_action,
+                        clean_x=latents.transpose(1, 2),
+                        **model_mask_kwargs,
+                    )
+                else:
+                    video_noise_pred, action_noise_pred = self.model(
+                        noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
+                        clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
+                        state=state_features, embodiment_id=embodiment_id,
+                        clean_x=latents.transpose(1, 2),
+                        **model_mask_kwargs,
+                    )
 
             self._debug_finite("video_noise_pred", video_noise_pred)
             self._debug_finite("action_noise_pred", action_noise_pred)
@@ -1100,30 +1119,31 @@ class WANPolicyHead(ActionHead):
             # Per-sample dynamics loss
             # DiT patch_embedding uses stride (1,2,2), so output spatial size can be smaller than
             # latent when H or W is odd (e.g. latent 11x20 -> model output 10x20). Crop target to match.
-            if training_target.shape != video_noise_pred.shape:
-                training_target = training_target[
-                    ..., : video_noise_pred.shape[3], : video_noise_pred.shape[4]
-                ]
-            dynamics_loss_per_sample = torch.nn.functional.mse_loss(
-                video_noise_pred.float(), training_target.float(), reduction='none'
-            ).mean(dim=(1,3,4))  # shape: [B, ...]
+            with nvtx_range("dreamzero.forward.loss"):
+                if training_target.shape != video_noise_pred.shape:
+                    training_target = training_target[
+                        ..., : video_noise_pred.shape[3], : video_noise_pred.shape[4]
+                    ]
+                dynamics_loss_per_sample = torch.nn.functional.mse_loss(
+                    video_noise_pred.float(), training_target.float(), reduction='none'
+                ).mean(dim=(1,3,4))  # shape: [B, ...]
 
-            weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
-            if latent_frame_mask is not None:
-                weighted_dynamics_loss = self._masked_mean(weight_dynamics, latent_frame_mask, dim=1).mean()
-            else:
-                weighted_dynamics_loss = weight_dynamics.mean()
+                weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
+                if latent_frame_mask is not None:
+                    weighted_dynamics_loss = self._masked_mean(weight_dynamics, latent_frame_mask, dim=1).mean()
+                else:
+                    weighted_dynamics_loss = weight_dynamics.mean()
 
-            if actions.numel() > 0:
-                weighted_action_loss = self._masked_weighted_action_loss(
-                    action_pred=action_noise_pred,
-                    training_target_action=training_target_action,
-                    action_mask=action_mask,
-                    has_real_action=has_real_action,
-                    timestep_action=timestep_action,
-                )
-            else:
-                weighted_action_loss = torch.tensor(0.0, device=self._device)
+                if actions.numel() > 0:
+                    weighted_action_loss = self._masked_weighted_action_loss(
+                        action_pred=action_noise_pred,
+                        training_target_action=training_target_action,
+                        action_mask=action_mask,
+                        has_real_action=has_real_action,
+                        timestep_action=timestep_action,
+                    )
+                else:
+                    weighted_action_loss = torch.tensor(0.0, device=self._device)
 
             dynamics_loss_weight = float(getattr(self.config, "dynamics_loss_weight", 1.0))
             action_loss_weight = float(getattr(self.config, "action_loss_weight", 1.0))

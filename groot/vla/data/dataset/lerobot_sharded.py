@@ -1,4 +1,5 @@
 from concurrent.futures import Future, ThreadPoolExecutor
+import os
 from pathlib import Path
 import time
 
@@ -1693,6 +1694,12 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         self.curr_shard_index = -1
         self._sample_rng = np.random.default_rng(self.seed)
         self._sampled_steps_by_schedule_index: dict[int, list[tuple[int, int]]] = {}
+        emit_sample_meta = os.environ.get("DREAMZERO_EMIT_SAMPLE_META", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if not self.cache_next_shard():
             return
         for schedule_index, (dataset_index, shard_index) in enumerate(self.shards_sample_schedule):
@@ -1727,6 +1734,13 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                 # Skip samples where state or action would be empty
                 if step_data is not None:
                     transformed = dataset.transforms(step_data)
+                    if emit_sample_meta:
+                        transformed = dict(transformed)
+                        transformed["_sample_dataset_index"] = np.asarray(dataset_index, dtype=np.int64)
+                        transformed["_sample_shard_index"] = np.asarray(shard_index, dtype=np.int64)
+                        transformed["_sample_schedule_index"] = np.asarray(schedule_index, dtype=np.int64)
+                        transformed["_sample_trajectory_id"] = np.asarray(trajectory_id, dtype=np.int64)
+                        transformed["_sample_step_index"] = np.asarray(step_index, dtype=np.int64)
                     yield transformed
 
             # Delete the cached shard and shard start indices to free up memory

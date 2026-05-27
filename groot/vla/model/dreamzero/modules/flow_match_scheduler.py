@@ -1,5 +1,7 @@
 import torch
 
+from groot.vla.utils.nvtx_utils import nvtx_range
+
 
 
 class FlowMatchScheduler():
@@ -71,21 +73,22 @@ class FlowMatchScheduler():
     #     return sample
     
     def add_noise(self, original_samples, noise, timestep):
-        if not isinstance(timestep, torch.Tensor):
-            timestep = torch.as_tensor(timestep)
-        lookup_device = timestep.device
-        flat_timestep = timestep.reshape(-1)
-        scheduler_timesteps = self.timesteps.to(device=lookup_device)
-        timestep_id = torch.argmin(
-            (scheduler_timesteps.unsqueeze(1) - flat_timestep.unsqueeze(0)).abs(),
-            dim=0,
-        )
-        sigma = self.sigmas.to(device=lookup_device, dtype=original_samples.dtype)[timestep_id]
-        sigma = sigma.reshape(timestep.shape).to(device=original_samples.device)
-        while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
-        sample = (1 - sigma) * original_samples + sigma * noise
-        return sample
+        with nvtx_range("dreamzero.scheduler.add_noise"):
+            if not isinstance(timestep, torch.Tensor):
+                timestep = torch.as_tensor(timestep)
+            lookup_device = timestep.device
+            flat_timestep = timestep.reshape(-1)
+            scheduler_timesteps = self.timesteps.to(device=lookup_device)
+            timestep_id = torch.argmin(
+                (scheduler_timesteps.unsqueeze(1) - flat_timestep.unsqueeze(0)).abs(),
+                dim=0,
+            )
+            sigma = self.sigmas.to(device=lookup_device, dtype=original_samples.dtype)[timestep_id]
+            sigma = sigma.reshape(timestep.shape).to(device=original_samples.device)
+            while len(sigma.shape) < len(original_samples.shape):
+                sigma = sigma.unsqueeze(-1)
+            sample = (1 - sigma) * original_samples + sigma * noise
+            return sample
 
     def training_target(self, sample, noise, timestep):
         target = noise - sample
@@ -93,14 +96,15 @@ class FlowMatchScheduler():
     
 
     def training_weight(self, timestep):
-        if not isinstance(timestep, torch.Tensor):
-            timestep = torch.as_tensor(timestep)
-        lookup_device = timestep.device
-        flat_timestep = timestep.reshape(-1)
-        scheduler_timesteps = self.timesteps.to(device=lookup_device)
-        timestep_id = torch.argmin(
-            (scheduler_timesteps.unsqueeze(1) - flat_timestep.unsqueeze(0)).abs(),
-            dim=0,
-        )
-        weights = self.linear_timesteps_weights.to(device=lookup_device)[timestep_id]
-        return weights.reshape(timestep.shape)
+        with nvtx_range("dreamzero.scheduler.training_weight"):
+            if not isinstance(timestep, torch.Tensor):
+                timestep = torch.as_tensor(timestep)
+            lookup_device = timestep.device
+            flat_timestep = timestep.reshape(-1)
+            scheduler_timesteps = self.timesteps.to(device=lookup_device)
+            timestep_id = torch.argmin(
+                (scheduler_timesteps.unsqueeze(1) - flat_timestep.unsqueeze(0)).abs(),
+                dim=0,
+            )
+            weights = self.linear_timesteps_weights.to(device=lookup_device)[timestep_id]
+            return weights.reshape(timestep.shape)

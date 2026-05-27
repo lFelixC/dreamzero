@@ -1,6 +1,7 @@
 from typing import Any, TypeAlias
 
 from groot.vla.model.dreamzero.modules.wan2_1_attention import AttentionModule
+from groot.vla.utils.nvtx_utils import nvtx_range
 from groot.vla.model.n1_5.modules.action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
@@ -643,19 +644,21 @@ class CausalWanSelfAttention(nn.Module):
         output = torch.empty_like(clean_image_q)
 
         first_end = min(self.frame_seqlen, total_len)
-        output[:, :first_end] = self.attn(
-            clean_image_q[:, :first_end],
-            clean_image_k[:, :first_end],
-            clean_image_v[:, :first_end],
-        )
-
-        for block_start in range(self.frame_seqlen, total_len, block_size):
-            block_end = min(block_start + block_size, total_len)
-            output[:, block_start:block_end] = self.attn(
-                clean_image_q[:, block_start:block_end],
-                clean_image_k[:, :block_end],
-                clean_image_v[:, :block_end],
+        with nvtx_range("dreamzero.video_tf.clean.first_attn"):
+            output[:, :first_end] = self.attn(
+                clean_image_q[:, :first_end],
+                clean_image_k[:, :first_end],
+                clean_image_v[:, :first_end],
             )
+
+        for block_idx, block_start in enumerate(range(self.frame_seqlen, total_len, block_size)):
+            block_end = min(block_start + block_size, total_len)
+            with nvtx_range(f"dreamzero.video_tf.clean.block.{block_idx}.attn"):
+                output[:, block_start:block_end] = self.attn(
+                    clean_image_q[:, block_start:block_end],
+                    clean_image_k[:, :block_end],
+                    clean_image_v[:, :block_end],
+                )
 
         return output
 
@@ -678,34 +681,37 @@ class CausalWanSelfAttention(nn.Module):
         output = torch.empty_like(noisy_image_q)
 
         first_end = min(self.frame_seqlen, total_len)
-        output[:, :first_end] = self.attn(
-            noisy_image_q[:, :first_end],
-            noisy_image_k[:, :first_end],
-            noisy_image_v[:, :first_end],
-        )
+        with nvtx_range("dreamzero.video_tf.noisy.first_attn"):
+            output[:, :first_end] = self.attn(
+                noisy_image_q[:, :first_end],
+                noisy_image_k[:, :first_end],
+                noisy_image_v[:, :first_end],
+            )
 
-        for block_start in range(self.frame_seqlen, total_len, block_size):
+        for block_idx, block_start in enumerate(range(self.frame_seqlen, total_len, block_size)):
             block_end = min(block_start + block_size, total_len)
             clean_end = min(block_start, clean_image_k.shape[1])
-            k_context = torch.cat(
-                [
-                    clean_image_k[:, :clean_end],
-                    noisy_image_k[:, block_start:block_end],
-                ],
-                dim=1,
-            )
-            v_context = torch.cat(
-                [
-                    clean_image_v[:, :clean_end],
-                    noisy_image_v[:, block_start:block_end],
-                ],
-                dim=1,
-            )
-            output[:, block_start:block_end] = self.attn(
-                noisy_image_q[:, block_start:block_end],
-                k_context,
-                v_context,
-            )
+            with nvtx_range(f"dreamzero.video_tf.noisy.block.{block_idx}.cat"):
+                k_context = torch.cat(
+                    [
+                        clean_image_k[:, :clean_end],
+                        noisy_image_k[:, block_start:block_end],
+                    ],
+                    dim=1,
+                )
+                v_context = torch.cat(
+                    [
+                        clean_image_v[:, :clean_end],
+                        noisy_image_v[:, block_start:block_end],
+                    ],
+                    dim=1,
+                )
+            with nvtx_range(f"dreamzero.video_tf.noisy.block.{block_idx}.attn"):
+                output[:, block_start:block_end] = self.attn(
+                    noisy_image_q[:, block_start:block_end],
+                    k_context,
+                    v_context,
+                )
 
         return output
     
