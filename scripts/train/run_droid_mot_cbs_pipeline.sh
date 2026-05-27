@@ -1,0 +1,90 @@
+#!/bin/bash
+set -euo pipefail
+
+# Full CBS pipeline: warmup to the reference LR, then run branch training
+# sequentially from the warmup checkpoint.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero}"
+PYTHON_BIN="${PYTHON_BIN:-${DREAMZERO_ROOT}/.venv/bin/python}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
+CBS_ROOT="${CBS_ROOT:-${CHECKPOINT_ROOT}/cbs_mot_droid}"
+CBS_RUN_ID="${CBS_RUN_ID:-$(date -u +%Y%m%d_%H%M%S)_pipeline}"
+
+BASE_GLOBAL_BATCH_SIZE="${BASE_GLOBAL_BATCH_SIZE:-128}"
+BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-1.5e-5}"
+REFERENCE_MAX_STEPS="${REFERENCE_MAX_STEPS:-100000}"
+REFERENCE_WARMUP_RATIO="${REFERENCE_WARMUP_RATIO:-0.05}"
+CBS_BASE_STEPS="${CBS_BASE_STEPS:-4096}"
+CBS_BATCHES="${CBS_BATCHES:-128 256 512 1024}"
+ACTION_LOSS_WEIGHT="${ACTION_LOSS_WEIGHT:-2.0}"
+WARMUP_PER_DEVICE_BS="${WARMUP_PER_DEVICE_BS:-16}"
+BRANCH_PER_DEVICE_BS="${BRANCH_PER_DEVICE_BS:-32}"
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
+
+WARMUP_STEPS="${WARMUP_STEPS:-$("${PYTHON_BIN}" - <<PY
+import math
+print(int(math.ceil(float("${REFERENCE_MAX_STEPS}") * float("${REFERENCE_WARMUP_RATIO}"))))
+PY
+)}"
+
+WARMUP_OUTPUT_DIR="${WARMUP_OUTPUT_DIR:-${CBS_ROOT}/${CBS_RUN_ID}/warmup_b${BASE_GLOBAL_BATCH_SIZE}_lr${BASE_LEARNING_RATE}_steps${WARMUP_STEPS}}"
+WARMUP_CKPT="${WARMUP_CKPT:-${WARMUP_OUTPUT_DIR}/checkpoint-${WARMUP_STEPS}}"
+LOG_DIR="${LOG_DIR:-${CBS_ROOT}/${CBS_RUN_ID}/logs}"
+mkdir -p "${LOG_DIR}"
+PIPELINE_LOG="${PIPELINE_LOG:-${LOG_DIR}/pipeline_$(date -u +%Y%m%d_%H%M%S).log}"
+
+exec > >(tee -a "${PIPELINE_LOG}") 2>&1
+
+cd "${DREAMZERO_ROOT}"
+
+echo "========== DROID MoT CBS full pipeline =========="
+echo "CBS_RUN_ID=${CBS_RUN_ID}"
+echo "WARMUP_OUTPUT_DIR=${WARMUP_OUTPUT_DIR}"
+echo "WARMUP_CKPT=${WARMUP_CKPT}"
+echo "BASE_GLOBAL_BATCH_SIZE=${BASE_GLOBAL_BATCH_SIZE}"
+echo "BASE_LEARNING_RATE=${BASE_LEARNING_RATE}"
+echo "WARMUP_STEPS=${WARMUP_STEPS}"
+echo "WARMUP_PER_DEVICE_BS=${WARMUP_PER_DEVICE_BS}"
+echo "CBS_BATCHES=${CBS_BATCHES}"
+echo "CBS_BASE_STEPS=${CBS_BASE_STEPS}"
+echo "BRANCH_PER_DEVICE_BS=${BRANCH_PER_DEVICE_BS}"
+echo "USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING}"
+echo "ACTION_LOSS_WEIGHT=${ACTION_LOSS_WEIGHT}"
+echo "PIPELINE_LOG=${PIPELINE_LOG}"
+echo "================================================="
+
+if [[ ! -d "${WARMUP_CKPT}" ]]; then
+  echo "----- Starting warmup -----"
+  CBS_RUN_ID="${CBS_RUN_ID}" \
+  BASE_GLOBAL_BATCH_SIZE="${BASE_GLOBAL_BATCH_SIZE}" \
+  BASE_LEARNING_RATE="${BASE_LEARNING_RATE}" \
+  REFERENCE_MAX_STEPS="${REFERENCE_MAX_STEPS}" \
+  REFERENCE_WARMUP_RATIO="${REFERENCE_WARMUP_RATIO}" \
+  WARMUP_STEPS="${WARMUP_STEPS}" \
+  OUTPUT_DIR="${WARMUP_OUTPUT_DIR}" \
+  PER_DEVICE_BS="${WARMUP_PER_DEVICE_BS}" \
+  USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING}" \
+  ACTION_LOSS_WEIGHT="${ACTION_LOSS_WEIGHT}" \
+  bash "${SCRIPT_DIR}/run_droid_mot_cbs_warmup.sh"
+else
+  echo "Warmup checkpoint already exists, skipping warmup: ${WARMUP_CKPT}"
+fi
+
+if [[ ! -d "${WARMUP_CKPT}" ]]; then
+  echo "ERROR: Expected warmup checkpoint was not created: ${WARMUP_CKPT}"
+  exit 1
+fi
+
+echo "----- Starting sequential CBS branches -----"
+WARMUP_CKPT="${WARMUP_CKPT}" \
+CBS_BATCHES="${CBS_BATCHES}" \
+BASE_GLOBAL_BATCH_SIZE="${BASE_GLOBAL_BATCH_SIZE}" \
+BASE_LEARNING_RATE="${BASE_LEARNING_RATE}" \
+CBS_BASE_STEPS="${CBS_BASE_STEPS}" \
+ACTION_LOSS_WEIGHT="${ACTION_LOSS_WEIGHT}" \
+PER_DEVICE_BS="${BRANCH_PER_DEVICE_BS}" \
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING}" \
+bash "${SCRIPT_DIR}/run_droid_mot_cbs_sweep.sh"
+
+echo "========== CBS pipeline complete: ${CBS_RUN_ID} =========="
