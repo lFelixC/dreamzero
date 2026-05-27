@@ -103,6 +103,8 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=8,
         metadata={"help": "Number of full video-expert refresh steps in MoT decoupled_denoise inference: 5, 6, 7, 8, or 16."},
     )
+    dynamics_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the video dynamics loss."})
+    action_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the action denoising loss."})
     input_embedding_dim: int = field(
         default=1536, metadata={"help": "Input embedding channel dimension."}
     )
@@ -1117,14 +1119,26 @@ class WANPolicyHead(ActionHead):
                     has_real_action=has_real_action,
                     timestep_action=timestep_action,
                 )
-                loss = weighted_dynamics_loss + weighted_action_loss
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
-                loss = weighted_dynamics_loss
+
+            dynamics_loss_weight = float(getattr(self.config, "dynamics_loss_weight", 1.0))
+            action_loss_weight = float(getattr(self.config, "action_loss_weight", 1.0))
+            if dynamics_loss_weight < 0.0 or action_loss_weight < 0.0:
+                raise ValueError(
+                    "Loss weights must be non-negative: "
+                    f"dynamics_loss_weight={dynamics_loss_weight}, "
+                    f"action_loss_weight={action_loss_weight}"
+                )
+            dynamics_loss_contribution = weighted_dynamics_loss * dynamics_loss_weight
+            action_loss_contribution = weighted_action_loss * action_loss_weight
+            loss = dynamics_loss_contribution + action_loss_contribution
             # loss = dynamics_loss_per_sample.mean()
 
             self._debug_finite("weighted_dynamics_loss", weighted_dynamics_loss)
             self._debug_finite("weighted_action_loss", weighted_action_loss)
+            self._debug_finite("dynamics_loss_contribution", dynamics_loss_contribution)
+            self._debug_finite("action_loss_contribution", action_loss_contribution)
             self._debug_finite("loss", loss)
 
         # Record log
@@ -1132,6 +1146,10 @@ class WANPolicyHead(ActionHead):
             "loss": loss,
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
+            "dynamics_loss_contribution": dynamics_loss_contribution,
+            "action_loss_contribution": action_loss_contribution,
+            "loss_weight_dynamics": torch.tensor(dynamics_loss_weight, device=self._device),
+            "loss_weight_action": torch.tensor(action_loss_weight, device=self._device),
         }
 
         return BatchFeature(data=output_dict)

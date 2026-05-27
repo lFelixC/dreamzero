@@ -64,6 +64,8 @@ from groot.vla.utils.checkpoint_sidecar import (
 from groot.vla.utils.nvtx_utils import nvtx_enabled, nvtx_range
 from groot.vla.utils.timer import ContextTimer
 
+logger = logging.getLogger(__name__)
+
 # Fix resume: https://github.com/huggingface/transformers/pull/34632/files
 np_core = np.core
 allowlist = [np_core.multiarray._reconstruct, np.ndarray, np.dtype]
@@ -101,18 +103,31 @@ class LossLoggerCallback(TrainerCallback):
             "loss",
             "dynamics_loss_avg",
             "action_loss_avg",
+            "dynamics_loss_contribution_avg",
+            "action_loss_contribution_avg",
             "train/loss_total",
             "train/loss_video",
             "train/loss_action",
+            "train/loss_video_contribution",
+            "train/loss_action_contribution",
+            "train/loss_weight_dynamics",
+            "train/loss_weight_action",
             "val/loss_total",
             "val/loss_video",
             "val/loss_action",
+            "val/loss_video_contribution",
+            "val/loss_action_contribution",
             "learning_rate",
         ):
             if key in logs:
                 entry[key] = logs[key]
         for key, value in logs.items():
-            if key.startswith("train/mot_") or key.startswith("mot_"):
+            if (
+                key.startswith("train/mot_")
+                or key.startswith("mot_")
+                or key.startswith("train/grad_conflict/")
+                or key.startswith("grad_conflict/")
+            ):
                 entry[key] = value
         if len(entry) > 1:  # more than just "step"
             with open(self.output_path, "a") as f:
@@ -460,6 +475,23 @@ class BaseTrainer(transformers.Trainer):
         self._last_forward_seconds = None
         self._last_loss_logging_seconds = None
         self._last_backward_seconds = None
+        self.track_loss_grad_conflict = self._coerce_bool(
+            kwargs.pop("track_loss_grad_conflict", False)
+        )
+        if "DREAMZERO_TRACK_GRAD_CONFLICT" in os.environ:
+            self.track_loss_grad_conflict = self._coerce_bool(
+                os.environ["DREAMZERO_TRACK_GRAD_CONFLICT"]
+            )
+        self.grad_conflict_logging_steps = self._coerce_positive_int(
+            kwargs.pop("grad_conflict_logging_steps", 10),
+            default=10,
+        )
+        if "DREAMZERO_GRAD_CONFLICT_LOGGING_STEPS" in os.environ:
+            self.grad_conflict_logging_steps = self._coerce_positive_int(
+                os.environ["DREAMZERO_GRAD_CONFLICT_LOGGING_STEPS"],
+                default=self.grad_conflict_logging_steps,
+            )
+        self._grad_conflict_disabled_warning_printed = False
         if self.timing_debug:
             timing_dir = Path(self.output_dir) / "timing"
             timing_dir.mkdir(parents=True, exist_ok=True)
@@ -509,6 +541,8 @@ class BaseTrainer(transformers.Trainer):
             "loss_total": outputs.get("loss"),
             "loss_video": outputs.get("dynamics_loss"),
             "loss_action": outputs.get("action_loss"),
+            "loss_video_contribution": outputs.get("dynamics_loss_contribution"),
+            "loss_action_contribution": outputs.get("action_loss_contribution"),
         }
         result = {}
         for key, value in aliases.items():
@@ -521,12 +555,299 @@ class BaseTrainer(transformers.Trainer):
     def _metric_aliases(outputs) -> dict[str, float]:
         result = {}
         for key, value in outputs.items():
-            if not key.startswith("mot_"):
+            if not (key.startswith("mot_") or key.startswith("loss_weight_")):
                 continue
             if value is None:
                 continue
             result[key] = value.detach().float().mean().item() if torch.is_tensor(value) else float(value)
         return result
+
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _coerce_positive_int(value, *, default: int) -> int:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(value, 1)
+
+    @staticmethod
+    def _is_mot_action_branch_param(name: str) -> bool:
+        return name.startswith("action_expert.") or ".action_expert." in name
+
+    @staticmethod
+    def _is_action_head_diffusion_param(name: str) -> bool:
+        return name.startswith("action_head.model.") or ".action_head.model." in name
+
+    @staticmethod
+    def _grad_norm_sq(grads, *, device: torch.device) -> torch.Tensor:
+        norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+        for grad in grads:
+            if grad is None:
+                continue
+            grad = grad.detach()
+            norm_sq = norm_sq + grad.float().pow(2).sum()
+        return norm_sq
+
+    @staticmethod
+    def _grad_dot(grads_a, grads_b, *, device: torch.device) -> torch.Tensor:
+        dot = torch.zeros((), device=device, dtype=torch.float32)
+        for grad_a, grad_b in zip(grads_a, grads_b):
+            if grad_a is None or grad_b is None:
+                continue
+            dot = dot + (grad_a.detach().float() * grad_b.detach().float()).sum()
+        return dot
+
+    @staticmethod
+    def _empty_grads(length: int):
+        return (None,) * length
+
+    def _loss_grads(self, loss: torch.Tensor, params: list[torch.nn.Parameter]):
+        if not params or not torch.is_tensor(loss) or not loss.requires_grad:
+            return self._empty_grads(len(params))
+        return torch.autograd.grad(
+            loss,
+            params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+
+    @staticmethod
+    def _average_grad_stat_scalars(scalars: list[torch.Tensor]) -> list[torch.Tensor]:
+        if not scalars:
+            return []
+        stacked = torch.stack([scalar.detach().float() for scalar in scalars])
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stacked, op=torch.distributed.ReduceOp.SUM)
+            stacked = stacked / torch.distributed.get_world_size()
+        return list(stacked.unbind())
+
+    @staticmethod
+    def _cosine_and_conflict(
+        dot: torch.Tensor,
+        norm_a_sq: torch.Tensor,
+        norm_b_sq: torch.Tensor,
+    ) -> tuple[float, float]:
+        norm_a = torch.clamp(norm_a_sq, min=0.0).sqrt()
+        norm_b = torch.clamp(norm_b_sq, min=0.0).sqrt()
+        denom = norm_a * norm_b
+        if denom.item() == 0.0:
+            return float("nan"), 0.0
+        cosine = torch.clamp(dot / denom, min=-1.0, max=1.0).item()
+        return cosine, float(cosine < 0.0)
+
+    def _grad_metric_root_model(self, model):
+        try:
+            return self.accelerator.unwrap_model(model)
+        except Exception:
+            return model
+
+    @staticmethod
+    def _is_mot_architecture(root_model) -> bool:
+        action_head = getattr(root_model, "action_head", None)
+        if action_head is None:
+            return False
+        head_config = getattr(action_head, "config", None)
+        if getattr(head_config, "architecture", "joint") == "mot":
+            return True
+        head_model = getattr(action_head, "model", None)
+        return bool(getattr(head_model, "is_mot_wam", False))
+
+    def _trainable_named_parameters_for_grad_metrics(self, model):
+        root_model = self._grad_metric_root_model(model)
+        named_params = [
+            (name, param)
+            for name, param in root_model.named_parameters()
+            if param.requires_grad
+        ]
+        return root_model, named_params
+
+    def _mot_grad_parameter_groups(
+        self,
+        named_params: list[tuple[str, torch.nn.Parameter]],
+    ) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+        action_params = [
+            param for name, param in named_params if self._is_mot_action_branch_param(name)
+        ]
+        video_params = [
+            param
+            for name, param in named_params
+            if self._is_action_head_diffusion_param(name)
+            and not self._is_mot_action_branch_param(name)
+        ]
+        if not video_params:
+            video_params = [
+                param
+                for name, param in named_params
+                if not self._is_mot_action_branch_param(name)
+            ]
+        return video_params, action_params
+
+    @staticmethod
+    def _first_metric_device(
+        losses: list[torch.Tensor],
+        params: list[torch.nn.Parameter],
+    ) -> torch.device:
+        for loss in losses:
+            if torch.is_tensor(loss):
+                return loss.device
+        for param in params:
+            return param.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _joint_loss_grad_metrics(
+        self,
+        dynamics_loss: torch.Tensor,
+        action_loss: torch.Tensor,
+        named_params: list[tuple[str, torch.nn.Parameter]],
+        dynamics_loss_weight: float = 1.0,
+        action_loss_weight: float = 1.0,
+    ) -> dict[str, float]:
+        params = [param for _, param in named_params]
+        device = self._first_metric_device([dynamics_loss, action_loss], params)
+        dynamics_grads = self._loss_grads(dynamics_loss, params)
+        action_grads = self._loss_grads(action_loss, params)
+
+        dynamics_norm_sq = self._grad_norm_sq(dynamics_grads, device=device)
+        action_norm_sq = self._grad_norm_sq(action_grads, device=device)
+        dot = self._grad_dot(dynamics_grads, action_grads, device=device)
+        del dynamics_grads, action_grads
+
+        dynamics_norm_sq, action_norm_sq, dot = self._average_grad_stat_scalars(
+            [dynamics_norm_sq, action_norm_sq, dot]
+        )
+        cosine, conflict = self._cosine_and_conflict(dot, dynamics_norm_sq, action_norm_sq)
+        return {
+            "grad_conflict/joint/dynamics_grad_norm": dynamics_norm_sq.sqrt().item(),
+            "grad_conflict/joint/action_grad_norm": action_norm_sq.sqrt().item(),
+            "grad_conflict/joint/dynamics_contrib_grad_norm": (
+                abs(dynamics_loss_weight) * dynamics_norm_sq.sqrt().item()
+            ),
+            "grad_conflict/joint/action_contrib_grad_norm": (
+                abs(action_loss_weight) * action_norm_sq.sqrt().item()
+            ),
+            "grad_conflict/joint/dynamics_action_cosine": cosine,
+            "grad_conflict/joint/is_conflict": conflict,
+        }
+
+    def _mot_loss_grad_metrics(
+        self,
+        dynamics_loss: torch.Tensor,
+        action_loss: torch.Tensor,
+        named_params: list[tuple[str, torch.nn.Parameter]],
+        dynamics_loss_weight: float = 1.0,
+        action_loss_weight: float = 1.0,
+    ) -> dict[str, float]:
+        video_params, action_params = self._mot_grad_parameter_groups(named_params)
+        all_action_loss_params = video_params + action_params
+        device = self._first_metric_device(
+            [dynamics_loss, action_loss],
+            all_action_loss_params or video_params,
+        )
+
+        dynamics_video_grads = self._loss_grads(dynamics_loss, video_params)
+        action_loss_grads = self._loss_grads(action_loss, all_action_loss_params)
+        action_video_grads = action_loss_grads[: len(video_params)]
+        action_action_grads = action_loss_grads[len(video_params) :]
+
+        dynamics_video_norm_sq = self._grad_norm_sq(dynamics_video_grads, device=device)
+        action_video_norm_sq = self._grad_norm_sq(action_video_grads, device=device)
+        action_action_norm_sq = self._grad_norm_sq(action_action_grads, device=device)
+        video_dot = self._grad_dot(dynamics_video_grads, action_video_grads, device=device)
+        del dynamics_video_grads, action_loss_grads, action_video_grads, action_action_grads
+
+        (
+            dynamics_video_norm_sq,
+            action_video_norm_sq,
+            action_action_norm_sq,
+            video_dot,
+        ) = self._average_grad_stat_scalars(
+            [
+                dynamics_video_norm_sq,
+                action_video_norm_sq,
+                action_action_norm_sq,
+                video_dot,
+            ]
+        )
+        cosine, conflict = self._cosine_and_conflict(
+            video_dot,
+            dynamics_video_norm_sq,
+            action_video_norm_sq,
+        )
+        return {
+            "grad_conflict/mot/dynamics_video_grad_norm": dynamics_video_norm_sq.sqrt().item(),
+            "grad_conflict/mot/action_video_grad_norm": action_video_norm_sq.sqrt().item(),
+            "grad_conflict/mot/action_action_grad_norm": action_action_norm_sq.sqrt().item(),
+            "grad_conflict/mot/dynamics_video_contrib_grad_norm": (
+                abs(dynamics_loss_weight) * dynamics_video_norm_sq.sqrt().item()
+            ),
+            "grad_conflict/mot/action_video_contrib_grad_norm": (
+                abs(action_loss_weight) * action_video_norm_sq.sqrt().item()
+            ),
+            "grad_conflict/mot/action_action_contrib_grad_norm": (
+                abs(action_loss_weight) * action_action_norm_sq.sqrt().item()
+            ),
+            "grad_conflict/mot/video_dynamics_action_cosine": cosine,
+            "grad_conflict/mot/video_is_conflict": conflict,
+        }
+
+    @staticmethod
+    def _output_scalar(outputs, key: str, default: float) -> float:
+        value = outputs.get(key)
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            return value.detach().float().mean().item()
+        return float(value)
+
+    def _maybe_log_loss_grad_metrics(self, model, outputs) -> None:
+        if not self.track_loss_grad_conflict:
+            return
+        if self.current_step % self.grad_conflict_logging_steps != 0:
+            return
+        dynamics_loss = outputs.get("dynamics_loss")
+        action_loss = outputs.get("action_loss")
+        if not torch.is_tensor(dynamics_loss) or not torch.is_tensor(action_loss):
+            return
+
+        try:
+            dynamics_loss_weight = self._output_scalar(outputs, "loss_weight_dynamics", 1.0)
+            action_loss_weight = self._output_scalar(outputs, "loss_weight_action", 1.0)
+            root_model, named_params = self._trainable_named_parameters_for_grad_metrics(model)
+            if not named_params:
+                return
+            if self._is_mot_architecture(root_model):
+                metrics = self._mot_loss_grad_metrics(
+                    dynamics_loss,
+                    action_loss,
+                    named_params,
+                    dynamics_loss_weight=dynamics_loss_weight,
+                    action_loss_weight=action_loss_weight,
+                )
+            else:
+                metrics = self._joint_loss_grad_metrics(
+                    dynamics_loss,
+                    action_loss,
+                    named_params,
+                    dynamics_loss_weight=dynamics_loss_weight,
+                    action_loss_weight=action_loss_weight,
+                )
+        except RuntimeError:
+            if not self._grad_conflict_disabled_warning_printed:
+                logger.exception("Disabling DreamZero loss-gradient conflict metrics after failure.")
+                self._grad_conflict_disabled_warning_printed = True
+            self.track_loss_grad_conflict = False
+            return
+
+        self.log({f"train/{key}": value for key, value in metrics.items()})
 
     def _install_backward_nvtx_wrapper(self) -> None:
         original_backward = self.accelerator.backward
@@ -758,6 +1079,8 @@ class BaseTrainer(transformers.Trainer):
             self._last_loss_logging_seconds = self._timing_elapsed(loss_log_start)
 
         loss = outputs["loss"]
+        if model.training:
+            self._maybe_log_loss_grad_metrics(model, outputs)
 
         return (loss, outputs) if return_outputs else loss
 

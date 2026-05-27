@@ -23,6 +23,8 @@ trainer:
   train_dataset: ???                          # train_dataset
   compute_dtype: ???                          # dtype_from_string(model.config.model_dtype)
   benchmark_time: false                       # whether or not to benchmark time for training
+  track_loss_grad_conflict: false             # log per-loss grad norms/cosines for joint and MoT WAMs
+  grad_conflict_logging_steps: 10             # interval for the extra autograd.grad probes
   # Legacy per-step profiling (profiles every N steps)
   enable_profiling: false                     # (legacy) enable per-step profiling in training_step
   profiling_steps: 5                          # (legacy) profile every N steps
