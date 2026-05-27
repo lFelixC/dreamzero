@@ -28,7 +28,7 @@ PER_DEVICE_BS=1                  # 320x640 + frame_seqlen=200 先用保守 micro
 DEEPSPEED_CFG="zero2_offload"    # 这一版 token 数是原 5B 50-token 配置的 4 倍，默认走 offload 更稳
 MAX_STEPS=50000                  # 总训练步数
 SAVE_STEPS=500                   # 更密一点存 checkpoint，方便早停
-MAX_CHUNK_SIZE=2                 # 大分辨率先把 chunk 控小，减少显存压力
+MAX_CHUNK_SIZE=4                 # 数据 / 序列 chunk 上限
 MODEL_TARGET_HEIGHT=320          # DROID composite 最终分辨率：320x640
 MODEL_TARGET_WIDTH=640
 MODEL_FRAME_SEQLEN=200           # (320/16/2) * (640/16/2) = 10 * 20 = 200
@@ -137,7 +137,7 @@ TRAIN_OVERRIDES=(
     "action_head_cfg.config.target_video_height=${MODEL_TARGET_HEIGHT}"         # 不再把 320x640 composite 压回 160x320
     "action_head_cfg.config.target_video_width=${MODEL_TARGET_WIDTH}"
     "save_lora_only=false"                                                      # 全量微调时保存完整权重，不只保存 LoRA
-    "max_chunk_size=${MAX_CHUNK_SIZE}"                                          # 大分辨率下默认更保守
+    "max_chunk_size=${MAX_CHUNK_SIZE}"                                          # 数据 / 序列 chunk 上限
     "save_strategy=steps"                                                       # 按 step 保存，而不是按 epoch
     "droid_data_root=${DROID_DATA_ROOT}"                                        # DROID LeRobot 数据集根目录
     "dit_version=${WAN22_CKPT_DIR}"                                             # Wan2.2 主权重目录

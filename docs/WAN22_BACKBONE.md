@@ -136,6 +136,7 @@ The Wan2.2 config (`wan_flow_matching_action_tf_wan22.yaml`) overrides:
 
 For other resolutions, `frame_seqlen` must match patch output per frame; use H and W divisible by 32 for even latent:
 - 160×320 (H×W): latent 10×20 → 50
+- 320×640 (H×W): latent 20×40 → 200
 - 176×320: latent 11×20 → 50 (odd H; loss uses crop)
 - 640×352: 220
 
@@ -165,5 +166,10 @@ dreamzero/
 └── docs/
     └── WAN22_BACKBONE.md          # This file
 ```
+
+The high-resolution local Wan2.2 launcher,
+`scripts/train/droid_training_full_finetune_wan22_local_320x640.sh`, keeps the
+320×640 DROID composite, sets `frame_seqlen=200`, and uses the normal
+`max_chunk_size=4`.
 
 The action head (`wan_flow_matching_action_tf.py`) automatically detects Wan2.2 vs Wan2.1 based on `in_dim` (48 vs 16) and `vae.z_dim` (48 vs 16), and loads the correct checkpoint files from the appropriate HuggingFace repos when local paths are not found.

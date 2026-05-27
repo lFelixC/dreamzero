@@ -295,6 +295,15 @@ export DEEPSPEED_CFG=zero2_offload
 bash scripts/train/droid_training_full_finetune_wan22.sh
 ```
 
+For the local high-resolution DROID composite recipe, use:
+
+```bash
+bash scripts/train/droid_training_full_finetune_wan22_local_320x640.sh
+```
+
+That launcher keeps the composite at `320x640`, sets `frame_seqlen=200`, and
+uses the normal `max_chunk_size=4`.
+
 ## 7. What Is Different From the Main README
 
 - Uses `uv venv` + `uv pip`
