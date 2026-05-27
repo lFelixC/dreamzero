@@ -125,8 +125,8 @@ class LossLoggerCallback(TrainerCallback):
             if (
                 key.startswith("train/mot_")
                 or key.startswith("mot_")
-                or key.startswith("train/grad_conflict/")
-                or key.startswith("grad_conflict/")
+                or key.startswith("train/local_grad/")
+                or key.startswith("local_grad/")
             ):
                 entry[key] = value
         if len(entry) > 1:  # more than just "step"
@@ -475,23 +475,28 @@ class BaseTrainer(transformers.Trainer):
         self._last_forward_seconds = None
         self._last_loss_logging_seconds = None
         self._last_backward_seconds = None
-        self.track_loss_grad_conflict = self._coerce_bool(
-            kwargs.pop("track_loss_grad_conflict", False)
-        )
-        if "DREAMZERO_TRACK_GRAD_CONFLICT" in os.environ:
-            self.track_loss_grad_conflict = self._coerce_bool(
-                os.environ["DREAMZERO_TRACK_GRAD_CONFLICT"]
+        legacy_track_loss_grad = kwargs.pop("track_loss_grad_conflict", None)
+        self.track_loss_grad = self._coerce_bool(
+            kwargs.pop(
+                "track_loss_grad",
+                legacy_track_loss_grad if legacy_track_loss_grad is not None else False,
             )
-        self.grad_conflict_logging_steps = self._coerce_positive_int(
-            kwargs.pop("grad_conflict_logging_steps", 10),
+        )
+        if "DREAMZERO_TRACK_LOSS_GRAD" in os.environ:
+            self.track_loss_grad = self._coerce_bool(os.environ["DREAMZERO_TRACK_LOSS_GRAD"])
+        self.loss_grad_logging_steps = self._coerce_positive_int(
+            kwargs.pop(
+                "loss_grad_logging_steps",
+                kwargs.pop("grad_conflict_logging_steps", 10),
+            ),
             default=10,
         )
-        if "DREAMZERO_GRAD_CONFLICT_LOGGING_STEPS" in os.environ:
-            self.grad_conflict_logging_steps = self._coerce_positive_int(
-                os.environ["DREAMZERO_GRAD_CONFLICT_LOGGING_STEPS"],
-                default=self.grad_conflict_logging_steps,
+        if "DREAMZERO_LOSS_GRAD_LOGGING_STEPS" in os.environ:
+            self.loss_grad_logging_steps = self._coerce_positive_int(
+                os.environ["DREAMZERO_LOSS_GRAD_LOGGING_STEPS"],
+                default=self.loss_grad_logging_steps,
             )
-        self._grad_conflict_disabled_warning_printed = False
+        self._loss_grad_disabled_warning_printed = False
         if self.timing_debug:
             timing_dir = Path(self.output_dir) / "timing"
             timing_dir.mkdir(parents=True, exist_ok=True)
@@ -626,23 +631,29 @@ class BaseTrainer(transformers.Trainer):
             return []
         stacked = torch.stack([scalar.detach().float() for scalar in scalars])
         if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # These are rank-local grad statistics averaged for logging, not the
+            # norm/cosine of the final optimizer gradient after DDP/DeepSpeed reduction.
             torch.distributed.all_reduce(stacked, op=torch.distributed.ReduceOp.SUM)
             stacked = stacked / torch.distributed.get_world_size()
         return list(stacked.unbind())
 
     @staticmethod
-    def _cosine_and_conflict(
+    def _grad_norm_and_contrib(norm_sq: torch.Tensor, loss_weight: float) -> tuple[float, float]:
+        norm = norm_sq.sqrt().item()
+        return norm, abs(loss_weight) * norm
+
+    @staticmethod
+    def _grad_cosine(
         dot: torch.Tensor,
         norm_a_sq: torch.Tensor,
         norm_b_sq: torch.Tensor,
-    ) -> tuple[float, float]:
+    ) -> float:
         norm_a = torch.clamp(norm_a_sq, min=0.0).sqrt()
         norm_b = torch.clamp(norm_b_sq, min=0.0).sqrt()
         denom = norm_a * norm_b
         if denom.item() == 0.0:
-            return float("nan"), 0.0
-        cosine = torch.clamp(dot / denom, min=-1.0, max=1.0).item()
-        return cosine, float(cosine < 0.0)
+            return float("nan")
+        return torch.clamp(dot / denom, min=-1.0, max=1.0).item()
 
     def _grad_metric_root_model(self, model):
         try:
@@ -724,18 +735,19 @@ class BaseTrainer(transformers.Trainer):
         dynamics_norm_sq, action_norm_sq, dot = self._average_grad_stat_scalars(
             [dynamics_norm_sq, action_norm_sq, dot]
         )
-        cosine, conflict = self._cosine_and_conflict(dot, dynamics_norm_sq, action_norm_sq)
+        cosine = self._grad_cosine(dot, dynamics_norm_sq, action_norm_sq)
+        dynamics_norm, dynamics_contrib_norm = self._grad_norm_and_contrib(
+            dynamics_norm_sq, dynamics_loss_weight
+        )
+        action_norm, action_contrib_norm = self._grad_norm_and_contrib(
+            action_norm_sq, action_loss_weight
+        )
         return {
-            "grad_conflict/joint/dynamics_grad_norm": dynamics_norm_sq.sqrt().item(),
-            "grad_conflict/joint/action_grad_norm": action_norm_sq.sqrt().item(),
-            "grad_conflict/joint/dynamics_contrib_grad_norm": (
-                abs(dynamics_loss_weight) * dynamics_norm_sq.sqrt().item()
-            ),
-            "grad_conflict/joint/action_contrib_grad_norm": (
-                abs(action_loss_weight) * action_norm_sq.sqrt().item()
-            ),
-            "grad_conflict/joint/dynamics_action_cosine": cosine,
-            "grad_conflict/joint/is_conflict": conflict,
+            "local_grad/joint/dynamics_grad_norm": dynamics_norm,
+            "local_grad/joint/action_grad_norm": action_norm,
+            "local_grad/joint/dynamics_contrib_grad_norm": dynamics_contrib_norm,
+            "local_grad/joint/action_contrib_grad_norm": action_contrib_norm,
+            "local_grad/joint/dynamics_action_cosine": cosine,
         }
 
     def _mot_loss_grad_metrics(
@@ -777,26 +789,28 @@ class BaseTrainer(transformers.Trainer):
                 video_dot,
             ]
         )
-        cosine, conflict = self._cosine_and_conflict(
+        cosine = self._grad_cosine(
             video_dot,
             dynamics_video_norm_sq,
             action_video_norm_sq,
         )
+        dynamics_video_norm, dynamics_video_contrib_norm = self._grad_norm_and_contrib(
+            dynamics_video_norm_sq, dynamics_loss_weight
+        )
+        action_video_norm, action_video_contrib_norm = self._grad_norm_and_contrib(
+            action_video_norm_sq, action_loss_weight
+        )
+        action_action_norm, action_action_contrib_norm = self._grad_norm_and_contrib(
+            action_action_norm_sq, action_loss_weight
+        )
         return {
-            "grad_conflict/mot/dynamics_video_grad_norm": dynamics_video_norm_sq.sqrt().item(),
-            "grad_conflict/mot/action_video_grad_norm": action_video_norm_sq.sqrt().item(),
-            "grad_conflict/mot/action_action_grad_norm": action_action_norm_sq.sqrt().item(),
-            "grad_conflict/mot/dynamics_video_contrib_grad_norm": (
-                abs(dynamics_loss_weight) * dynamics_video_norm_sq.sqrt().item()
-            ),
-            "grad_conflict/mot/action_video_contrib_grad_norm": (
-                abs(action_loss_weight) * action_video_norm_sq.sqrt().item()
-            ),
-            "grad_conflict/mot/action_action_contrib_grad_norm": (
-                abs(action_loss_weight) * action_action_norm_sq.sqrt().item()
-            ),
-            "grad_conflict/mot/video_dynamics_action_cosine": cosine,
-            "grad_conflict/mot/video_is_conflict": conflict,
+            "local_grad/mot/dynamics_video_grad_norm": dynamics_video_norm,
+            "local_grad/mot/action_video_grad_norm": action_video_norm,
+            "local_grad/mot/action_action_grad_norm": action_action_norm,
+            "local_grad/mot/dynamics_video_contrib_grad_norm": dynamics_video_contrib_norm,
+            "local_grad/mot/action_video_contrib_grad_norm": action_video_contrib_norm,
+            "local_grad/mot/action_action_contrib_grad_norm": action_action_contrib_norm,
+            "local_grad/mot/video_dynamics_action_cosine": cosine,
         }
 
     @staticmethod
@@ -809,9 +823,9 @@ class BaseTrainer(transformers.Trainer):
         return float(value)
 
     def _maybe_log_loss_grad_metrics(self, model, outputs) -> None:
-        if not self.track_loss_grad_conflict:
+        if not self.track_loss_grad:
             return
-        if self.current_step % self.grad_conflict_logging_steps != 0:
+        if self.current_step % self.loss_grad_logging_steps != 0:
             return
         dynamics_loss = outputs.get("dynamics_loss")
         action_loss = outputs.get("action_loss")
@@ -841,10 +855,10 @@ class BaseTrainer(transformers.Trainer):
                     action_loss_weight=action_loss_weight,
                 )
         except RuntimeError:
-            if not self._grad_conflict_disabled_warning_printed:
-                logger.exception("Disabling DreamZero loss-gradient conflict metrics after failure.")
-                self._grad_conflict_disabled_warning_printed = True
-            self.track_loss_grad_conflict = False
+            if not self._loss_grad_disabled_warning_printed:
+                logger.exception("Disabling DreamZero loss-gradient metrics after failure.")
+                self._loss_grad_disabled_warning_printed = True
+            self.track_loss_grad = False
             return
 
         self.log({f"train/{key}": value for key, value in metrics.items()})
@@ -1058,7 +1072,10 @@ class BaseTrainer(transformers.Trainer):
         if model.training:
             ### For additional losses, track and log their moving averages
             for key, value in outputs.items():
-                if key.endswith("_loss") and key != "loss":
+                if (
+                    (key.endswith("_loss") or key.endswith("_loss_contribution"))
+                    and key != "loss"
+                ):
                     # Initialize queue if not exists
                     if key not in self.loss_queues:
                         self.loss_queues[key] = []
