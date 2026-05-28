@@ -48,6 +48,8 @@ action_head_cfg:
     lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
     init_lora_weights: "kaiming"
     train_architecture: ${train_architecture}
+    skip_component_loading: false
+    defer_lora_injection: false
     architecture: ${architecture}
     mot_action_hidden_dim: ${mot_action_hidden_dim}
     mot_action_ffn_dim: ${mot_action_ffn_dim}
