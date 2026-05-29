@@ -986,11 +986,24 @@ class WANPolicyHead(ActionHead):
                     action_block_valid.append(action_token_mask[:, start:end].all(dim=1).all())
                 valid = valid & torch.stack(action_block_valid)
 
+        if dist.is_available() and dist.is_initialized():
+            valid_int = valid.to(dtype=torch.int32)
+            dist.all_reduce(valid_int, op=dist.ReduceOp.MIN)
+            valid = valid_int.to(dtype=torch.bool)
+
         valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
         if valid_indices.numel() == 0:
             raise ValueError(
                 "MoT blockwise causal training found no block with valid video/action/state supervision."
             )
+        if dist.is_available() and dist.is_initialized():
+            selected = torch.empty((), dtype=torch.int64, device=device)
+            if dist.get_rank() == 0:
+                choice = torch.randint(valid_indices.numel(), (1,), device=device)
+                selected.copy_(valid_indices[choice].reshape(()))
+            dist.broadcast(selected, src=0)
+            return int(selected.item())
+
         choice = torch.randint(valid_indices.numel(), (1,), device=device)
         return int(valid_indices[choice].item())
 
@@ -1239,6 +1252,9 @@ class WANPolicyHead(ActionHead):
             num_state_per_block=num_state_per_block,
             device=latents.device,
         )
+        if self._coerce_bool(os.getenv("DREAMZERO_DEBUG_MOT_BLOCK_INDEX", "0")):
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            print(f"[MOT_BLOCK_INDEX][rank={rank}] block_index={block_index} num_blocks={num_blocks}")
         target_start_frame = 1 + block_index * self.num_frame_per_block
         target_end_frame = target_start_frame + self.num_frame_per_block
         action_start = block_index * num_action_per_block
