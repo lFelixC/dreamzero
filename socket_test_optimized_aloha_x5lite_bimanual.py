@@ -61,6 +61,21 @@ class Args:
     rtc_guidance_step_stride: int = 1
 
 
+def _dreamzero_cache_mode(policy: GrootSimPolicy) -> tuple[str | None, bool]:
+    action_head = getattr(getattr(policy, "trained_model", None), "action_head", None)
+    if action_head is None:
+        return None, False
+    model = getattr(action_head, "model", None)
+    if not getattr(model, "is_mot_wam", False):
+        return None, False
+    resolver = getattr(action_head, "_effective_mot_inference_video_mode", None)
+    if callable(resolver):
+        mode = str(resolver(use_rtc=False))
+    else:
+        mode = str(getattr(getattr(action_head, "config", None), "mot_inference_video_mode", "auto"))
+    return mode, mode == "decoupled_denoise"
+
+
 def _normalize_image_array(data: Any, key: str) -> np.ndarray:
     arr = np.asarray(data)
     if arr.ndim not in (3, 4, 5):
@@ -317,6 +332,13 @@ class AlohaBimanualPolicy:
         self._output_dir = output_dir
         self._max_chunk_size = max_chunk_size
         self._use_rtc = use_rtc
+        self._mot_inference_video_mode, self._cache_order_sensitive = _dreamzero_cache_mode(groot_policy)
+        if self._cache_order_sensitive and self._use_rtc:
+            logger.warning(
+                "Disabling server-side RTC for cache-order-sensitive DreamZero mode %s.",
+                self._mot_inference_video_mode,
+            )
+            self._use_rtc = False
         self._rtc_execution_horizon = rtc_execution_horizon
         self._rtc_max_guidance_weight = rtc_max_guidance_weight
         self._rtc_prefix_attention_schedule = rtc_prefix_attention_schedule
@@ -719,6 +741,14 @@ class AlohaBimanualPolicy:
             0,
         )
         rtc_requested = rtc_step_idx is not None
+        if rtc_requested and self._cache_order_sensitive:
+            logger.warning(
+                "Ignoring RTC request because DreamZero mode %s requires in-order causal cache updates.",
+                self._mot_inference_video_mode,
+            )
+            rtc_requested = False
+            rtc_step_idx = None
+            rtc_inference_delay_steps = 0
         if rtc_inference_delay_steps > 0 and not rtc_requested:
             logger.warning(
                 "Received rtc_inference_delay_steps=%d without rtc_step_idx; ignoring RTC delay metadata for this call.",
@@ -910,6 +940,14 @@ def main(args: Args) -> None:
     else:
         image_height, image_width = _get_expected_video_resolution(policy)
         logger.info("Using checkpoint image resolution %dx%d", image_height, image_width)
+    action_head_config = getattr(getattr(policy.trained_model, "action_head", None), "config", None)
+    wam_architecture = getattr(action_head_config, "architecture", None)
+    mot_inference_video_mode, cache_order_sensitive = _dreamzero_cache_mode(policy)
+    if cache_order_sensitive and args.use_rtc:
+        logger.warning(
+            "Checkpoint mode %s is cache-order-sensitive; RTC requests will be ignored.",
+            mot_inference_video_mode,
+        )
 
     output_dir = _build_output_dir(args.output_root, args.model_path, args.index) if rank == 0 else None
     if output_dir:
@@ -937,6 +975,11 @@ def main(args: Args) -> None:
         needs_stereo_camera=False,
         needs_session_id=True,
         action_space="joint_position",
+        wam_architecture=wam_architecture,
+        mot_inference_video_mode=mot_inference_video_mode,
+        cache_order_sensitive=cache_order_sensitive,
+        supports_rtc=not cache_order_sensitive,
+        supports_async_prefetch=not cache_order_sensitive,
     )
 
     if rank == 0:

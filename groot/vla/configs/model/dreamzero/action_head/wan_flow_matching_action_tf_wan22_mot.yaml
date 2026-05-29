@@ -18,3 +18,4 @@ mot_video_noise_beta_alpha: 3.0
 mot_video_noise_beta_beta: 1.0
 mot_decoupled_inference_video_final_noise: 0.8
 mot_decoupled_inference_video_refresh_steps: 8
+mot_decoupled_training_action_steps: null

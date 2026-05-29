@@ -24,6 +24,7 @@ mot_video_noise_beta_alpha: 3.0
 mot_video_noise_beta_beta: 1.0
 mot_decoupled_inference_video_final_noise: 0.8
 mot_decoupled_inference_video_refresh_steps: 8
+mot_decoupled_training_action_steps: null
 dynamics_loss_weight: 1.0
 action_loss_weight: 1.0
 num_frame_per_block: 1
@@ -61,6 +62,7 @@ action_head_cfg:
     mot_video_noise_beta_beta: ${mot_video_noise_beta_beta}
     mot_decoupled_inference_video_final_noise: ${mot_decoupled_inference_video_final_noise}
     mot_decoupled_inference_video_refresh_steps: ${mot_decoupled_inference_video_refresh_steps}
+    mot_decoupled_training_action_steps: ${mot_decoupled_training_action_steps}
     dynamics_loss_weight: ${dynamics_loss_weight}
     action_loss_weight: ${action_loss_weight}
     use_gradient_checkpointing: true

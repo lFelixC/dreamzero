@@ -85,7 +85,7 @@ class WANPolicyHeadConfig(PretrainedConfig):
     )
     mot_decouple_video_action_noise: bool = field(
         default=False,
-        metadata={"help": "MoT full-video training: video uses high-noise Beta timesteps, action uses independent uniform timesteps."},
+        metadata={"help": "MoT full-video decoupled mode: blockwise causal training plus decoupled inference."},
     )
     mot_video_noise_beta_alpha: float = field(
         default=3.0,
@@ -102,6 +102,10 @@ class WANPolicyHeadConfig(PretrainedConfig):
     mot_decoupled_inference_video_refresh_steps: int = field(
         default=8,
         metadata={"help": "Number of full video-expert refresh steps in MoT decoupled_denoise inference: 5, 6, 7, 8, or 16."},
+    )
+    mot_decoupled_training_action_steps: int | None = field(
+        default=None,
+        metadata={"help": "Action-only denoise steps for MoT blockwise causal decoupled training. None matches inference steps."},
     )
     dynamics_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the video dynamics loss."})
     action_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the action denoising loss."})
@@ -500,6 +504,9 @@ class WANPolicyHead(ActionHead):
                     "mot_inference_video_mode=decoupled_denoise requires "
                     "mot_action_video_attention=full_video."
                 )
+        action_steps = getattr(config, "mot_decoupled_training_action_steps", None)
+        if action_steps is not None and int(action_steps) <= 0:
+            raise ValueError("mot_decoupled_training_action_steps must be positive when set.")
 
     def _select_diffusion_model_architecture(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
@@ -880,6 +887,504 @@ class WANPolicyHead(ActionHead):
         action_token_mask = action_mask.any(dim=2)
         return self._masked_mean(weight_action, action_token_mask, dim=1).mean()
 
+    def _uses_mot_decoupled_block_training(self, actions: torch.Tensor) -> bool:
+        return (
+            actions is not None
+            and actions.numel() > 0
+            and getattr(self.model, "is_mot_wam", False)
+            and self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False))
+        )
+
+    def _mot_decoupled_training_action_steps(self) -> int:
+        configured_steps = getattr(self.config, "mot_decoupled_training_action_steps", None)
+        if configured_steps is None:
+            return int(self.num_inference_steps)
+        configured_steps = int(configured_steps)
+        if configured_steps <= 0:
+            raise ValueError("mot_decoupled_training_action_steps must be positive.")
+        return configured_steps
+
+    def _infer_blockwise_training_layout(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor,
+        state_features: torch.Tensor,
+    ) -> tuple[int, int, int]:
+        future_latent_frames = latents.shape[1] - 1
+        if future_latent_frames <= 0 or future_latent_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                "MoT blockwise causal training requires latent frames to be "
+                "1 + N * num_frame_per_block, got "
+                f"latent_frames={latents.shape[1]}, num_frame_per_block={self.num_frame_per_block}."
+            )
+        num_video_blocks = future_latent_frames // self.num_frame_per_block
+
+        if actions.shape[1] % self.model.num_action_per_block != 0:
+            raise ValueError(
+                "Action horizon must form complete action blocks: "
+                f"actions.shape={tuple(actions.shape)}, "
+                f"num_action_per_block={self.model.num_action_per_block}."
+            )
+        if state_features.shape[1] % self.model.num_state_per_block != 0:
+            raise ValueError(
+                "State horizon must form complete state blocks: "
+                f"state_features.shape={tuple(state_features.shape)}, "
+                f"num_state_per_block={self.model.num_state_per_block}."
+            )
+
+        num_action_blocks = actions.shape[1] // self.model.num_action_per_block
+        num_state_blocks = state_features.shape[1] // self.model.num_state_per_block
+        if not (num_video_blocks == num_action_blocks == num_state_blocks):
+            raise ValueError(
+                "MoT blockwise causal training requires equal video/action/state blocks, got "
+                f"video={num_video_blocks}, action={num_action_blocks}, state={num_state_blocks}."
+            )
+        return num_video_blocks, self.model.num_action_per_block, self.model.num_state_per_block
+
+    def _sample_blockwise_training_index(
+        self,
+        latent_frame_mask: torch.Tensor | None,
+        action_mask: torch.Tensor | None,
+        state_mask: torch.Tensor | None,
+        has_real_action: torch.Tensor | None,
+        num_blocks: int,
+        num_action_per_block: int,
+        num_state_per_block: int,
+        device: torch.device,
+    ) -> int:
+        block_indices = torch.arange(num_blocks, device=device)
+        valid = torch.ones(num_blocks, dtype=torch.bool, device=device)
+
+        if latent_frame_mask is not None:
+            valid_latent_frames = latent_frame_mask.long().sum(dim=1)
+            valid_blocks_tensor = ((valid_latent_frames - 1).clamp_min(0) // self.num_frame_per_block).clamp_max(num_blocks)
+            valid = valid & (block_indices < int(valid_blocks_tensor.min().item()))
+
+        if state_mask is not None:
+            state_token_mask = state_mask.to(device=device, dtype=torch.bool).any(dim=2)
+            state_block_valid = []
+            for block_idx in range(num_blocks):
+                start = block_idx * num_state_per_block
+                end = start + num_state_per_block
+                state_block_valid.append(state_token_mask[:, start:end].all(dim=1).all())
+            state_block_valid = torch.stack(state_block_valid)
+            # Prefix warmup uses all state blocks before the sampled target too.
+            valid = valid & torch.cumprod(state_block_valid.to(torch.int64), dim=0).to(torch.bool)
+
+        if action_mask is not None:
+            action_token_mask = action_mask.to(device=device, dtype=torch.bool).any(dim=2)
+            if has_real_action is not None:
+                real_sample_mask = has_real_action.to(device=device, dtype=torch.bool).view(-1)
+            else:
+                real_sample_mask = torch.ones(action_token_mask.shape[0], dtype=torch.bool, device=device)
+            if bool(real_sample_mask.any().item()):
+                action_token_mask = action_token_mask[real_sample_mask]
+                action_block_valid = []
+                for block_idx in range(num_blocks):
+                    start = block_idx * num_action_per_block
+                    end = start + num_action_per_block
+                    action_block_valid.append(action_token_mask[:, start:end].all(dim=1).all())
+                valid = valid & torch.stack(action_block_valid)
+
+        valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            raise ValueError(
+                "MoT blockwise causal training found no block with valid video/action/state supervision."
+            )
+        choice = torch.randint(valid_indices.numel(), (1,), device=device)
+        return int(valid_indices[choice].item())
+
+    @staticmethod
+    def _slice_temporal_block(
+        tensor: torch.Tensor,
+        block_index: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        start = block_index * block_size
+        return tensor[:, start : start + block_size]
+
+    def _slice_masked_state_block(
+        self,
+        state_features: torch.Tensor,
+        state_mask: torch.Tensor | None,
+        block_index: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        state_block = self._slice_temporal_block(state_features, block_index, block_size)
+        if state_mask is None:
+            return state_block
+        mask_block = self._slice_temporal_block(
+            state_mask.to(device=state_block.device, dtype=state_block.dtype),
+            block_index,
+            block_size,
+        )
+        return state_block * mask_block
+
+    @staticmethod
+    def _detach_kv_cache_list(kv_cache: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [cache.detach() for cache in kv_cache]
+
+    def _slice_condition_y(
+        self,
+        y: torch.Tensor | None,
+        start_frame: int,
+        num_frames: int,
+    ) -> torch.Tensor | None:
+        if y is None:
+            return None
+        end_frame = start_frame + num_frames
+        if end_frame <= y.shape[2]:
+            return y[:, :, start_frame:end_frame]
+        if y.shape[2] >= num_frames:
+            return y[:, :, -num_frames:]
+        return y
+
+    def _warm_training_video_cache(
+        self,
+        latents: torch.Tensor,
+        prompt_embs: torch.Tensor,
+        clip_feas: torch.Tensor,
+        ys: torch.Tensor | None,
+        state_features: torch.Tensor,
+        state_mask: torch.Tensor | None,
+        embodiment_id: torch.Tensor,
+        kv_cache: list[torch.Tensor],
+        crossattn_cache: list[torch.Tensor],
+        block_index: int,
+        num_state_per_block: int,
+        seq_len: int,
+    ) -> None:
+        batch_size = latents.shape[0]
+        device = latents.device
+        zero_first_timestep = torch.zeros([batch_size, 1], device=device, dtype=torch.int64)
+
+        with torch.no_grad(), torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
+            first_state = self._slice_masked_state_block(state_features, state_mask, 0, num_state_per_block)
+            _, _, updated_kv_caches = self.model(
+                latents[:, :1].transpose(1, 2),
+                timestep=zero_first_timestep,
+                timestep_action=None,
+                clip_feature=clip_feas,
+                y=self._slice_condition_y(ys, 0, 1),
+                context=prompt_embs,
+                seq_len=seq_len // self.num_frame_per_block,
+                state=first_state,
+                embodiment_id=embodiment_id,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_frame=0,
+            )
+            for layer_idx, updated_kv_cache in enumerate(updated_kv_caches):
+                kv_cache[layer_idx] = updated_kv_cache.detach()
+
+            for prefix_block_idx in range(block_index):
+                start_frame = 1 + prefix_block_idx * self.num_frame_per_block
+                end_frame = start_frame + self.num_frame_per_block
+                prefix_state = self._slice_masked_state_block(
+                    state_features,
+                    state_mask,
+                    prefix_block_idx,
+                    num_state_per_block,
+                )
+                prefix_timestep = torch.zeros(
+                    [batch_size, self.num_frame_per_block],
+                    device=device,
+                    dtype=torch.int64,
+                )
+                _, _, updated_kv_caches = self.model(
+                    latents[:, start_frame:end_frame].transpose(1, 2),
+                    timestep=prefix_timestep,
+                    timestep_action=None,
+                    clip_feature=clip_feas,
+                    y=self._slice_condition_y(ys, start_frame, self.num_frame_per_block),
+                    context=prompt_embs,
+                    seq_len=seq_len,
+                    state=prefix_state,
+                    embodiment_id=embodiment_id,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start_frame=start_frame,
+                )
+                for layer_idx, updated_kv_cache in enumerate(updated_kv_caches):
+                    kv_cache[layer_idx] = updated_kv_cache.detach()
+
+    def _mot_blockwise_video_loss(
+        self,
+        video_noise_pred: torch.Tensor,
+        training_target: torch.Tensor,
+        timestep: torch.Tensor,
+        latent_frame_mask: torch.Tensor | None,
+        target_start_frame: int,
+    ) -> torch.Tensor:
+        if training_target.shape != video_noise_pred.shape:
+            training_target = training_target[
+                ..., : video_noise_pred.shape[3], : video_noise_pred.shape[4]
+            ]
+        dynamics_loss_per_sample = torch.nn.functional.mse_loss(
+            video_noise_pred.float(),
+            training_target.float(),
+            reduction="none",
+        ).mean(dim=(1, 3, 4))
+        weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(
+            timestep.flatten(0, 1),
+        ).unflatten(0, timestep.shape).to(self._device)
+        if latent_frame_mask is None:
+            return weight_dynamics.mean()
+        target_mask = latent_frame_mask[:, target_start_frame : target_start_frame + self.num_frame_per_block]
+        return self._masked_mean(weight_dynamics, target_mask, dim=1).mean()
+
+    def _mot_blockwise_action_loss(
+        self,
+        action_block: torch.Tensor,
+        action_mask_block: torch.Tensor,
+        has_real_action: torch.Tensor,
+        state_block: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        refreshed_video_kv: list[torch.Tensor],
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        if not hasattr(self.model, "forward_action_from_refreshed_video_kv"):
+            raise RuntimeError("MoT blockwise causal training requires MoTCausalWanModel refreshed-video action path.")
+
+        action_steps = self._mot_decoupled_training_action_steps()
+        action_scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=self.scheduler.num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+        action_scheduler.set_timesteps(
+            action_steps,
+            device=action_block.device,
+            shift=self.sigma_shift,
+        )
+
+        action_noise = torch.randn_like(action_block)
+        first_timestep = action_scheduler.timesteps[0]
+        first_timestep_action = torch.ones(
+            [action_block.shape[0], action_block.shape[1]],
+            device=action_block.device,
+            dtype=torch.int64,
+        ) * first_timestep
+        noisy_action = self.scheduler.add_noise(
+            action_block.flatten(0, 1),
+            action_noise.flatten(0, 1),
+            first_timestep_action.flatten(0, 1),
+        ).unflatten(0, (action_block.shape[0], action_block.shape[1]))
+        training_target_action = self.scheduler.training_target(
+            action_block,
+            action_noise,
+            first_timestep_action,
+        )
+
+        action_losses = []
+        for step_index, action_timestep in enumerate(action_scheduler.timesteps):
+            timestep_action = torch.ones(
+                [action_block.shape[0], action_block.shape[1]],
+                device=action_block.device,
+                dtype=torch.int64,
+            ) * action_timestep
+            action_noise_pred = self.model.forward_action_from_refreshed_video_kv(
+                action=noisy_action,
+                timestep_action=timestep_action,
+                state=state_block,
+                embodiment_id=embodiment_id,
+                video_kv_cache=refreshed_video_kv,
+                current_start_frame=current_start_frame,
+            )
+            action_losses.append(
+                self._masked_weighted_action_loss(
+                    action_pred=action_noise_pred,
+                    training_target_action=training_target_action,
+                    action_mask=action_mask_block,
+                    has_real_action=has_real_action,
+                    timestep_action=timestep_action,
+                )
+            )
+            noisy_action = action_scheduler.step(
+                model_output=action_noise_pred.detach(),
+                timestep=action_timestep,
+                sample=noisy_action.detach(),
+                step_index=step_index,
+                return_dict=False,
+            )[0].detach()
+
+        return torch.stack(action_losses).mean()
+
+    def _forward_mot_decoupled_block_training(
+        self,
+        latents: torch.Tensor,
+        latent_frame_mask: torch.Tensor | None,
+        prompt_embs: torch.Tensor,
+        clip_feas: torch.Tensor,
+        ys: torch.Tensor | None,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor,
+        has_real_action: torch.Tensor,
+        state_features: torch.Tensor,
+        state_mask: torch.Tensor | None,
+        embodiment_id: torch.Tensor,
+    ) -> BatchFeature:
+        num_blocks, num_action_per_block, num_state_per_block = self._infer_blockwise_training_layout(
+            latents=latents,
+            actions=actions,
+            state_features=state_features,
+        )
+        block_index = self._sample_blockwise_training_index(
+            latent_frame_mask=latent_frame_mask,
+            action_mask=action_mask,
+            state_mask=state_mask,
+            has_real_action=has_real_action,
+            num_blocks=num_blocks,
+            num_action_per_block=num_action_per_block,
+            num_state_per_block=num_state_per_block,
+            device=latents.device,
+        )
+        target_start_frame = 1 + block_index * self.num_frame_per_block
+        target_end_frame = target_start_frame + self.num_frame_per_block
+        action_start = block_index * num_action_per_block
+        action_end = action_start + num_action_per_block
+
+        batch_size, _, _, height, width = latents.shape
+        frame_seqlen = (height // 2) * (width // 2)
+        seq_len = self.num_frame_per_block * frame_seqlen
+
+        kv_cache, _ = self._create_kv_caches(
+            batch_size=batch_size,
+            dtype=latents.dtype,
+            device=latents.device,
+            frame_seqlen=frame_seqlen,
+        )
+        crossattn_cache, _ = self._create_crossattn_caches(
+            batch_size=batch_size,
+            dtype=latents.dtype,
+            device=latents.device,
+        )
+
+        self._warm_training_video_cache(
+            latents=latents,
+            prompt_embs=prompt_embs,
+            clip_feas=clip_feas,
+            ys=ys,
+            state_features=state_features,
+            state_mask=state_mask,
+            embodiment_id=embodiment_id,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            block_index=block_index,
+            num_state_per_block=num_state_per_block,
+            seq_len=seq_len,
+        )
+
+        target_latents = latents[:, target_start_frame:target_end_frame]
+        video_noise = torch.randn_like(target_latents)
+        video_noise_ratio = self.video_beta_dist.sample([batch_size, 1]).to(
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        video_timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
+        video_timestep_id = torch.clamp(
+            video_timestep_id,
+            0,
+            self.scheduler.num_train_timesteps - 1,
+        ).expand(-1, self.num_frame_per_block)
+        timestep = self.scheduler.timesteps.to(device=latents.device)[video_timestep_id]
+        noisy_target_latents = self.scheduler.add_noise(
+            target_latents.flatten(0, 1),
+            video_noise.flatten(0, 1),
+            timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, self.num_frame_per_block))
+        training_target = self.scheduler.training_target(
+            target_latents,
+            video_noise,
+            timestep,
+        ).transpose(1, 2)
+
+        state_block = self._slice_masked_state_block(
+            state_features,
+            state_mask,
+            block_index,
+            num_state_per_block,
+        )
+        action_block = actions[:, action_start:action_end]
+        action_mask_block = action_mask[:, action_start:action_end]
+
+        with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
+            video_noise_pred, _, refreshed_video_kv = self.model(
+                noisy_target_latents.transpose(1, 2),
+                timestep=timestep,
+                timestep_action=None,
+                clip_feature=clip_feas,
+                y=self._slice_condition_y(ys, target_start_frame, self.num_frame_per_block),
+                context=prompt_embs,
+                seq_len=seq_len,
+                state=state_block,
+                embodiment_id=embodiment_id,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_frame=target_start_frame,
+            )
+            weighted_dynamics_loss = self._mot_blockwise_video_loss(
+                video_noise_pred=video_noise_pred,
+                training_target=training_target,
+                timestep=timestep,
+                latent_frame_mask=latent_frame_mask,
+                target_start_frame=target_start_frame,
+            )
+            action_video_kv = (
+                self._detach_kv_cache_list(refreshed_video_kv)
+                if getattr(self.model, "mot_action_video_ki", False)
+                else refreshed_video_kv
+            )
+            weighted_action_loss = self._mot_blockwise_action_loss(
+                action_block=action_block,
+                action_mask_block=action_mask_block,
+                has_real_action=has_real_action,
+                state_block=state_block,
+                embodiment_id=embodiment_id,
+                refreshed_video_kv=action_video_kv,
+                current_start_frame=target_start_frame,
+            )
+
+            dynamics_loss_weight = float(getattr(self.config, "dynamics_loss_weight", 1.0))
+            action_loss_weight = float(getattr(self.config, "action_loss_weight", 1.0))
+            if dynamics_loss_weight < 0.0 or action_loss_weight < 0.0:
+                raise ValueError(
+                    "Loss weights must be non-negative: "
+                    f"dynamics_loss_weight={dynamics_loss_weight}, "
+                    f"action_loss_weight={action_loss_weight}"
+                )
+            dynamics_loss_contribution = weighted_dynamics_loss * dynamics_loss_weight
+            action_loss_contribution = weighted_action_loss * action_loss_weight
+            loss = dynamics_loss_contribution + action_loss_contribution
+
+        if not self._noise_logged:
+            print(
+                "[NOISE] Mode=MOT_BLOCKWISE_CAUSAL | "
+                f"prefix_blocks=0..{num_blocks - 1} sampled | "
+                f"Video: Beta({self.config.mot_video_noise_beta_alpha},"
+                f"{self.config.mot_video_noise_beta_beta}) one-step | "
+                f"Action: {self._mot_decoupled_training_action_steps()}-step refreshed-KV denoise"
+            )
+            self._noise_logged = True
+
+        self._debug_finite("weighted_dynamics_loss", weighted_dynamics_loss)
+        self._debug_finite("weighted_action_loss", weighted_action_loss)
+        self._debug_finite("dynamics_loss_contribution", dynamics_loss_contribution)
+        self._debug_finite("action_loss_contribution", action_loss_contribution)
+        self._debug_finite("loss", loss)
+
+        return BatchFeature(
+            data={
+                "loss": loss,
+                "dynamics_loss": weighted_dynamics_loss,
+                "action_loss": weighted_action_loss,
+                "dynamics_loss_contribution": dynamics_loss_contribution,
+                "action_loss_contribution": action_loss_contribution,
+                "loss_weight_dynamics": torch.tensor(dynamics_loss_weight, device=self._device),
+                "loss_weight_action": torch.tensor(action_loss_weight, device=self._device),
+            }
+        )
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
@@ -970,12 +1475,25 @@ class WANPolicyHead(ActionHead):
             ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
 
+        # specific to autoregressive
+        latents = latents.transpose(1, 2)
+        if self._uses_mot_decoupled_block_training(actions):
+            return self._forward_mot_decoupled_block_training(
+                latents=latents,
+                latent_frame_mask=latent_frame_mask,
+                prompt_embs=prompt_embs,
+                clip_feas=clip_feas,
+                ys=ys,
+                actions=actions,
+                action_mask=action_mask,
+                has_real_action=has_real_action,
+                state_features=state_features,
+                state_mask=state_mask,
+                embodiment_id=embodiment_id,
+            )
+
         # Loss
         noise = torch.randn_like(latents)
-
-        # specific to autoregressive
-        noise = noise.transpose(1, 2)
-        latents = latents.transpose(1, 2)
 
         if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
             # MoT decoupled mode: train action against full-video K/V while keeping

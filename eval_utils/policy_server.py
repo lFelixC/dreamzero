@@ -39,6 +39,13 @@ class PolicyServerConfig:
     needs_session_id: bool = False
     # Which action space to use.
     action_space: str = "joint_position"  # can be in ["joint_position", "joint_velocity", "cartesian_position", "cartesian_velocity"]
+    # Optional DreamZero cache-mode metadata. Clients use these to avoid request
+    # patterns that would reorder causal KV/cache updates.
+    wam_architecture: str | None = None
+    mot_inference_video_mode: str | None = None
+    cache_order_sensitive: bool = False
+    supports_rtc: bool = True
+    supports_async_prefetch: bool = True
 
 
 class WebsocketPolicyServer:
