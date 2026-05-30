@@ -1503,14 +1503,63 @@ class MoTCausalWanModel(CausalWanModel):
         )
 
         for layer_idx, block in enumerate(self.action_expert.blocks):
-            action_tokens = self._run_action_expert_block_cached(
-                block=block,
-                tokens=action_tokens,
-                e=action_e,
-                context=None,
-                video_kv=self._select_cached_video_kv_for_action(kv_cache[layer_idx]),
-                current_start_frame=current_start_frame,
-            )
+            layer_video_kv = self._select_cached_video_kv_for_action(kv_cache[layer_idx])
+
+            if torch.is_grad_enabled() and self.action_expert.use_gradient_checkpointing:
+                if layer_video_kv is None:
+
+                    def run_cached_action_layer(layer_tokens, layer_e, _block=block):
+                        return self._run_action_expert_block_cached(
+                            block=_block,
+                            tokens=layer_tokens,
+                            e=layer_e,
+                            context=None,
+                            video_kv=None,
+                            current_start_frame=current_start_frame,
+                        )
+
+                    action_tokens = torch.utils.checkpoint.checkpoint(
+                        run_cached_action_layer,
+                        action_tokens,
+                        action_e,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_video_k, layer_video_v = layer_video_kv
+
+                    def run_cached_action_layer(
+                        layer_tokens,
+                        layer_e,
+                        video_k,
+                        video_v,
+                        _block=block,
+                    ):
+                        return self._run_action_expert_block_cached(
+                            block=_block,
+                            tokens=layer_tokens,
+                            e=layer_e,
+                            context=None,
+                            video_kv=(video_k, video_v),
+                            current_start_frame=current_start_frame,
+                        )
+
+                    action_tokens = torch.utils.checkpoint.checkpoint(
+                        run_cached_action_layer,
+                        action_tokens,
+                        action_e,
+                        layer_video_k,
+                        layer_video_v,
+                        use_reentrant=False,
+                    )
+            else:
+                action_tokens = self._run_action_expert_block_cached(
+                    block=block,
+                    tokens=action_tokens,
+                    e=action_e,
+                    context=None,
+                    video_kv=layer_video_kv,
+                    current_start_frame=current_start_frame,
+                )
 
         return self.action_expert.decode_action(
             tokens=action_tokens,
