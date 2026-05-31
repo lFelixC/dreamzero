@@ -962,6 +962,8 @@ class MoTCausalWanModel(CausalWanModel):
     def _select_cached_video_kv_for_action(
         self,
         updated_kv_cache: torch.Tensor,
+        prefix_kv_cache: torch.Tensor | None = None,
+        current_video_token_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         mode = self.mot_action_video_attention
         if mode == "none":
@@ -970,9 +972,26 @@ class MoTCausalWanModel(CausalWanModel):
         video_k = updated_kv_cache[0]
         video_v = updated_kv_cache[1]
         if mode == "first_frame":
+            if prefix_kv_cache is not None and prefix_kv_cache.shape[2] > 0:
+                video_k = prefix_kv_cache[0]
+                video_v = prefix_kv_cache[1]
             end = min(self.frame_seqlen, video_k.shape[1])
             return video_k[:, :end], video_v[:, :end]
         if mode == "full_video":
+            if (
+                prefix_kv_cache is not None
+                and prefix_kv_cache.shape[2] > 0
+                and current_video_token_len is not None
+                and video_k.shape[1] <= int(current_video_token_len)
+            ):
+                # Some refreshed-video paths can hand the action expert only the
+                # current generated chunk. Restore the observed prefix explicitly.
+                video_k = torch.cat([prefix_kv_cache[0], video_k], dim=1)
+                video_v = torch.cat([prefix_kv_cache[1], video_v], dim=1)
+                if self.local_attn_size != -1:
+                    max_tokens = self.local_attn_size * self.frame_seqlen
+                    video_k = video_k[:, -max_tokens:]
+                    video_v = video_v[:, -max_tokens:]
             return video_k, video_v
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
@@ -1453,7 +1472,11 @@ class MoTCausalWanModel(CausalWanModel):
                 tokens=action_tokens,
                 e=action_e,
                 context=None,
-                video_kv=self._select_cached_video_kv_for_action(updated_kv_cache),
+                video_kv=self._select_cached_video_kv_for_action(
+                    updated_kv_cache,
+                    prefix_kv_cache=kv_cache[layer_idx],
+                    current_video_token_len=seq_len,
+                ),
                 current_start_frame=current_start_frame,
             )
 
@@ -1483,6 +1506,8 @@ class MoTCausalWanModel(CausalWanModel):
         kv_cache: list[torch.Tensor],
         current_start_frame: int,
         require_full_video: bool = False,
+        prefix_kv_cache: list[torch.Tensor] | None = None,
+        current_video_token_len: int | None = None,
     ) -> torch.Tensor:
         """Run only the MoT action expert using a supplied per-layer video K/V cache."""
         if require_full_video and self.mot_action_video_attention != "full_video":
@@ -1503,7 +1528,14 @@ class MoTCausalWanModel(CausalWanModel):
         )
 
         for layer_idx, block in enumerate(self.action_expert.blocks):
-            layer_video_kv = self._select_cached_video_kv_for_action(kv_cache[layer_idx])
+            layer_prefix_kv = None
+            if prefix_kv_cache is not None:
+                layer_prefix_kv = prefix_kv_cache[layer_idx]
+            layer_video_kv = self._select_cached_video_kv_for_action(
+                kv_cache[layer_idx],
+                prefix_kv_cache=layer_prefix_kv,
+                current_video_token_len=current_video_token_len,
+            )
 
             if torch.is_grad_enabled() and self.action_expert.use_gradient_checkpointing:
                 if layer_video_kv is None:
@@ -1595,6 +1627,8 @@ class MoTCausalWanModel(CausalWanModel):
         embodiment_id,
         video_kv_cache: list[torch.Tensor],
         current_start_frame: int,
+        prefix_kv_cache: list[torch.Tensor] | None = None,
+        current_video_token_len: int | None = None,
     ) -> torch.Tensor:
         """Run action expert from the latest full-video denoise refresh K/V."""
         return self._forward_action_from_video_kv_cache(
@@ -1605,6 +1639,8 @@ class MoTCausalWanModel(CausalWanModel):
             kv_cache=video_kv_cache,
             current_start_frame=current_start_frame,
             require_full_video=True,
+            prefix_kv_cache=prefix_kv_cache,
+            current_video_token_len=current_video_token_len,
         )
 
     def _forward_train(

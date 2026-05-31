@@ -285,10 +285,8 @@ if [[ "${ARCH}" == "mot" ]]; then
     "mot_action_video_ki=${MOT_ACTION_VIDEO_KI:-false}"
     "mot_inference_video_mode=${MOT_INFERENCE_VIDEO_MODE:-auto}"
     "mot_decouple_video_action_noise=${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"
-    "mot_video_noise_beta_alpha=${MOT_VIDEO_NOISE_BETA_ALPHA:-3.0}"
-    "mot_video_noise_beta_beta=${MOT_VIDEO_NOISE_BETA_BETA:-1.0}"
     "mot_decoupled_inference_video_final_noise=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE:-0.8}"
-    "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-8}"
+    "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-1}"
   )
 fi
 

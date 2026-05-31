@@ -31,11 +31,8 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 - `mot_action_video_ki`: `true | false`
 - `mot_inference_video_mode`: `auto | denoise | cache_only | decoupled_denoise`
 - `mot_decouple_video_action_noise`: `true | false`
-- `mot_video_noise_beta_alpha`
-- `mot_video_noise_beta_beta`
 - `mot_decoupled_inference_video_final_noise`
 - `mot_decoupled_inference_video_refresh_steps`
-- `mot_decoupled_training_action_steps`
 
 `mot_action_video_attention` 含义：
 
@@ -55,11 +52,11 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 - `auto`: 当前默认。`first_frame` 和 `none` 推理时只用 cached video K/V 做 action denoise；`full_video` 保持 video/action 一起 denoise。
 - `denoise`: 保持原始推理行为，video/action 每个采样步一起 denoise。
 - `cache_only`: 强制不做 future video denoise，只用已建立的 video K/V cache 做 action conditioning。RTC guidance 当前会自动退回 `denoise`。
-- `decoupled_denoise`: MoT full-video decoupled 专用推理路径。video 只按 refresh mask 跳步刷新，action 每个采样步都重新 denoise。
+- `decoupled_denoise`: MoT full-video decoupled 专用推理路径。默认 video 只做一次 denoise refresh，action 每个采样步都复用这次 refreshed video K/V；如显式把 `mot_decoupled_inference_video_refresh_steps` 设为 5/6/7/8/16，则退回多次 video refresh ablation。
 
 如果训练使用 `mot_action_video_attention=full_video`，但推理只想用 cached video K/V 加速，可以显式设置 `mot_inference_video_mode=cache_only` 或环境变量 `MOT_INFERENCE_VIDEO_MODE=cache_only`。
 
-`mot_decouple_video_action_noise=true` 只支持 `architecture=mot` 且 `mot_action_video_attention=full_video`。训练时按 block index 采样当前 block：先用多 block 真实 video prefix warm causal KV/cache，只对当前目标 video block 做一次 high-noise flow 预测，再用该 block 刷新的 video K/V 对对应 action block 做多步 action-only denoise。`mot_decoupled_training_action_steps=null` 时使用推理默认步数。`mot_inference_video_mode=auto` 会自动选择 `decoupled_denoise`。
+`mot_decouple_video_action_noise=true` 只支持 `architecture=mot` 且 `mot_action_video_attention=full_video`。训练仍走 full teacher-forcing：双段 clean/noisy video 作为完整序列并行前向，不采样 block index，不 warm prefix KV/cache。该开关只改变 noise/timestep 采样：video 固定使用 one-step 推理初始 timestep 对应的高噪声尺度（当前约 `t=999.8`），action 使用独立 uniform timestep；action loss 仍是单步 flow matching，并复用同一次 video denoise forward 产生的 K/V。`mot_inference_video_mode=auto` 会自动选择 `decoupled_denoise`。
 
 `droid_random_drop_exterior_view_prob` 是 DROID 数据增强开关，默认 `0.0`。设置为 `0.5` 时，50% 训练样本会随机把 left/right exterior 其中一个置黑；设置为 `1.0` 时，每个训练样本都 drop 一个 exterior view。该增强只在训练态 DROID 三视角拼图时生效，不 drop wrist view。
 
@@ -70,10 +67,10 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 - action shared context: 关闭。
 - video state context: 开启。
 - action expert gate 初始化: AdaLN-zero 默认初始化。
-- 训练 noise/timestep: 默认 video/action 使用标准耦合采样；仅当显式开启 `mot_decouple_video_action_noise` 时进入 MoT blockwise causal decoupled 采样。
-- 推理模式: 默认 `auto`，`first_frame`/`none` 可跳过 future video denoise，`full_video` 默认保持 video/action 一起 denoise，full-video decoupled checkpoint 默认使用 `decoupled_denoise`。
+- 训练 noise/timestep: 默认 video/action 使用标准耦合采样；仅当显式开启 `mot_decouple_video_action_noise` 时，full teacher-forcing 训练中的 video 固定到 one-step 推理初始 timestep，action 使用独立 uniform timestep。
+- 推理模式: 默认 `auto`，`first_frame`/`none` 可跳过 future video denoise，`full_video` 默认保持 video/action 一起 denoise，full-video decoupled checkpoint 默认使用 one-step video `decoupled_denoise`。
 
-当前 MoT 主链路仍不恢复旧的 action-only cache refresh/no-denoise 诊断组合；新增的 decoupled 路径只服务 full-video 高噪声训练和对应的跳步 video 推理。
+当前 MoT 主链路仍不恢复旧的 action-only cache refresh/no-denoise 诊断组合；decoupled 推理路径只服务 full-video decoupled-noise checkpoint，默认契约是 one-step video refresh plus every-step action denoise。
 
 ## 训练入口
 
@@ -100,11 +97,8 @@ bash scripts/train/droid_wan22_mot_full.sh
 - `MOT_ACTION_VIDEO_KI`，也可用短别名 `MOT_KI`
 - `MOT_INFERENCE_VIDEO_MODE`
 - `MOT_DECOUPLE_VIDEO_ACTION_NOISE`
-- `MOT_VIDEO_NOISE_BETA_ALPHA`
-- `MOT_VIDEO_NOISE_BETA_BETA`
 - `MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE`
 - `MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS`
-- `MOT_DECOUPLED_TRAINING_ACTION_STEPS`，可选；不设时使用默认推理步数。
 - `DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB`
 
 非 MoT 训练脚本仍保留；MoT small、joint small 和 MoT ablation 脚本已删除。
@@ -222,10 +216,8 @@ DATALOADER_PERSISTENT_WORKERS=false \
 USE_GRADIENT_CHECKPOINTING=true \
 MOT_ACTION_VIDEO_ATTENTION=full_video \
 MOT_DECOUPLE_VIDEO_ACTION_NOISE=true \
-MOT_VIDEO_NOISE_BETA_ALPHA=3.0 \
-MOT_VIDEO_NOISE_BETA_BETA=1.0 \
 MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE=0.8 \
-MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=8 \
+MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=1 \
 OUTPUT_DIR=/data/checkpoints/dreamzero/dreamzero_droid_wan22_mot_decoupled_smoke \
 WANDB_MODE=offline \
 SWANLAB_SYNC_WANDB=0 \
@@ -235,7 +227,7 @@ bash scripts/train/droid_wan22_mot_full.sh
 训练成功时日志里应看到：
 
 ```text
-[NOISE] Mode=MOT_BLOCKWISE_CAUSAL | ... | Video: Beta(3.0,1.0) one-step | Action: 16-step refreshed-KV denoise
+[NOISE] Mode=MOT_DECOUPLED | Video: fixed one-step idx=1 t=999.8 ... | Action: INDEPENDENT Uniform ...
 ```
 
 decoupled 两卡 server：
@@ -280,8 +272,8 @@ PYTHONPATH=/data/dreamzero_mot:${PYTHONPATH:-} \
 
 ```text
 [MoT] inference_video_mode=decoupled_denoise (configured=decoupled_denoise, action_video_attention=full_video)
-[MoT] decoupled_denoise: video_final_noise=0.800, video_refresh_steps=8/16, action_steps=every_step
-[MoT] decoupled_denoise compute: video_refresh_steps=8, action_steps=16
+[MoT] decoupled_denoise: video_final_noise=0.800, video_refresh_steps=1/1, action_steps=every_step
+[MoT] decoupled_denoise compute: video_refresh_steps=1, action_steps=16
 ```
 
 本次 smoke client 返回了 shape 为 `(1, 8)` 的 action。
