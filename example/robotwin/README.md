@@ -311,12 +311,15 @@ ${OUTPUT_ROOT}/report.json
 ${OUTPUT_ROOT}/report.csv
 ${OUTPUT_ROOT}/logs/server_${PORT}.log
 ${OUTPUT_ROOT}/logs/env_worker_${WORKER_ID}.log
-${OUTPUT_ROOT}/server_outputs/
 ${OUTPUT_ROOT}/${TASK}/summary.json
 ${OUTPUT_ROOT}/${TASK}/episode_000000.json
 ```
 
 Worker logs are written for `WORKER_ID=0..NUM_ENVS-1`.
+Server-side generated video saving is disabled by default to avoid accumulating
+predicted-video latents on the H200 during long eval runs. Use
+`socket_test_optimized_aloha_x5lite_bimanual.py --save-server-video
+--output-root ...` only for small server debugging runs.
 
 Each episode JSON records reset time, expert-filter time, inference wait time,
 env step time, observation render time, episode wall time, action shapes, seed,
@@ -423,6 +426,10 @@ CUDA_VISIBLE_DEVICES="${SERVER_GPU}" \
   --max-chunk-size "${MAX_CHUNK_SIZE}" \
   --output-root "${SERVER_OUTPUT_ROOT}"
 ```
+
+Do not add `--save-server-video` for normal remote eval. It keeps generated
+video latents on rank 0 until reset and can make H200 memory grow during long
+tasks.
 
 Check from the 4090 machine that the H200 port is reachable:
 
