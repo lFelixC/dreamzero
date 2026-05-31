@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LingBot-style RoboTwin eval controller for DreamZero websocket inference."""
+"""LingBot-VA style synchronized-wave RoboTwin eval controller."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import contextlib
 import csv
 import json
 import os
-import pickle
 import secrets
 import signal
 import socket
@@ -30,7 +29,6 @@ for extra in (
     REPO_ROOT / "third_party" / "RoboTwin",
     REPO_ROOT / "third_party" / "lerobot" / "src",
     REPO_ROOT / "third_party" / "lerobot",
-    Path("/data/openpi/packages/openpi-client/src"),
 ):
     if extra.exists() and str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
@@ -39,13 +37,11 @@ from eval_utils.policy_client import WebsocketClientPolicy  # noqa: E402
 from example.robotwin.robotwin_fast_env import (  # noqa: E402
     ROBOTWIN_ACTION_DIM,
     parse_image_resolution,
+    robotwin_obs_sequences_to_batched_payload,
     robotwin_obs_sequence_to_payload,
 )
 
-try:
-    from openpi_client import msgpack_numpy
-except Exception:  # pragma: no cover - fallback for static checks without openpi-client.
-    msgpack_numpy = None
+from eval_utils import msgpack_numpy  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = Path("/data/checkpoints/dreamzero/robotwin_eval_runs/lingbot_style_eval")
@@ -67,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--tasks", default=os.environ.get("TASKS", os.environ.get("TASK", "beat_block_hammer")))
     parser.add_argument("--episodes", type=int, default=8)
-    parser.add_argument("--num-envs", type=int, default=1, help="Compatibility only; LingBot-style eval always uses 1 env.")
+    parser.add_argument("--num-envs", type=int, default=1, help="Number of synchronized RoboTwin env workers.")
     parser.add_argument("--env-cuda", default=os.environ.get("ENV_CUDA", "0"))
     parser.add_argument("--worker-python", default=sys.executable)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -148,7 +144,6 @@ def build_worker_env(cuda_visible_devices: str) -> dict[str, str]:
         str(REPO_ROOT / "third_party" / "RoboTwin"),
         str(REPO_ROOT / "third_party" / "lerobot" / "src"),
         str(REPO_ROOT / "third_party" / "lerobot"),
-        "/data/openpi/packages/openpi-client/src",
     ]
     existing = env.get("PYTHONPATH")
     if existing:
@@ -159,46 +154,55 @@ def build_worker_env(cuda_visible_devices: str) -> dict[str, str]:
 
 def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]:
     log_dir.mkdir(parents=True, exist_ok=True)
+    worker_count = max(int(args.num_envs), 1)
     authkey = secrets.token_bytes(16)
-    listener = Listener(("127.0.0.1", 0), backlog=1, authkey=authkey)
+    listener = Listener(("127.0.0.1", 0), backlog=worker_count, authkey=authkey)
     with contextlib.suppress(AttributeError):
         listener._listener._socket.settimeout(1.0)
     host, port = listener.address
-    cuda_values = parse_cuda_list(args.env_cuda, 1)
+    cuda_values = parse_cuda_list(args.env_cuda, worker_count)
     worker_script = REPO_ROOT / "example" / "robotwin" / "parallel_env_worker.py"
-    log_path = log_dir / "env_worker_0.log"
-    cmd = [
-        args.worker_python,
-        str(worker_script),
-        "--host",
-        str(host),
-        "--port",
-        str(port),
-        "--authkey-hex",
-        authkey.hex(),
-        "--worker-id",
-        "0",
-    ]
-    log_file = log_path.open("ab", buffering=0)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(REPO_ROOT),
-            env=build_worker_env(cuda_values[0]),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    finally:
-        log_file.close()
+    procs: dict[int, subprocess.Popen] = {}
+    log_paths: dict[int, Path] = {}
+    for worker_id in range(worker_count):
+        log_path = log_dir / f"env_worker_{worker_id}.log"
+        cmd = [
+            args.worker_python,
+            str(worker_script),
+            "--host",
+            str(host),
+            "--port",
+            str(port),
+            "--authkey-hex",
+            authkey.hex(),
+            "--worker-id",
+            str(worker_id),
+        ]
+        log_file = log_path.open("ab", buffering=0)
+        try:
+            procs[worker_id] = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=build_worker_env(cuda_values[worker_id]),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            log_paths[worker_id] = log_path
+        finally:
+            log_file.close()
 
     deadline = time.time() + args.worker_timeout
+    handles: dict[int, WorkerHandle] = {}
     try:
-        while True:
+        while len(handles) < worker_count:
             if time.time() > deadline:
-                raise TimeoutError(f"Timed out waiting for worker to connect; see {log_path}")
-            if proc.poll() is not None:
-                raise RuntimeError(f"Worker exited before connecting; see {log_path}")
+                missing = sorted(set(procs) - set(handles))
+                paths = ", ".join(log_paths[item].as_posix() for item in missing)
+                raise TimeoutError(f"Timed out waiting for workers {missing}; see {paths}")
+            for worker_id, proc in procs.items():
+                if worker_id not in handles and proc.poll() is not None:
+                    raise RuntimeError(f"Worker {worker_id} exited before connecting; see {log_paths[worker_id]}")
             try:
                 conn = listener.accept()
             except socket.timeout:
@@ -206,21 +210,24 @@ def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]
             ready = conn.recv()
             if not ready.get("ok") or ready.get("type") != "ready":
                 raise RuntimeError(f"Unexpected worker handshake: {ready}")
-            return [
-                WorkerHandle(
-                    worker_id=int(ready["worker_id"]),
-                    process=proc,
-                    conn=conn,
-                    log_path=log_path,
-                    cuda_visible_devices=str(ready.get("cuda_visible_devices", cuda_values[0])),
-                )
-            ]
+            worker_id = int(ready["worker_id"])
+            if worker_id not in procs:
+                raise RuntimeError(f"Worker connected with unexpected id {worker_id}: {ready}")
+            handles[worker_id] = WorkerHandle(
+                worker_id=worker_id,
+                process=procs[worker_id],
+                conn=conn,
+                log_path=log_paths[worker_id],
+                cuda_visible_devices=str(ready.get("cuda_visible_devices", cuda_values[worker_id])),
+            )
+        return [handles[worker_id] for worker_id in sorted(handles)]
     except Exception:
-        if proc.poll() is None:
-            with contextlib.suppress(Exception):
-                os.killpg(proc.pid, signal.SIGTERM)
-            with contextlib.suppress(Exception):
-                proc.terminate()
+        for proc in procs.values():
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                with contextlib.suppress(Exception):
+                    proc.terminate()
         raise
     finally:
         listener.close()
@@ -271,6 +278,18 @@ def recv_worker(worker: WorkerHandle, timeout: float) -> dict[str, Any]:
     return response
 
 
+def terminate_worker(worker: WorkerHandle) -> None:
+    with contextlib.suppress(Exception):
+        worker.conn.close()
+    proc = worker.process
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(Exception):
+        os.killpg(proc.pid, signal.SIGTERM)
+    with contextlib.suppress(Exception):
+        proc.terminate()
+
+
 def load_task_step_limit(task: str, fallback: int) -> int:
     if fallback > 0:
         return int(fallback)
@@ -289,9 +308,7 @@ def load_task_step_limit(task: str, fallback: int) -> int:
 def payload_size_bytes(payload: dict[str, Any]) -> int:
     payload_with_endpoint = dict(payload)
     payload_with_endpoint["endpoint"] = "infer"
-    if msgpack_numpy is not None:
-        return len(msgpack_numpy.Packer().pack(payload_with_endpoint))
-    return len(pickle.dumps(payload_with_endpoint))
+    return len(msgpack_numpy.Packer().pack(payload_with_endpoint))
 
 
 def normalize_action_sequence(action: Any) -> np.ndarray:
@@ -304,6 +321,30 @@ def normalize_action_sequence(action: Any) -> np.ndarray:
         arr = arr[0]
     elif arr.ndim != 2:
         raise ValueError(f"Expected action shape [H,14], [1,H,14], or [14], got {arr.shape}")
+    if arr.shape[-1] != ROBOTWIN_ACTION_DIM:
+        raise ValueError(f"Expected action width {ROBOTWIN_ACTION_DIM}, got {arr.shape}")
+    return np.ascontiguousarray(arr)
+
+
+def normalize_batched_action_sequence(action: Any, batch_size: int) -> np.ndarray:
+    arr = np.asarray(action, dtype=np.float32)
+    if arr.ndim == 1:
+        if batch_size != 1:
+            raise ValueError(f"Expected batched action for B={batch_size}, got {arr.shape}")
+        arr = arr.reshape(1, 1, -1)
+    elif arr.ndim == 2:
+        if arr.shape[-1] != ROBOTWIN_ACTION_DIM:
+            raise ValueError(f"Expected action width {ROBOTWIN_ACTION_DIM}, got {arr.shape}")
+        if batch_size == 1:
+            arr = arr.reshape(1, arr.shape[0], arr.shape[1])
+        elif arr.shape[0] == batch_size:
+            arr = arr.reshape(batch_size, 1, arr.shape[1])
+        else:
+            raise ValueError(f"Cannot interpret action shape {arr.shape} for batch size {batch_size}")
+    elif arr.ndim != 3:
+        raise ValueError(f"Expected batched action shape [B,H,14], got {arr.shape}")
+    if arr.shape[0] != batch_size:
+        raise ValueError(f"Expected action batch size {batch_size}, got {arr.shape}")
     if arr.shape[-1] != ROBOTWIN_ACTION_DIM:
         raise ValueError(f"Expected action width {ROBOTWIN_ACTION_DIM}, got {arr.shape}")
     return np.ascontiguousarray(arr)
@@ -376,11 +417,45 @@ def write_episode_result(task_dir: Path, result: dict[str, Any]) -> None:
     path.write_text(json.dumps(result, indent=2, default=json_default, ensure_ascii=False), encoding="utf-8")
 
 
+def aggregate_wave_batch_stats(results: list[dict[str, Any]]) -> dict[str, float | int]:
+    calls_by_wave: dict[int, int] = {}
+    batch_time_by_wave: dict[int, float] = {}
+    for result in results:
+        wave_id = int(result.get("wave_id", -1))
+        if wave_id < 0:
+            continue
+        calls = int(result.get("batch_infer_calls", result.get("infer_calls", 0)))
+        batch_time = float((result.get("timing") or {}).get("batch_infer_time", 0.0))
+        calls_by_wave[wave_id] = max(calls_by_wave.get(wave_id, 0), calls)
+        batch_time_by_wave[wave_id] = max(batch_time_by_wave.get(wave_id, 0.0), batch_time)
+    total_calls = sum(calls_by_wave.values())
+    total_batch_time = sum(batch_time_by_wave.values())
+    return {
+        "batch_infer_calls": total_calls,
+        "batch_infer_time": total_batch_time,
+        "avg_batch_infer_time": total_batch_time / total_calls if total_calls else 0.0,
+    }
+
+
 def write_task_summary(task_dir: Path, task: str, results: list[dict[str, Any]]) -> None:
     successes = sum(int(bool(result.get("success"))) for result in results)
     steps = [int(result.get("steps", 0)) for result in results]
     infer_counts = [int(result.get("infer_calls", 0)) for result in results]
     keyframes = [int(result.get("keyframe_count", 0)) for result in results]
+    wave_ids = sorted({int(result.get("wave_id", -1)) for result in results if int(result.get("wave_id", -1)) >= 0})
+    wave_batch_sizes_by_id = {
+        wave_id: max(
+            int(result.get("wave_batch_size", 1))
+            for result in results
+            if int(result.get("wave_id", -1)) == wave_id
+        )
+        for wave_id in wave_ids
+    }
+    wave_batch_sizes = list(wave_batch_sizes_by_id.values())
+    wave_batch_stats = aggregate_wave_batch_stats(results)
+    per_env_batch_call_count = sum(int(result.get("batch_infer_calls", result.get("infer_calls", 0))) for result in results)
+    per_env_infer_time = sum(float((result.get("timing") or {}).get("per_env_infer_time", 0.0)) for result in results)
+    sync_idle_steps = sum(int(result.get("sync_idle_steps", 0)) for result in results)
     summary = {
         "mode": "lingbot_style_robotwin",
         "task": task,
@@ -394,6 +469,13 @@ def write_task_summary(task_dir: Path, task: str, results: list[dict[str, Any]])
         "episode_length_max": int(np.max(steps)) if steps else 0,
         "avg_infer_calls": float(np.mean(infer_counts)) if infer_counts else 0.0,
         "avg_keyframes": float(np.mean(keyframes)) if keyframes else 0.0,
+        "num_envs_requested": int(results[0].get("num_envs_requested", 1)) if results else 0,
+        "waves": len(wave_ids),
+        "avg_wave_batch_size": float(np.mean(wave_batch_sizes)) if wave_batch_sizes else 0.0,
+        "batch_infer_calls": int(wave_batch_stats["batch_infer_calls"]),
+        "avg_batch_infer_time": float(wave_batch_stats["avg_batch_infer_time"]),
+        "avg_per_env_infer_time": per_env_infer_time / per_env_batch_call_count if per_env_batch_call_count else 0.0,
+        "sync_idle_steps": sync_idle_steps,
         "timestamp": time.time(),
     }
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +492,9 @@ def error_episode_result(
     episode_index: int,
     worker: WorkerHandle,
     exc: BaseException,
+    wave_id: int | None = None,
+    batch_index: int | None = None,
+    wave_batch_size: int | None = None,
 ) -> dict[str, Any]:
     return {
         "episode_index": episode_index,
@@ -429,6 +514,14 @@ def error_episode_result(
         "lingbot_style_eval": True,
         "fast_eval": True,
         "env_reuse_mode": "cold_reset",
+        "wave_id": int(wave_id) if wave_id is not None else -1,
+        "batch_index": int(batch_index) if batch_index is not None else 0,
+        "num_envs_requested": int(args.num_envs),
+        "wave_batch_size": int(wave_batch_size) if wave_batch_size is not None else 1,
+        "batch_infer_calls": 0,
+        "avg_batch_infer_time": 0.0,
+        "avg_per_env_infer_time": 0.0,
+        "sync_idle_steps": 0,
         "timing": {
             "reset_time": 0.0,
             "expert_filter_time": 0.0,
@@ -437,6 +530,8 @@ def error_episode_result(
             "get_obs_time": 0.0,
             "episode_wall_time": 0.0,
             "infer_payload_size_bytes": 0,
+            "batch_infer_time": 0.0,
+            "per_env_infer_time": 0.0,
         },
         "profile": {},
         "last_info": {},
@@ -446,6 +541,9 @@ def error_episode_result(
 def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_at: float) -> dict[str, Any]:
     metrics = state["metrics"]
     episode_wall_time = float(completed_at - state["episode_start"])
+    batch_infer_calls = int(metrics.get("batch_infer_calls", state["infer_calls"]))
+    batch_infer_time = float(metrics.get("batch_infer_time", 0.0))
+    per_env_infer_time = float(metrics.get("per_env_infer_time", 0.0))
     timing = {
         "reset_time": float(metrics.get("reset_time", 0.0)),
         "expert_filter_time": float(metrics.get("expert_filter_time", 0.0)),
@@ -454,6 +552,8 @@ def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_
         "get_obs_time": float(metrics.get("get_obs_time", 0.0)),
         "episode_wall_time": episode_wall_time,
         "infer_payload_size_bytes": int(metrics.get("infer_payload_size_bytes", 0)),
+        "batch_infer_time": batch_infer_time,
+        "per_env_infer_time": per_env_infer_time,
     }
     profile = {
         "payload_build_time": float(metrics.get("payload_build_time", 0.0)),
@@ -477,6 +577,7 @@ def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_
         "success": bool(state["success"]),
         "reward_sum": float(state["reward_sum"]),
         "done": bool(state["done"]),
+        "error": str(state.get("error", "")),
         "action_shapes": state["action_shapes"],
         "first_action": state["first_action"],
         "checkpoint": checkpoint_result(args),
@@ -485,6 +586,14 @@ def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_
         "lingbot_style_eval": True,
         "fast_eval": True,
         "env_reuse_mode": "cold_reset",
+        "wave_id": int(state.get("wave_id", -1)),
+        "batch_index": int(state.get("batch_index", 0)),
+        "num_envs_requested": int(state.get("num_envs_requested", args.num_envs)),
+        "wave_batch_size": int(state.get("wave_batch_size", 1)),
+        "batch_infer_calls": batch_infer_calls,
+        "avg_batch_infer_time": batch_infer_time / batch_infer_calls if batch_infer_calls else 0.0,
+        "avg_per_env_infer_time": per_env_infer_time / batch_infer_calls if batch_infer_calls else 0.0,
+        "sync_idle_steps": int(metrics.get("sync_idle_steps", 0)),
         "expert_filter": state.get("expert_filter", {"enabled": True}),
         "timing": timing,
         "profile": profile if args.profile else {},
@@ -518,6 +627,106 @@ def reset_worker_for_episode(
         }
     )
     return recv_worker(worker, args.worker_timeout)
+
+
+def send_reset_worker_for_episode(
+    args: argparse.Namespace,
+    *,
+    task: str,
+    worker: WorkerHandle,
+    episode_index: int,
+    episode_length: int,
+    task_dir: Path,
+) -> float:
+    video_path = task_dir / "videos" / f"episode_{episode_index:06d}.mp4" if args.save_video else None
+    reset_start = time.perf_counter()
+    worker.conn.send(
+        {
+            "cmd": "reset",
+            "task_name": task,
+            "episode_index": episode_index,
+            "episode_length": episode_length,
+            "seed_start": args.seed_start,
+            "episodes": args.episodes,
+            "reset_retries": args.reset_retries,
+            "expert_filter": True,
+            "expert_filter_max_candidates": args.expert_filter_max_candidates,
+            "video_path": video_path.as_posix() if video_path is not None else "",
+            "video_fps": args.video_fps,
+        }
+    )
+    return reset_start
+
+
+def set_worker_prompt(args: argparse.Namespace, worker: WorkerHandle, prompt: str) -> str:
+    worker.conn.send({"cmd": "set_prompt", "prompt": prompt})
+    response = recv_worker(worker, args.worker_timeout)
+    return str(response.get("prompt", prompt))
+
+
+def make_wave_state(
+    args: argparse.Namespace,
+    *,
+    task: str,
+    worker: WorkerHandle,
+    episode_index: int,
+    episode_length: int,
+    task_dir: Path,
+    wave_id: int,
+    batch_index: int,
+    wave_batch_size: int,
+    reset_start: float,
+    reset_response: dict[str, Any],
+) -> dict[str, Any]:
+    now = time.perf_counter()
+    prompt = str(reset_response["prompt"])
+    return {
+        "worker": worker,
+        "episode_index": episode_index,
+        "task": task,
+        "prompt": prompt,
+        "session_id": "",
+        "seed": int(reset_response["seed"]),
+        "reset_attempts": int(reset_response["reset_attempts"]),
+        "expert_filter": reset_response.get("expert_filter", {"enabled": True}),
+        "obs_sequence": [reset_response["obs"]],
+        "done": False,
+        "success": False,
+        "reward_sum": 0.0,
+        "steps": 0,
+        "infer_calls": 0,
+        "keyframe_count": 1,
+        "action_shapes": [],
+        "first_action": None,
+        "last_info": reset_response.get("info", {}),
+        "episode_start": reset_start,
+        "video_path": (task_dir / "videos" / f"episode_{episode_index:06d}.mp4").as_posix()
+        if args.save_video
+        else None,
+        "video_frames": 0,
+        "wave_id": wave_id,
+        "batch_index": batch_index,
+        "num_envs_requested": int(args.num_envs),
+        "wave_batch_size": wave_batch_size,
+        "episode_length": episode_length,
+        "metrics": {
+            "reset_time": float(reset_response.get("reset_time", now - reset_start)),
+            "expert_filter_time": float((reset_response.get("expert_filter") or {}).get("total_time", 0.0)),
+            "infer_wait_time": 0.0,
+            "env_step_time": 0.0,
+            "get_obs_time": 0.0,
+            "infer_payload_size_bytes": 0,
+            "payload_build_time": 0.0,
+            "payload_pack_time": 0.0,
+            "ws_roundtrip_time": 0.0,
+            "action_normalize_time": 0.0,
+            "worker_step_wait_time": 0.0,
+            "batch_infer_time": 0.0,
+            "per_env_infer_time": 0.0,
+            "batch_infer_calls": 0,
+            "sync_idle_steps": 0,
+        },
+    }
 
 
 def run_episode(
@@ -675,11 +884,267 @@ def run_episode(
     return finalize_episode(args, state, completed_at)
 
 
+def run_wave(
+    args: argparse.Namespace,
+    *,
+    task: str,
+    workers: list[WorkerHandle],
+    client: WebsocketClientPolicy | None,
+    episode_indices: list[int],
+    episode_length: int,
+    task_dir: Path,
+    wave_id: int,
+) -> list[dict[str, Any]]:
+    planned_batch_size = len(episode_indices)
+    if planned_batch_size <= 0:
+        return []
+    wave_workers = workers[:planned_batch_size]
+    results: list[dict[str, Any]] = []
+    reset_starts: dict[int, float] = {}
+
+    for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
+        try:
+            reset_starts[batch_index] = send_reset_worker_for_episode(
+                args,
+                task=task,
+                worker=worker,
+                episode_index=episode_index,
+                episode_length=episode_length,
+                task_dir=task_dir,
+            )
+        except Exception as exc:
+            terminate_worker(worker)
+            results.append(
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=episode_index,
+                    worker=worker,
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=planned_batch_size,
+                )
+            )
+
+    states: list[dict[str, Any]] = []
+    for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
+        if batch_index not in reset_starts:
+            continue
+        try:
+            reset_response = recv_worker(worker, args.worker_timeout)
+            states.append(
+                make_wave_state(
+                    args,
+                    task=task,
+                    worker=worker,
+                    episode_index=episode_index,
+                    episode_length=episode_length,
+                    task_dir=task_dir,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=planned_batch_size,
+                    reset_start=reset_starts[batch_index],
+                    reset_response=reset_response,
+                )
+            )
+        except Exception as exc:
+            terminate_worker(worker)
+            results.append(
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=episode_index,
+                    worker=worker,
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=planned_batch_size,
+                )
+            )
+
+    if not states:
+        return results
+
+    canonical_prompt = str(states[0]["prompt"])
+    session_id = f"robotwin-lingbot-{task}-wave-{wave_id}-{uuid.uuid4().hex[:8]}"
+    synced_states: list[dict[str, Any]] = []
+    for batch_index, state in enumerate(states):
+        state["batch_index"] = batch_index
+        state["wave_batch_size"] = len(states)
+        state["session_id"] = session_id
+        state["prompt"] = canonical_prompt
+        try:
+            set_worker_prompt(args, state["worker"], canonical_prompt)
+            synced_states.append(state)
+        except Exception as exc:
+            terminate_worker(state["worker"])
+            results.append(
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=int(state["episode_index"]),
+                    worker=state["worker"],
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=len(states),
+                )
+            )
+
+    states = synced_states
+    if not states:
+        return results
+    for batch_index, state in enumerate(states):
+        state["batch_index"] = batch_index
+        state["wave_batch_size"] = len(states)
+
+    if client is not None:
+        client.reset({"session_id": session_id, "prompt": canonical_prompt})
+
+    max_infer = args.max_steps if args.max_steps > 0 else max(int(episode_length), 1)
+    batch_size = len(states)
+    for _ in range(max_infer):
+        active_indices = [idx for idx, state in enumerate(states) if not bool(state["done"])]
+        if not active_indices:
+            break
+
+        payload_build_start = time.perf_counter()
+        payload = robotwin_obs_sequences_to_batched_payload(
+            [state["obs_sequence"] for state in states],
+            canonical_prompt,
+            session_id,
+            image_resolution=args.resolved_client_image_resolution,
+        )
+        payload_build_time = time.perf_counter() - payload_build_start
+        payload_pack_start = time.perf_counter()
+        size_bytes = payload_size_bytes(payload)
+        payload_pack_time = time.perf_counter() - payload_pack_start
+        ws_roundtrip_time = 0.0
+        action_normalize_time = 0.0
+
+        if args.dry_run_actions:
+            action_batch = np.zeros((batch_size, args.open_loop_horizon, ROBOTWIN_ACTION_DIM), dtype=np.float32)
+        else:
+            assert client is not None
+            infer_start = time.perf_counter()
+            raw_action = client.infer(dict(payload))
+            ws_roundtrip_time = time.perf_counter() - infer_start
+            normalize_start = time.perf_counter()
+            action_batch = normalize_batched_action_sequence(raw_action, batch_size)
+            action_normalize_time = time.perf_counter() - normalize_start
+
+        infer_time = ws_roundtrip_time + action_normalize_time
+        per_env_infer_time = infer_time / max(batch_size, 1)
+        per_env_payload_size = int(round(size_bytes / max(batch_size, 1)))
+        idle_count = batch_size - len(active_indices)
+
+        for state in states:
+            metrics = state["metrics"]
+            metrics["batch_infer_calls"] += 1
+            metrics["batch_infer_time"] += infer_time
+            metrics["per_env_infer_time"] += per_env_infer_time
+            if bool(state["done"]):
+                metrics["sync_idle_steps"] += 1
+
+        for batch_index in active_indices:
+            state = states[batch_index]
+            action_chunk = action_batch[batch_index]
+            state["infer_calls"] += 1
+            state["metrics"]["infer_wait_time"] += infer_time
+            state["metrics"]["infer_payload_size_bytes"] += per_env_payload_size
+            state["metrics"]["payload_build_time"] += payload_build_time
+            state["metrics"]["payload_pack_time"] += payload_pack_time
+            state["metrics"]["ws_roundtrip_time"] += ws_roundtrip_time
+            state["metrics"]["action_normalize_time"] += action_normalize_time
+            state["action_shapes"].append(list(action_chunk.shape))
+            if state["first_action"] is None and action_chunk.size:
+                state["first_action"] = action_chunk[0].tolist()
+            try:
+                state["worker"].conn.send(
+                    {
+                        "cmd": "step_chunk",
+                        "actions": action_chunk,
+                        "need_obs": True,
+                        "clip_action": bool(args.clip_action),
+                        "max_keyframes": KEYFRAMES_PER_CHUNK,
+                    }
+                )
+            except Exception as exc:
+                state["done"] = True
+                state["error"] = f"{exc.__class__.__name__}: {exc}"
+                terminate_worker(state["worker"])
+
+        for batch_index in active_indices:
+            state = states[batch_index]
+            if state.get("error"):
+                continue
+            worker_wait_start = time.perf_counter()
+            try:
+                step_response = recv_worker(state["worker"], args.worker_timeout)
+            except Exception as exc:
+                state["done"] = True
+                state["error"] = f"{exc.__class__.__name__}: {exc}"
+                terminate_worker(state["worker"])
+                continue
+            worker_wait_time = time.perf_counter() - worker_wait_start
+
+            actions_sent = int(step_response.get("actions_sent", 0))
+            state["metrics"]["worker_step_wait_time"] += worker_wait_time
+            state["metrics"]["env_step_time"] += float(step_response.get("env_step_time", 0.0))
+            state["metrics"]["get_obs_time"] += float(step_response.get("get_obs_time", 0.0))
+            state["steps"] += actions_sent
+            state["reward_sum"] += float(step_response.get("reward_sum", 0.0))
+            state["done"] = bool(step_response.get("done", False))
+            state["last_info"] = step_response.get("info", {})
+            state["success"] = bool(state["last_info"].get("is_success", state["success"]))
+            keyframes = step_response.get("keyframe_obs") or []
+            if keyframes:
+                state["obs_sequence"] = keyframes[-KEYFRAMES_PER_CHUNK:]
+                state["keyframe_count"] += len(keyframes)
+            elif step_response.get("obs") is not None:
+                state["obs_sequence"] = [step_response["obs"]]
+                state["keyframe_count"] += 1
+            if actions_sent <= 0:
+                state["done"] = True
+
+        if idle_count == batch_size:
+            break
+
+    completed_at = time.perf_counter()
+    if args.save_video:
+        pending_video_states: list[dict[str, Any]] = []
+        for state in states:
+            try:
+                state["worker"].conn.send({"cmd": "finish_episode"})
+                pending_video_states.append(state)
+            except Exception as exc:
+                last_info = state.get("last_info", {})
+                if not isinstance(last_info, dict):
+                    last_info = {"last_info": last_info}
+                last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
+                state["last_info"] = last_info
+        for state in pending_video_states:
+            try:
+                video_response = recv_worker(state["worker"], args.worker_timeout)
+                state["video_path"] = video_response.get("video_path") or state.get("video_path")
+                state["video_frames"] = int(video_response.get("video_frames", 0))
+            except Exception as exc:
+                last_info = state.get("last_info", {})
+                if not isinstance(last_info, dict):
+                    last_info = {"last_info": last_info}
+                last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
+                state["last_info"] = last_info
+
+    results.extend(finalize_episode(args, state, completed_at) for state in states)
+    return results
+
+
 def run_task(
     args: argparse.Namespace,
     *,
     task: str,
-    worker: WorkerHandle,
+    workers: list[WorkerHandle],
     client: WebsocketClientPolicy | None,
 ) -> list[dict[str, Any]]:
     task_dir = args.output_dir / task
@@ -687,27 +1152,38 @@ def run_task(
     episode_length = load_task_step_limit(task, args.episode_length)
     results: list[dict[str, Any]] = []
 
-    for episode_index in range(args.episodes):
+    wave_id = 0
+    for episode_start in range(0, args.episodes, args.num_envs):
+        episode_indices = list(range(episode_start, min(episode_start + args.num_envs, args.episodes)))
         try:
-            result = run_episode(
+            wave_results = run_wave(
                 args,
                 task=task,
-                worker=worker,
+                workers=workers,
                 client=client,
-                episode_index=episode_index,
+                episode_indices=episode_indices,
                 episode_length=episode_length,
                 task_dir=task_dir,
+                wave_id=wave_id,
             )
         except Exception as exc:
-            result = error_episode_result(
-                args,
-                task=task,
-                episode_index=episode_index,
-                worker=worker,
-                exc=exc,
-            )
-        write_episode_result(task_dir, result)
-        results.append(result)
+            wave_results = [
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=episode_index,
+                    worker=workers[batch_index % len(workers)],
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=len(episode_indices),
+                )
+                for batch_index, episode_index in enumerate(episode_indices)
+            ]
+        for result in sorted(wave_results, key=lambda item: int(item.get("episode_index", 0))):
+            write_episode_result(task_dir, result)
+            results.append(result)
+        wave_id += 1
 
     if client is not None:
         with contextlib.suppress(Exception):
@@ -744,14 +1220,20 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
 
     for task_dir in task_dirs:
         episode_paths = sorted(task_dir.glob("episode_*.json"))
+        episode_results: list[dict[str, Any]] = []
         successes = 0
         rewards: list[float] = []
         steps: list[int] = []
         infer_calls: list[int] = []
         keyframes: list[int] = []
+        wave_ids: set[int] = set()
+        wave_batch_sizes_by_id: dict[int, int] = {}
         reset_times: list[float] = []
         expert_times: list[float] = []
         infer_times: list[float] = []
+        batch_call_counts: list[int] = []
+        per_env_batch_times: list[float] = []
+        sync_idle_counts: list[int] = []
         env_times: list[float] = []
         obs_times: list[float] = []
         wall_times: list[float] = []
@@ -759,6 +1241,7 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         task_gpu_summary: dict[str, dict[str, Any]] = {}
         for path in episode_paths:
             data = json.loads(path.read_text(encoding="utf-8"))
+            episode_results.append(data)
             timing = data.get("timing", {})
             worker_gpu = str(data.get("worker_cuda_visible_devices", "unknown") or "unknown")
             successes += int(bool(data.get("success")))
@@ -766,9 +1249,19 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
             steps.append(int(data.get("steps", 0)))
             infer_calls.append(int(data.get("infer_calls", 0)))
             keyframes.append(int(data.get("keyframe_count", 0)))
+            wave_id = int(data.get("wave_id", -1))
+            if wave_id >= 0:
+                wave_ids.add(wave_id)
+                wave_batch_sizes_by_id[wave_id] = max(
+                    wave_batch_sizes_by_id.get(wave_id, 0),
+                    int(data.get("wave_batch_size", 1)),
+                )
             reset_times.append(float(timing.get("reset_time", 0.0)))
             expert_times.append(float(timing.get("expert_filter_time", 0.0)))
             infer_times.append(float(timing.get("infer_wait_time", 0.0)))
+            batch_call_counts.append(int(data.get("batch_infer_calls", data.get("infer_calls", 0))))
+            per_env_batch_times.append(float(timing.get("per_env_infer_time", 0.0)))
+            sync_idle_counts.append(int(data.get("sync_idle_steps", 0)))
             env_times.append(float(timing.get("env_step_time", 0.0)))
             obs_times.append(float(timing.get("get_obs_time", 0.0)))
             wall_times.append(float(timing.get("episode_wall_time", 0.0)))
@@ -795,6 +1288,10 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         total_episodes += count
         complete = count == expected_episodes
         complete_tasks += int(complete)
+        wave_batch_stats = aggregate_wave_batch_stats(episode_results)
+        total_batch_calls = int(wave_batch_stats["batch_infer_calls"])
+        per_env_batch_call_count = sum(batch_call_counts)
+        wave_batch_sizes = list(wave_batch_sizes_by_id.values())
         rows.append(
             {
                 "task": task_dir.name,
@@ -805,10 +1302,18 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
                 "avg_steps": sum(steps) / count if count else 0.0,
                 "avg_infer_calls": sum(infer_calls) / count if count else 0.0,
                 "avg_keyframes": sum(keyframes) / count if count else 0.0,
+                "waves": len(wave_ids),
+                "avg_wave_batch_size": sum(wave_batch_sizes) / count if count else 0.0,
                 "episode_length_std": float(np.std(steps)) if steps else 0.0,
                 "avg_reset_time": sum(reset_times) / count if count else 0.0,
                 "avg_expert_filter_time": sum(expert_times) / count if count else 0.0,
                 "avg_infer_wait_time": sum(infer_times) / count if count else 0.0,
+                "batch_infer_calls": total_batch_calls,
+                "avg_batch_infer_time": float(wave_batch_stats["avg_batch_infer_time"]),
+                "avg_per_env_infer_time": sum(per_env_batch_times) / per_env_batch_call_count
+                if per_env_batch_call_count
+                else 0.0,
+                "sync_idle_steps": sum(sync_idle_counts),
                 "avg_env_step_time": sum(env_times) / count if count else 0.0,
                 "avg_get_obs_time": sum(obs_times) / count if count else 0.0,
                 "avg_episode_wall_time": sum(wall_times) / count if count else 0.0,
@@ -827,6 +1332,9 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         "episodes": total_episodes,
         "successes": total_success,
         "success_rate": total_success / total_episodes if total_episodes else 0.0,
+        "waves": sum(int(row.get("waves", 0)) for row in rows),
+        "batch_infer_calls": sum(int(row.get("batch_infer_calls", 0)) for row in rows),
+        "sync_idle_steps": sum(int(row.get("sync_idle_steps", 0)) for row in rows),
         "env_gpu_summary": finalize_gpu_summary(global_gpu_summary),
         "rows": rows,
     }
@@ -840,10 +1348,16 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         "avg_steps",
         "avg_infer_calls",
         "avg_keyframes",
+        "waves",
+        "avg_wave_batch_size",
         "episode_length_std",
         "avg_reset_time",
         "avg_expert_filter_time",
         "avg_infer_wait_time",
+        "batch_infer_calls",
+        "avg_batch_infer_time",
+        "avg_per_env_infer_time",
+        "sync_idle_steps",
         "avg_env_step_time",
         "avg_get_obs_time",
         "avg_episode_wall_time",
@@ -861,9 +1375,8 @@ def main() -> None:
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
-    if args.num_envs != 1:
-        print("LingBot-style eval uses exactly one env; forcing --num-envs=1.", file=sys.stderr)
-        args.num_envs = 1
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
     if args.open_loop_horizon <= 0:
         raise ValueError("--open-loop-horizon must be positive for dry-run chunks")
     if args.save_video and args.video_fps <= 0:
@@ -875,7 +1388,6 @@ def main() -> None:
     log_dir = args.output_dir / "logs"
     tasks = parse_tasks(args.tasks)
     workers = start_workers(args, log_dir)
-    worker = workers[0]
     client: WebsocketClientPolicy | None = None
     server_metadata: dict[str, Any] | None = None
     all_results: list[dict[str, Any]] = []
@@ -889,7 +1401,7 @@ def main() -> None:
         )
         write_run_config(args, tasks=tasks, workers=workers, server_metadata=server_metadata)
         for task in tasks:
-            task_results = run_task(args, task=task, worker=worker, client=client)
+            task_results = run_task(args, task=task, workers=workers, client=client)
             all_results.extend(task_results)
         write_report(args.output_dir, args.episodes)
     finally:

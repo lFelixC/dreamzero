@@ -11,8 +11,8 @@ from typing import Dict, Tuple
 import websockets.sync.client
 from typing_extensions import override
 
-from openpi_client.base_policy import BasePolicy
-from openpi_client import msgpack_numpy
+from eval_utils.base_policy import BasePolicy
+from eval_utils import msgpack_numpy
 
 # The websockets library by default sends a ping every 20 seconds and
 # expects a pong response within 20 seconds. However, the sever may not

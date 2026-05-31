@@ -284,6 +284,76 @@ def robotwin_obs_sequence_to_payload(
     return payload
 
 
+def _pad_observation_sequence(
+    observations: Sequence[dict[str, Any]],
+    target_length: int,
+) -> list[dict[str, Any]]:
+    if not observations:
+        raise ValueError("Cannot pad an empty observation sequence")
+    values = list(observations)[-target_length:]
+    if len(values) >= target_length:
+        return values
+    return [values[0]] * (target_length - len(values)) + values
+
+
+def _batched_state_array(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected per-env state shape [T,D] or [D], got {arr.shape}")
+    return arr
+
+
+def robotwin_obs_sequences_to_batched_payload(
+    observation_sequences: Sequence[Sequence[dict[str, Any]]],
+    prompt: str,
+    session_id: str,
+    *,
+    image_resolution: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    if not observation_sequences:
+        raise ValueError("Cannot build a batched payload from zero observation sequences")
+
+    max_length = max(len(sequence) for sequence in observation_sequences)
+    if max_length <= 0:
+        raise ValueError("Cannot build a batched payload from an empty observation sequence")
+
+    per_env_payloads = [
+        robotwin_obs_sequence_to_payload(
+            _pad_observation_sequence(sequence, max_length),
+            prompt,
+            session_id,
+            image_resolution=image_resolution,
+        )
+        for sequence in observation_sequences
+    ]
+
+    batch_size = len(per_env_payloads)
+    payload: dict[str, Any] = {}
+    for key in ROBOTWIN_CAMERA_TO_DREAMZERO:
+        payload[key] = np.ascontiguousarray(np.stack([item[key] for item in per_env_payloads], axis=0))
+    for key in (
+        "state.left_joint_pos",
+        "state.left_gripper_pos",
+        "state.right_joint_pos",
+        "state.right_gripper_pos",
+    ):
+        payload[key] = np.ascontiguousarray(
+            np.stack([_batched_state_array(item[key]) for item in per_env_payloads], axis=0)
+        )
+
+    prompts = [prompt] * batch_size
+    payload.update(
+        {
+            "prompt": prompts,
+            "annotation.task": prompts,
+            "session_id": session_id,
+        }
+    )
+    return payload
+
+
 def load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
     ensure_robotwin_workdir()
     import yaml
@@ -858,6 +928,13 @@ class DreamZeroRoboTwinEnv:
             "expert_filter": expert_filter_info,
             "prompt": prompt,
         }
+
+    def set_prompt(self, prompt: str) -> dict[str, Any]:
+        if self.env is None:
+            raise RuntimeError("set_prompt called before reset")
+        self.prompt = str(prompt)
+        set_robotwin_instruction(self.env, self.prompt)
+        return {"prompt": self.prompt}
 
     def step_chunk(
         self,

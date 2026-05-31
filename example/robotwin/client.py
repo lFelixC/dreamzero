@@ -14,14 +14,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib
 import json
-import os
 import sys
 import time
 import uuid
 import warnings
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +26,6 @@ import gymnasium as gym
 import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
-from gymnasium import spaces
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -43,8 +39,31 @@ for extra in (
         sys.path.insert(0, str(extra))
 
 from eval_utils.policy_client import WebsocketClientPolicy  # noqa: E402
-from example.robotwin.robotwin_fast_env import (  # noqa: E402
-    robotwin_fast_step as shared_robotwin_fast_step,
+# Keep these names available from client.py while sharing the implementation.
+from example.robotwin.robotwin_fast_env import (  # noqa: E402,F401
+    ROBOTWIN_ACTION_DIM,
+    ROBOTWIN_ACTION_HIGH,
+    ROBOTWIN_ACTION_LOW,
+    ROBOTWIN_CAMERA_H,
+    ROBOTWIN_CAMERA_NAMES,
+    ROBOTWIN_CAMERA_TO_DREAMZERO,
+    ROBOTWIN_CAMERA_W,
+    RoboTwinCompatEnv,
+    coalesce,
+    ensure_robotwin_workdir,
+    first_existing,
+    initialize_robotwin_eval_state,
+    is_unstable_reset_error,
+    load_robotwin_setup_kwargs,
+    load_robotwin_task,
+    make_arm_tag,
+    make_robotwin_env,
+    model_image_sequence,
+    nested_get,
+    normalize_image,
+    payload_from_observation,
+    robotwin_fast_step,
+    split_left_right_state,
 )
 
 VIDEO_KEYS = {
@@ -52,18 +71,6 @@ VIDEO_KEYS = {
     "cam_left": "observation.images.cam_left",
     "cam_right": "observation.images.cam_right",
 }
-
-ROBOTWIN_CAMERA_TO_DREAMZERO = {
-    "video.cam_high": "head_camera",
-    "video.cam_left": "left_camera",
-    "video.cam_right": "right_camera",
-}
-ROBOTWIN_CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
-ROBOTWIN_ACTION_DIM = 14
-ROBOTWIN_ACTION_LOW = -np.inf
-ROBOTWIN_ACTION_HIGH = np.inf
-ROBOTWIN_CAMERA_H = 240
-ROBOTWIN_CAMERA_W = 320
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,123 +158,6 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 records.append(json.loads(line))
     return records
-
-
-def split_left_right_state(state: Any) -> dict[str, np.ndarray]:
-    arr = np.asarray(state, dtype=np.float32)
-    if arr.ndim == 2:
-        if arr.shape[0] != 1:
-            raise ValueError(f"Packed state must be one row, got {arr.shape}")
-        arr = arr[0]
-    if arr.shape != (14,):
-        raise ValueError(f"Expected packed RoboTwin state shape (14,), got {arr.shape}")
-    left = arr[:7]
-    right = arr[7:]
-    return {
-        "state.left_joint_pos": left[:6],
-        "state.left_gripper_pos": left[6:7],
-        "state.right_joint_pos": right[:6],
-        "state.right_gripper_pos": right[6:7],
-    }
-
-
-def normalize_image(image: Any) -> np.ndarray:
-    arr = np.asarray(image)
-    if arr.ndim == 4:
-        arr = arr[-1]
-    if arr.ndim != 3 or arr.shape[-1] < 3:
-        raise ValueError(f"Expected image shape (H, W, C), got {arr.shape}")
-    arr = arr[..., :3]
-    if np.issubdtype(arr.dtype, np.floating):
-        if float(np.nanmax(arr)) <= 1.0:
-            arr = (arr * 255.0).clip(0, 255)
-        else:
-            arr = arr.clip(0, 255)
-    return np.ascontiguousarray(arr.astype(np.uint8))
-
-
-def model_image_sequence(image: Any) -> np.ndarray:
-    return normalize_image(image)[None, ...]
-
-
-def first_existing(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return None
-
-
-def nested_get(mapping: dict[str, Any], path: tuple[str, ...]) -> Any:
-    value: Any = mapping
-    for key in path:
-        if not isinstance(value, dict) or key not in value:
-            return None
-        value = value[key]
-    return value
-
-
-def coalesce(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def payload_from_observation(obs: dict[str, Any], prompt: str, session_id: str) -> dict[str, Any]:
-    images = {
-        "video.cam_high": coalesce(
-            first_existing(obs, ("video.cam_high", "observation.images.cam_high", "cam_high")),
-            nested_get(obs, ("observation", "images", "cam_high")),
-            nested_get(obs, ("images", "cam_high")),
-        ),
-        "video.cam_left": coalesce(
-            first_existing(
-                obs,
-                ("video.cam_left", "observation.images.cam_left", "observation.images.cam_left_wrist", "cam_left", "cam_left_wrist"),
-            ),
-            nested_get(obs, ("observation", "images", "cam_left")),
-            nested_get(obs, ("observation", "images", "cam_left_wrist")),
-            nested_get(obs, ("images", "cam_left")),
-        ),
-        "video.cam_right": coalesce(
-            first_existing(
-                obs,
-                ("video.cam_right", "observation.images.cam_right", "observation.images.cam_right_wrist", "cam_right", "cam_right_wrist"),
-            ),
-            nested_get(obs, ("observation", "images", "cam_right")),
-            nested_get(obs, ("observation", "images", "cam_right_wrist")),
-            nested_get(obs, ("images", "cam_right")),
-        ),
-    }
-    missing_images = [key for key, value in images.items() if value is None]
-    if missing_images:
-        raise KeyError(f"Missing image observations: {missing_images}")
-
-    split_state = {
-        key: first_existing(obs, (key,))
-        for key in (
-            "state.left_joint_pos",
-            "state.left_gripper_pos",
-            "state.right_joint_pos",
-            "state.right_gripper_pos",
-        )
-    }
-    if any(value is None for value in split_state.values()):
-        packed = first_existing(obs, ("observation.state", "state"))
-        if packed is None:
-            packed = nested_get(obs, ("observation", "state"))
-        split_state = split_left_right_state(packed)
-
-    payload = {
-        "video.cam_high": model_image_sequence(images["video.cam_high"]),
-        "video.cam_left": model_image_sequence(images["video.cam_left"]),
-        "video.cam_right": model_image_sequence(images["video.cam_right"]),
-        "prompt": prompt,
-        "annotation.task": prompt,
-        "session_id": session_id,
-    }
-    payload.update({key: np.asarray(value, dtype=np.float32) for key, value in split_state.items()})
-    return payload
 
 
 def dataset_episode_paths(dataset_root: Path, episode_index: int, info: dict[str, Any]) -> tuple[Path, dict[str, Path]]:
@@ -420,216 +310,6 @@ def checkpoint_result(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
-def load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
-    ensure_robotwin_workdir()
-    import yaml
-    from envs import CONFIGS_PATH
-
-    task_config = "demo_clean"
-    with open(os.path.join(CONFIGS_PATH, f"{task_config}.yml"), encoding="utf-8") as f:
-        args = yaml.safe_load(f)
-
-    with open(os.path.join(CONFIGS_PATH, "_embodiment_config.yml"), encoding="utf-8") as f:
-        embodiment_types = yaml.safe_load(f)
-    embodiment = args.get("embodiment", ["aloha-agilex"])
-    if len(embodiment) == 1:
-        robot_file = embodiment_types[embodiment[0]]["file_path"]
-        args["left_robot_file"] = robot_file
-        args["right_robot_file"] = robot_file
-        args["dual_arm_embodied"] = True
-    elif len(embodiment) == 3:
-        args["left_robot_file"] = embodiment_types[embodiment[0]]["file_path"]
-        args["right_robot_file"] = embodiment_types[embodiment[1]]["file_path"]
-        args["embodiment_dis"] = embodiment[2]
-        args["dual_arm_embodied"] = False
-    else:
-        raise ValueError(f"embodiment must have 1 or 3 items, got {len(embodiment)}")
-
-    with open(os.path.join(args["left_robot_file"], "config.yml"), encoding="utf-8") as f:
-        args["left_embodiment_config"] = yaml.safe_load(f)
-    with open(os.path.join(args["right_robot_file"], "config.yml"), encoding="utf-8") as f:
-        args["right_embodiment_config"] = yaml.safe_load(f)
-
-    with open(os.path.join(CONFIGS_PATH, "_camera_config.yml"), encoding="utf-8") as f:
-        camera_config = yaml.safe_load(f)
-    head_cam = args["camera"]["head_camera_type"]
-    args["head_camera_h"] = camera_config[head_cam]["h"]
-    args["head_camera_w"] = camera_config[head_cam]["w"]
-    args["render_freq"] = 0
-    args["task_name"] = task_name
-    args["task_config"] = task_config
-    return args
-
-
-def load_robotwin_task(task_name: str) -> type:
-    ensure_robotwin_workdir()
-    module = importlib.import_module(f"envs.{task_name}")
-    task_cls = getattr(module, task_name, None)
-    if task_cls is None:
-        raise AttributeError(f"Task class '{task_name}' not found in envs/{task_name}.py")
-    return task_cls
-
-
-def ensure_robotwin_workdir() -> None:
-    robotwin_root = REPO_ROOT / "third_party" / "RoboTwin"
-    if robotwin_root.exists() and Path.cwd().resolve() != robotwin_root.resolve():
-        os.chdir(robotwin_root)
-
-
-class RoboTwinCompatEnv(gym.Env):
-    """Python 3.10 compatible wrapper for RoboTwin 2.0's SAPIEN API."""
-
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
-
-    def __init__(
-        self,
-        task_name: str,
-        episode_index: int = 0,
-        camera_names: Sequence[str] = ROBOTWIN_CAMERA_NAMES,
-        observation_height: int = ROBOTWIN_CAMERA_H,
-        observation_width: int = ROBOTWIN_CAMERA_W,
-        episode_length: int = 300,
-    ) -> None:
-        super().__init__()
-        self.task_name = task_name
-        self.task = task_name
-        self.task_description = task_name.replace("_", " ")
-        self.episode_index = episode_index
-        self.camera_names = list(camera_names)
-        self.observation_height = observation_height
-        self.observation_width = observation_width
-        self.episode_length = episode_length
-        self._max_episode_steps = episode_length
-        self._env: Any | None = None
-        self._step_count = 0
-        self._black_frame = np.zeros((self.observation_height, self.observation_width, 3), dtype=np.uint8)
-        self.observation_space = spaces.Dict(
-            {
-                "pixels": spaces.Dict(
-                    {
-                        cam: spaces.Box(
-                            low=0,
-                            high=255,
-                            shape=(self.observation_height, self.observation_width, 3),
-                            dtype=np.uint8,
-                        )
-                        for cam in self.camera_names
-                    }
-                ),
-                "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(ROBOTWIN_ACTION_DIM,), dtype=np.float32),
-            }
-        )
-        self.action_space = spaces.Box(
-            low=ROBOTWIN_ACTION_LOW,
-            high=ROBOTWIN_ACTION_HIGH,
-            shape=(ROBOTWIN_ACTION_DIM,),
-            dtype=np.float32,
-        )
-
-    def _ensure_env(self) -> None:
-        if self._env is None:
-            self._env = load_robotwin_task(self.task_name)()
-
-    def _get_obs(self) -> dict[str, Any]:
-        assert self._env is not None
-        raw = self._env.get_obs()
-        cameras_raw = raw.get("observation", {})
-        images: dict[str, np.ndarray] = {}
-        for cam in self.camera_names:
-            cam_data = cameras_raw.get(cam)
-            img = cam_data.get("rgb") if cam_data else None
-            if img is None:
-                images[cam] = self._black_frame
-                continue
-            img = np.asarray(img, dtype=np.uint8)
-            if img.ndim == 2:
-                img = np.stack([img, img, img], axis=-1)
-            elif img.shape[-1] != 3:
-                img = img[..., :3]
-            images[cam] = img
-
-        joint_action = raw.get("joint_action") or {}
-        vec = joint_action.get("vector")
-        if vec is None:
-            joint_state = np.zeros(ROBOTWIN_ACTION_DIM, dtype=np.float32)
-        else:
-            arr = np.asarray(vec, dtype=np.float32).ravel()
-            joint_state = (
-                arr[:ROBOTWIN_ACTION_DIM]
-                if arr.size >= ROBOTWIN_ACTION_DIM
-                else np.zeros(ROBOTWIN_ACTION_DIM, dtype=np.float32)
-            )
-        return {"pixels": images, "agent_pos": joint_state}
-
-    def reset(self, seed: int | None = None, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        import torch
-
-        self._ensure_env()
-        super().reset(seed=seed)
-        assert self._env is not None
-        actual_seed = self.episode_index if seed is None else seed
-        setup_kwargs = load_robotwin_setup_kwargs(self.task_name)
-        setup_kwargs.update(seed=actual_seed, is_test=True)
-        with torch.enable_grad():
-            self._env.setup_demo(**setup_kwargs)
-        self.episode_index += 1
-        self._step_count = 0
-        return self._get_obs(), {"is_success": False, "task": self.task_name}
-
-    def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
-        import torch
-
-        assert self._env is not None
-        action = np.asarray(action, dtype=np.float32)
-        if action.ndim != 1 or action.shape[0] != ROBOTWIN_ACTION_DIM:
-            raise ValueError(f"Expected action shape ({ROBOTWIN_ACTION_DIM},), got {action.shape}")
-        with torch.enable_grad():
-            if hasattr(self._env, "take_action"):
-                self._env.take_action(action)
-            else:
-                self._env.step(action)
-        self._step_count += 1
-        is_success = bool(getattr(self._env, "eval_success", False))
-        if not is_success and hasattr(self._env, "check_success"):
-            is_success = bool(self._env.check_success())
-        obs = self._get_obs()
-        truncated = self._step_count >= self.episode_length
-        info = {"task": self.task_name, "is_success": is_success}
-        return obs, float(is_success), is_success, truncated, info
-
-    def close(self) -> None:
-        if self._env is None:
-            return
-        with contextlib.suppress(Exception):
-            if hasattr(self._env, "close"):
-                self._env.close()
-            elif hasattr(self._env, "close_env"):
-                self._env.close_env()
-        self._env = None
-
-
-def make_robotwin_env(task_name: str, episode_index: int, episode_length: int) -> gym.Env:
-    ensure_robotwin_workdir()
-    try:
-        from lerobot.envs.robotwin import RoboTwinEnv
-
-        return RoboTwinEnv(
-            task_name=task_name,
-            episode_index=episode_index,
-            episode_length=episode_length,
-        )
-    except Exception as exc:
-        warnings.warn(
-            f"Falling back to local RoboTwinEnv compatibility wrapper because LeRobot import failed: {exc}",
-            RuntimeWarning,
-        )
-        return RoboTwinCompatEnv(
-            task_name=task_name,
-            episode_index=episode_index,
-            episode_length=episode_length,
-        )
-
-
 def robotwin_obs_to_payload(obs: dict[str, Any], prompt: str, session_id: str) -> dict[str, Any]:
     pixels = obs.get("pixels")
     if not isinstance(pixels, dict):
@@ -650,47 +330,6 @@ def save_rollout_video(output_dir: Path, episode_index: int, frames: list[np.nda
     path = output_dir / f"episode_{episode_index:06d}.mp4"
     imageio.mimsave(path.as_posix(), frames, fps=fps)
     return path.as_posix()
-
-
-def is_unstable_reset_error(exc: BaseException) -> bool:
-    return exc.__class__.__name__ == "UnStableError" or "Objects is unstable" in str(exc)
-
-
-def make_arm_tag(value: str) -> Any:
-    try:
-        ensure_robotwin_workdir()
-        from envs.utils import ArmTag
-
-        return ArmTag(value)
-    except Exception:
-        return value
-
-
-def initialize_robotwin_eval_state(env: gym.Env) -> None:
-    """Fill task fields that expert play_once normally creates before check_success."""
-    inner_env = getattr(env, "_env", None)
-    if inner_env is None:
-        return
-
-    task_name = str(getattr(inner_env, "task_name", getattr(env, "task_name", "")))
-    if task_name == "open_laptop" and not hasattr(inner_env, "arm_tag") and hasattr(inner_env, "laptop"):
-        try:
-            ensure_robotwin_workdir()
-            from envs.utils import ArmTag, get_face_prod
-
-            face_prod = get_face_prod(inner_env.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
-            inner_env.arm_tag = ArmTag("left" if face_prod > 0 else "right")
-        except Exception:
-            inner_env.arm_tag = make_arm_tag("left")
-
-    elif task_name == "place_object_scale" and not hasattr(inner_env, "arm_tag") and hasattr(inner_env, "object"):
-        inner_env.arm_tag = make_arm_tag("right" if inner_env.object.get_pose().p[0] > 0 else "left")
-
-    elif task_name == "put_object_cabinet" and hasattr(inner_env, "object"):
-        if not hasattr(inner_env, "arm_tag"):
-            inner_env.arm_tag = make_arm_tag("right" if inner_env.object.get_pose().p[0] > 0 else "left")
-        if not hasattr(inner_env, "origin_z"):
-            inner_env.origin_z = float(inner_env.object.get_pose().p[2])
 
 
 def reset_robotwin_env_with_retries(
@@ -722,16 +361,6 @@ def reset_robotwin_env_with_retries(
 
     assert last_error is not None
     raise last_error
-
-
-def robotwin_fast_step(
-    env: gym.Env,
-    action: np.ndarray,
-    *,
-    need_obs: bool,
-) -> tuple[dict[str, Any] | None, float, bool, bool, dict[str, Any]]:
-    """Step RoboTwin without rendering unless the next inference needs obs."""
-    return shared_robotwin_fast_step(env, action, need_obs=need_obs)
 
 
 def run_robotwin_mode(args: argparse.Namespace, client: WebsocketClientPolicy) -> list[dict[str, Any]]:
