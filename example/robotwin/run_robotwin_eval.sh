@@ -38,6 +38,7 @@ GPU selection:
 
 Common knobs:
   EPISODES=8 SAVE_VIDEO=0 PORT=8100
+  PROGRESS=plain ROBOTWIN_PROGRESS_INTERVAL=30
   EXPERT_FILTER_MAX_CANDIDATES=1000
 
 Legacy aliases still accepted:
@@ -304,6 +305,8 @@ VIDEO_FPS="${VIDEO_FPS:-10}"
 DRY_RUN_ACTIONS="${DRY_RUN_ACTIONS:-0}"
 PROFILE="${PROFILE:-0}"
 CLIENT_IMAGE_RESOLUTION="${CLIENT_IMAGE_RESOLUTION:-none}"
+PROGRESS="${PROGRESS:-${ROBOTWIN_PROGRESS:-plain}}"
+ROBOTWIN_PROGRESS_INTERVAL="${ROBOTWIN_PROGRESS_INTERVAL:-30}"
 SERVER_NPROC="${SERVER_NPROC:-$(csv_count "${SERVER_GPU_VALUE}")}"
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 HOST="${HOST:-127.0.0.1}"
@@ -413,6 +416,8 @@ run_controller() {
       --checkpoint-label "dreamzero_robotwin_lingbot_style_eval" \
       --checkpoint-path "${CKPT_RESOLVED}" \
       --client-image-resolution "${CLIENT_IMAGE_RESOLUTION}" \
+      --progress "${PROGRESS}" \
+      --progress-interval "${ROBOTWIN_PROGRESS_INTERVAL}" \
       "${profile_args[@]}" \
       "${video_args[@]}" \
       "${dry_args[@]}"
@@ -424,7 +429,7 @@ echo "[eval] ckpt=${CKPT_RESOLVED}"
 echo "[eval] output_root=${OUTPUT_ROOT}"
 echo "[eval] server_gpu=${SERVER_GPU_VALUE} server_nproc=${SERVER_NPROC} client_gpu=${CLIENT_GPU_VALUE} port=${PORT}"
 echo "[eval] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} seed_start=${SEED_START} open_loop_horizon=${OPEN_LOOP_HORIZON} expert_filter=${EXPERT_FILTER}"
-echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION}"
+echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION} progress=${PROGRESS}"
 
 if [[ "${DRY_RUN_ACTIONS}" == "1" ]]; then
   echo "[server] DRY_RUN_ACTIONS=1, skipping websocket server"

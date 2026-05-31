@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -57,6 +58,234 @@ class WorkerHandle:
     cuda_visible_devices: str
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minute:02d}m{sec:02d}s"
+    if minute:
+        return f"{minute}m{sec:02d}s"
+    return f"{sec}s"
+
+
+class ProgressReporter:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        total_tasks: int,
+        episodes_per_task: int,
+        output_dir: Path,
+        interval: float,
+    ) -> None:
+        self.mode = mode
+        self.total_tasks = int(total_tasks)
+        self.episodes_per_task = int(episodes_per_task)
+        self.total_episodes = self.total_tasks * self.episodes_per_task
+        self.output_dir = output_dir
+        self.interval = max(float(interval), 1.0)
+        self.started_at = time.perf_counter()
+        self.global_completed = 0
+        self.global_success = 0
+        self.last_update_at = 0.0
+        self.status_lock = threading.Lock()
+        self.current_status: str | None = None
+        self.current_status_started_at = 0.0
+        self.heartbeat_stop = threading.Event()
+        self.heartbeat_thread: threading.Thread | None = None
+        self._tqdm_cls: Any | None = None
+        self.task_bar: Any | None = None
+        self.episode_bar: Any | None = None
+
+        if self.mode == "tqdm":
+            try:
+                from tqdm import tqdm
+            except Exception as exc:
+                self.mode = "plain"
+                self._emit(f"[progress] tqdm unavailable ({exc}); falling back to plain logs")
+            else:
+                self._tqdm_cls = tqdm
+                self.task_bar = tqdm(
+                    total=self.total_tasks,
+                    desc="tasks",
+                    unit="task",
+                    dynamic_ncols=True,
+                    file=sys.stderr,
+                )
+
+        self.log(
+            f"enabled mode={self.mode} tasks={self.total_tasks} "
+            f"episodes_per_task={self.episodes_per_task} output={self.output_dir}"
+        )
+        if self.mode != "none":
+            self.heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="robotwin-progress-heartbeat",
+                daemon=True,
+            )
+            self.heartbeat_thread.start()
+
+    def _emit(self, message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    def log(self, message: str) -> None:
+        if self.mode == "none":
+            return
+        line = f"[progress {time.strftime('%H:%M:%S')}] {message}"
+        if self.mode == "tqdm" and self._tqdm_cls is not None:
+            self._tqdm_cls.write(line, file=sys.stderr)
+        else:
+            self._emit(line)
+
+    def _heartbeat_loop(self) -> None:
+        while not self.heartbeat_stop.wait(self.interval):
+            with self.status_lock:
+                status = self.current_status
+                started_at = self.current_status_started_at
+            if not status:
+                continue
+            self.log(f"still waiting: {status} elapsed={format_duration(time.perf_counter() - started_at)}")
+
+    def set_status(self, status: str) -> None:
+        if self.mode == "none":
+            return
+        with self.status_lock:
+            self.current_status = status
+            self.current_status_started_at = time.perf_counter()
+
+    def clear_status(self) -> None:
+        if self.mode == "none":
+            return
+        with self.status_lock:
+            self.current_status = None
+            self.current_status_started_at = 0.0
+
+    def close(self) -> None:
+        self.heartbeat_stop.set()
+        if self.heartbeat_thread is not None:
+            self.heartbeat_thread.join(timeout=1.0)
+            self.heartbeat_thread = None
+        if self.episode_bar is not None:
+            self.episode_bar.close()
+            self.episode_bar = None
+        if self.task_bar is not None:
+            self.task_bar.close()
+            self.task_bar = None
+
+    def task_start(self, *, task_index: int, task: str, episode_length: int, total_waves: int) -> None:
+        if self.mode == "tqdm" and self._tqdm_cls is not None:
+            if self.episode_bar is not None:
+                self.episode_bar.close()
+            self.episode_bar = self._tqdm_cls(
+                total=self.episodes_per_task,
+                desc=f"{task[:28]}",
+                unit="ep",
+                leave=False,
+                dynamic_ncols=True,
+                file=sys.stderr,
+            )
+        self.log(
+            f"task {task_index}/{self.total_tasks} start task={task} "
+            f"episodes={self.episodes_per_task} episode_length={episode_length} waves={total_waves}"
+        )
+
+    def wave_phase(
+        self,
+        *,
+        task_index: int,
+        task: str,
+        wave_id: int,
+        total_waves: int,
+        phase: str,
+        detail: str,
+    ) -> None:
+        self.log(f"task {task_index}/{self.total_tasks} {task} wave {wave_id + 1}/{total_waves} {phase}: {detail}")
+
+    def wave_step(
+        self,
+        *,
+        task_index: int,
+        task: str,
+        wave_id: int,
+        total_waves: int,
+        infer_index: int,
+        max_infer: int,
+        active: int,
+        batch_size: int,
+        successes: int,
+        errors: int,
+        infer_time: float,
+        wave_elapsed: float,
+        force: bool = False,
+    ) -> None:
+        now = time.perf_counter()
+        if not force and now - self.last_update_at < self.interval:
+            return
+        self.last_update_at = now
+        postfix = (
+            f"task={task} wave={wave_id + 1}/{total_waves} infer={infer_index}/{max_infer} "
+            f"active={active}/{batch_size} success={successes}/{batch_size} errors={errors} "
+            f"infer={infer_time:.2f}s elapsed={format_duration(wave_elapsed)}"
+        )
+        if self.mode == "tqdm" and self.episode_bar is not None:
+            self.episode_bar.set_postfix_str(
+                f"wave {wave_id + 1}/{total_waves} infer {infer_index}/{max_infer} "
+                f"active {active}/{batch_size} ok {successes}/{batch_size}"
+            )
+            return
+        self.log(f"task {task_index}/{self.total_tasks} {postfix}")
+
+    def wave_done(
+        self,
+        *,
+        task_index: int,
+        task: str,
+        wave_id: int,
+        total_waves: int,
+        results: list[dict[str, Any]],
+        task_completed: int,
+        wave_elapsed: float,
+    ) -> None:
+        completed = len(results)
+        successes = sum(1 for item in results if bool(item.get("success")))
+        errors = sum(1 for item in results if item.get("error"))
+        self.global_completed += completed
+        self.global_success += successes
+        if self.episode_bar is not None and completed:
+            self.episode_bar.update(completed)
+
+        elapsed = time.perf_counter() - self.started_at
+        rate = self.global_completed / elapsed if elapsed > 0 and self.global_completed else 0.0
+        remaining = max(self.total_episodes - self.global_completed, 0)
+        eta = remaining / rate if rate > 0 else 0.0
+        success_rate = successes / completed if completed else 0.0
+        self.log(
+            f"task {task_index}/{self.total_tasks} {task} wave {wave_id + 1}/{total_waves} done "
+            f"episodes={completed} success={successes}/{completed} ({success_rate:.1%}) errors={errors} "
+            f"task_progress={task_completed}/{self.episodes_per_task} "
+            f"global={self.global_completed}/{self.total_episodes} "
+            f"speed={rate * 60:.2f} ep/min eta={format_duration(eta)} "
+            f"wave_elapsed={format_duration(wave_elapsed)}"
+        )
+
+    def task_done(self, *, task_index: int, task: str, results: list[dict[str, Any]], elapsed: float) -> None:
+        completed = len(results)
+        successes = sum(1 for item in results if bool(item.get("success")))
+        errors = sum(1 for item in results if item.get("error"))
+        success_rate = successes / completed if completed else 0.0
+        self.log(
+            f"task {task_index}/{self.total_tasks} done task={task} "
+            f"episodes={completed} success={successes}/{completed} ({success_rate:.1%}) "
+            f"errors={errors} elapsed={format_duration(elapsed)}"
+        )
+        if self.episode_bar is not None:
+            self.episode_bar.close()
+            self.episode_bar = None
+        if self.task_bar is not None:
+            self.task_bar.update(1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-host", default="127.0.0.1")
@@ -81,6 +310,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-video", action="store_true", help="Save head-camera rollout videos from the worker.")
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--progress",
+        choices=("plain", "tqdm", "none"),
+        default=os.environ.get("ROBOTWIN_PROGRESS", "plain"),
+        help="Progress display mode. tqdm falls back to plain if tqdm is unavailable.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=float(os.environ.get("ROBOTWIN_PROGRESS_INTERVAL", "30")),
+        help="Minimum seconds between in-wave progress heartbeats.",
+    )
     parser.add_argument(
         "--client-image-resolution",
         default=os.environ.get("CLIENT_IMAGE_RESOLUTION", "none"),
@@ -152,7 +393,7 @@ def build_worker_env(cuda_visible_devices: str) -> dict[str, str]:
     return env
 
 
-def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]:
+def start_workers(args: argparse.Namespace, log_dir: Path, progress: ProgressReporter | None = None) -> list[WorkerHandle]:
     log_dir.mkdir(parents=True, exist_ok=True)
     worker_count = max(int(args.num_envs), 1)
     authkey = secrets.token_bytes(16)
@@ -164,6 +405,8 @@ def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]
     worker_script = REPO_ROOT / "example" / "robotwin" / "parallel_env_worker.py"
     procs: dict[int, subprocess.Popen] = {}
     log_paths: dict[int, Path] = {}
+    if progress is not None:
+        progress.log(f"starting workers count={worker_count} logs={log_dir}")
     for worker_id in range(worker_count):
         log_path = log_dir / f"env_worker_{worker_id}.log"
         cmd = [
@@ -195,6 +438,8 @@ def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]
     deadline = time.time() + args.worker_timeout
     handles: dict[int, WorkerHandle] = {}
     try:
+        if progress is not None:
+            progress.set_status(f"worker connections 0/{worker_count}")
         while len(handles) < worker_count:
             if time.time() > deadline:
                 missing = sorted(set(procs) - set(handles))
@@ -220,8 +465,19 @@ def start_workers(args: argparse.Namespace, log_dir: Path) -> list[WorkerHandle]
                 log_path=log_paths[worker_id],
                 cuda_visible_devices=str(ready.get("cuda_visible_devices", cuda_values[worker_id])),
             )
+            if progress is not None:
+                progress.log(
+                    f"worker connected {len(handles)}/{worker_count} "
+                    f"id={worker_id} pid={procs[worker_id].pid} cuda={handles[worker_id].cuda_visible_devices}"
+                )
+                if len(handles) < worker_count:
+                    progress.set_status(f"worker connections {len(handles)}/{worker_count}")
+        if progress is not None:
+            progress.clear_status()
         return [handles[worker_id] for worker_id in sorted(handles)]
     except Exception:
+        if progress is not None:
+            progress.clear_status()
         for proc in procs.values():
             if proc.poll() is None:
                 with contextlib.suppress(Exception):
@@ -888,19 +1144,35 @@ def run_wave(
     args: argparse.Namespace,
     *,
     task: str,
+    task_index: int,
     workers: list[WorkerHandle],
     client: WebsocketClientPolicy | None,
     episode_indices: list[int],
     episode_length: int,
     task_dir: Path,
     wave_id: int,
+    total_waves: int,
+    progress: ProgressReporter | None,
 ) -> list[dict[str, Any]]:
     planned_batch_size = len(episode_indices)
     if planned_batch_size <= 0:
         return []
+    wave_started_at = time.perf_counter()
     wave_workers = workers[:planned_batch_size]
     results: list[dict[str, Any]] = []
     reset_starts: dict[int, float] = {}
+
+    if progress is not None:
+        first_ep = min(episode_indices)
+        last_ep = max(episode_indices)
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="start",
+            detail=f"episodes={first_ep}-{last_ep} batch_size={planned_batch_size}",
+        )
 
     for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
         try:
@@ -927,10 +1199,29 @@ def run_wave(
                 )
             )
 
+    if progress is not None:
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="reset",
+            detail=f"waiting for {len(reset_starts)}/{planned_batch_size} env resets and expert filters",
+        )
+        progress.set_status(
+            f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} "
+            f"reset/expert_filter ready=0/{len(reset_starts)}"
+        )
+
     states: list[dict[str, Any]] = []
     for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
         if batch_index not in reset_starts:
             continue
+        if progress is not None:
+            progress.set_status(
+                f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} "
+                f"reset/expert_filter worker={worker.worker_id} episode={episode_index} ready={len(states)}/{len(reset_starts)}"
+            )
         try:
             reset_response = recv_worker(worker, args.worker_timeout)
             states.append(
@@ -964,7 +1255,19 @@ def run_wave(
             )
 
     if not states:
+        if progress is not None:
+            progress.clear_status()
         return results
+    if progress is not None:
+        progress.clear_status()
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="reset_done",
+            detail=f"ready={len(states)} reset_errors={len(results)}",
+        )
 
     canonical_prompt = str(states[0]["prompt"])
     session_id = f"robotwin-lingbot-{task}-wave-{wave_id}-{uuid.uuid4().hex[:8]}"
@@ -1000,11 +1303,28 @@ def run_wave(
         state["wave_batch_size"] = len(states)
 
     if client is not None:
-        client.reset({"session_id": session_id, "prompt": canonical_prompt})
+        if progress is not None:
+            progress.set_status(
+                f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} policy reset"
+            )
+        try:
+            client.reset({"session_id": session_id, "prompt": canonical_prompt})
+        finally:
+            if progress is not None:
+                progress.clear_status()
 
     max_infer = args.max_steps if args.max_steps > 0 else max(int(episode_length), 1)
     batch_size = len(states)
-    for _ in range(max_infer):
+    if progress is not None:
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="infer",
+            detail=f"batch_size={batch_size} max_infer={max_infer} session_id={session_id}",
+        )
+    for infer_index in range(max_infer):
         active_indices = [idx for idx, state in enumerate(states) if not bool(state["done"])]
         if not active_indices:
             break
@@ -1028,7 +1348,16 @@ def run_wave(
         else:
             assert client is not None
             infer_start = time.perf_counter()
-            raw_action = client.infer(dict(payload))
+            if progress is not None:
+                progress.set_status(
+                    f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} "
+                    f"infer {infer_index + 1}/{max_infer} batch={batch_size}"
+                )
+            try:
+                raw_action = client.infer(dict(payload))
+            finally:
+                if progress is not None:
+                    progress.clear_status()
             ws_roundtrip_time = time.perf_counter() - infer_start
             normalize_start = time.perf_counter()
             action_batch = normalize_batched_action_sequence(raw_action, batch_size)
@@ -1080,6 +1409,11 @@ def run_wave(
             if state.get("error"):
                 continue
             worker_wait_start = time.perf_counter()
+            if progress is not None:
+                progress.set_status(
+                    f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} "
+                    f"step worker={state['worker'].worker_id} episode={state['episode_index']}"
+                )
             try:
                 step_response = recv_worker(state["worker"], args.worker_timeout)
             except Exception as exc:
@@ -1087,6 +1421,9 @@ def run_wave(
                 state["error"] = f"{exc.__class__.__name__}: {exc}"
                 terminate_worker(state["worker"])
                 continue
+            finally:
+                if progress is not None:
+                    progress.clear_status()
             worker_wait_time = time.perf_counter() - worker_wait_start
 
             actions_sent = int(step_response.get("actions_sent", 0))
@@ -1108,6 +1445,26 @@ def run_wave(
             if actions_sent <= 0:
                 state["done"] = True
 
+        if progress is not None:
+            active_after_step = sum(1 for state in states if not bool(state["done"]))
+            successes = sum(1 for state in states if bool(state["success"]))
+            errors = sum(1 for state in states if state.get("error"))
+            progress.wave_step(
+                task_index=task_index,
+                task=task,
+                wave_id=wave_id,
+                total_waves=total_waves,
+                infer_index=infer_index + 1,
+                max_infer=max_infer,
+                active=active_after_step,
+                batch_size=batch_size,
+                successes=successes,
+                errors=errors,
+                infer_time=infer_time,
+                wave_elapsed=time.perf_counter() - wave_started_at,
+                force=infer_index == 0 or active_after_step == 0,
+            )
+
         if idle_count == batch_size:
             break
 
@@ -1125,6 +1482,11 @@ def run_wave(
                 last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
                 state["last_info"] = last_info
         for state in pending_video_states:
+            if progress is not None:
+                progress.set_status(
+                    f"task {task_index}/{progress.total_tasks} {task} wave {wave_id + 1}/{total_waves} "
+                    f"save_video worker={state['worker'].worker_id} episode={state['episode_index']}"
+                )
             try:
                 video_response = recv_worker(state["worker"], args.worker_timeout)
                 state["video_path"] = video_response.get("video_path") or state.get("video_path")
@@ -1135,6 +1497,9 @@ def run_wave(
                     last_info = {"last_info": last_info}
                 last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
                 state["last_info"] = last_info
+            finally:
+                if progress is not None:
+                    progress.clear_status()
 
     results.extend(finalize_episode(args, state, completed_at) for state in states)
     return results
@@ -1144,27 +1509,42 @@ def run_task(
     args: argparse.Namespace,
     *,
     task: str,
+    task_index: int,
     workers: list[WorkerHandle],
     client: WebsocketClientPolicy | None,
+    progress: ProgressReporter | None,
 ) -> list[dict[str, Any]]:
     task_dir = args.output_dir / task
     task_dir.mkdir(parents=True, exist_ok=True)
     episode_length = load_task_step_limit(task, args.episode_length)
     results: list[dict[str, Any]] = []
+    total_waves = max((args.episodes + args.num_envs - 1) // args.num_envs, 1)
+    task_started_at = time.perf_counter()
+    if progress is not None:
+        progress.task_start(
+            task_index=task_index,
+            task=task,
+            episode_length=episode_length,
+            total_waves=total_waves,
+        )
 
     wave_id = 0
     for episode_start in range(0, args.episodes, args.num_envs):
         episode_indices = list(range(episode_start, min(episode_start + args.num_envs, args.episodes)))
+        wave_started_at = time.perf_counter()
         try:
             wave_results = run_wave(
                 args,
                 task=task,
+                task_index=task_index,
                 workers=workers,
                 client=client,
                 episode_indices=episode_indices,
                 episode_length=episode_length,
                 task_dir=task_dir,
                 wave_id=wave_id,
+                total_waves=total_waves,
+                progress=progress,
             )
         except Exception as exc:
             wave_results = [
@@ -1183,12 +1563,29 @@ def run_task(
         for result in sorted(wave_results, key=lambda item: int(item.get("episode_index", 0))):
             write_episode_result(task_dir, result)
             results.append(result)
+        if progress is not None:
+            progress.wave_done(
+                task_index=task_index,
+                task=task,
+                wave_id=wave_id,
+                total_waves=total_waves,
+                results=wave_results,
+                task_completed=len(results),
+                wave_elapsed=time.perf_counter() - wave_started_at,
+            )
         wave_id += 1
 
     if client is not None:
         with contextlib.suppress(Exception):
             client.reset({"session_id": f"robotwin-lingbot-{task}-final-flush"})
     write_task_summary(task_dir, task, results)
+    if progress is not None:
+        progress.task_done(
+            task_index=task_index,
+            task=task,
+            results=results,
+            elapsed=time.perf_counter() - task_started_at,
+        )
     return results
 
 
@@ -1381,33 +1778,61 @@ def main() -> None:
         raise ValueError("--open-loop-horizon must be positive for dry-run chunks")
     if args.save_video and args.video_fps <= 0:
         raise ValueError("--video-fps must be positive when --save-video is enabled")
+    if args.progress_interval <= 0:
+        raise ValueError("--progress-interval must be positive")
 
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.resolved_client_image_resolution = None
     log_dir = args.output_dir / "logs"
     tasks = parse_tasks(args.tasks)
-    workers = start_workers(args, log_dir)
+    progress = ProgressReporter(
+        mode=args.progress,
+        total_tasks=len(tasks),
+        episodes_per_task=args.episodes,
+        output_dir=args.output_dir,
+        interval=args.progress_interval,
+    )
+    workers: list[WorkerHandle] = []
     client: WebsocketClientPolicy | None = None
     server_metadata: dict[str, Any] | None = None
     all_results: list[dict[str, Any]] = []
     try:
+        workers = start_workers(args, log_dir, progress=progress)
         if not args.dry_run_actions:
-            client = WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
-            server_metadata = client.get_server_metadata()
+            progress.log(f"connecting policy server ws://{args.remote_host}:{args.remote_port}")
+            progress.set_status(f"policy server connect ws://{args.remote_host}:{args.remote_port}")
+            try:
+                client = WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
+                server_metadata = client.get_server_metadata()
+                progress.log(f"policy server ready metadata={server_metadata}")
+            finally:
+                progress.clear_status()
+        else:
+            progress.log("dry-run actions enabled; policy server connection skipped")
         args.resolved_client_image_resolution = resolve_client_image_resolution(
             args.client_image_resolution,
             server_metadata,
         )
+        progress.log(f"client_image_resolution={args.resolved_client_image_resolution or 'none'}")
         write_run_config(args, tasks=tasks, workers=workers, server_metadata=server_metadata)
-        for task in tasks:
-            task_results = run_task(args, task=task, workers=workers, client=client)
+        for task_index, task in enumerate(tasks, start=1):
+            task_results = run_task(
+                args,
+                task=task,
+                task_index=task_index,
+                workers=workers,
+                client=client,
+                progress=progress,
+            )
             all_results.extend(task_results)
         write_report(args.output_dir, args.episodes)
     finally:
         if client is not None:
             client.close()
-        stop_workers(workers)
+        if workers:
+            stop_workers(workers)
+        progress.close()
 
     done = {
         "mode": "lingbot_style_robotwin",
