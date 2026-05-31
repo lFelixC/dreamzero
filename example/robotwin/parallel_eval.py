@@ -36,7 +36,9 @@ for extra in (
 
 from eval_utils.policy_client import WebsocketClientPolicy  # noqa: E402
 from example.robotwin.robotwin_fast_env import (  # noqa: E402
+    DEFAULT_ROBOTWIN_TASK_CONFIG,
     ROBOTWIN_ACTION_DIM,
+    ROBOTWIN_TASK_CONFIG_ENV,
     parse_image_resolution,
     robotwin_obs_sequences_to_batched_payload,
     robotwin_obs_sequence_to_payload,
@@ -296,6 +298,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-cuda", default=os.environ.get("ENV_CUDA", "0"))
     parser.add_argument("--worker-python", default=sys.executable)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--task-config",
+        default=os.environ.get(ROBOTWIN_TASK_CONFIG_ENV, DEFAULT_ROBOTWIN_TASK_CONFIG),
+        help="RoboTwin task config name, for example demo_clean or demo_randomized.",
+    )
     parser.add_argument("--episode-length", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0, help="Max inference requests per episode; 0 derives from task step limit.")
     parser.add_argument("--open-loop-horizon", type=int, default=24, help="Dry-run action chunk length only.")
@@ -377,9 +384,10 @@ def parse_cuda_list(raw: str, count: int) -> list[str]:
     return [values[i % len(values)] for i in range(count)]
 
 
-def build_worker_env(cuda_visible_devices: str) -> dict[str, str]:
+def build_worker_env(args: argparse.Namespace, cuda_visible_devices: str) -> dict[str, str]:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    env[ROBOTWIN_TASK_CONFIG_ENV] = str(args.task_config)
     pythonpath_parts = [
         str(REPO_ROOT),
         str(REPO_ROOT / "third_party" / "RoboTwin"),
@@ -426,7 +434,7 @@ def start_workers(args: argparse.Namespace, log_dir: Path, progress: ProgressRep
             procs[worker_id] = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_ROOT),
-                env=build_worker_env(cuda_values[worker_id]),
+                env=build_worker_env(args, cuda_values[worker_id]),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

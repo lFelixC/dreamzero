@@ -42,6 +42,8 @@ ROBOTWIN_CAMERA_TO_DREAMZERO = {
 }
 ROBOTWIN_CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
 ROBOTWIN_ACTION_DIM = 14
+DEFAULT_ROBOTWIN_TASK_CONFIG = "demo_clean"
+ROBOTWIN_TASK_CONFIG_ENV = "ROBOTWIN_TASK_CONFIG"
 ROBOTWIN_ACTION_LOW = -np.inf
 ROBOTWIN_ACTION_HIGH = np.inf
 ROBOTWIN_CAMERA_H = 240
@@ -354,14 +356,22 @@ def robotwin_obs_sequences_to_batched_payload(
     return payload
 
 
-def load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
+def get_robotwin_task_config() -> str:
+    return os.environ.get(ROBOTWIN_TASK_CONFIG_ENV, DEFAULT_ROBOTWIN_TASK_CONFIG).strip() or DEFAULT_ROBOTWIN_TASK_CONFIG
+
+
+def load_robotwin_setup_kwargs(task_name: str, task_config: str | None = None) -> dict[str, Any]:
     ensure_robotwin_workdir()
     import yaml
     from envs import CONFIGS_PATH
 
-    task_config = "demo_clean"
-    with open(os.path.join(CONFIGS_PATH, f"{task_config}.yml"), encoding="utf-8") as f:
+    resolved_task_config = (task_config or get_robotwin_task_config()).strip()
+    config_path = os.path.join(CONFIGS_PATH, f"{resolved_task_config}.yml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"RoboTwin task config not found: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
         args = yaml.safe_load(f)
+    args["_robotwin_task_config"] = resolved_task_config
 
     with open(os.path.join(CONFIGS_PATH, "_embodiment_config.yml"), encoding="utf-8") as f:
         embodiment_types = yaml.safe_load(f)

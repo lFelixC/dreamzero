@@ -39,6 +39,7 @@ GPU selection:
 Common knobs:
   EPISODES=8 SAVE_VIDEO=0 PORT=8100
   PROGRESS=plain ROBOTWIN_PROGRESS_INTERVAL=30
+  ROBOTWIN_TASK_CONFIG=demo_clean
   EXPERT_FILTER_MAX_CANDIDATES=1000
 
 Legacy aliases still accepted:
@@ -307,6 +308,7 @@ PROFILE="${PROFILE:-0}"
 CLIENT_IMAGE_RESOLUTION="${CLIENT_IMAGE_RESOLUTION:-none}"
 PROGRESS="${PROGRESS:-${ROBOTWIN_PROGRESS:-plain}}"
 ROBOTWIN_PROGRESS_INTERVAL="${ROBOTWIN_PROGRESS_INTERVAL:-30}"
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-${TASK_CONFIG:-demo_clean}}"
 SERVER_NPROC="${SERVER_NPROC:-$(csv_count "${SERVER_GPU_VALUE}")}"
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 HOST="${HOST:-127.0.0.1}"
@@ -407,6 +409,7 @@ run_controller() {
       --env-cuda "${CLIENT_GPU_VALUE}" \
       --worker-python "${ROBOTWIN_PYTHON}" \
       --output-dir "${OUTPUT_ROOT}" \
+      --task-config "${ROBOTWIN_TASK_CONFIG}" \
       --episode-length "${EPISODE_LENGTH}" \
       --max-steps "${MAX_STEPS}" \
       --seed-start "${SEED_START}" \
@@ -429,7 +432,7 @@ echo "[eval] ckpt=${CKPT_RESOLVED}"
 echo "[eval] output_root=${OUTPUT_ROOT}"
 echo "[eval] server_gpu=${SERVER_GPU_VALUE} server_nproc=${SERVER_NPROC} client_gpu=${CLIENT_GPU_VALUE} port=${PORT}"
 echo "[eval] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} seed_start=${SEED_START} open_loop_horizon=${OPEN_LOOP_HORIZON} expert_filter=${EXPERT_FILTER}"
-echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION} progress=${PROGRESS}"
+echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION} progress=${PROGRESS} task_config=${ROBOTWIN_TASK_CONFIG}"
 
 if [[ "${DRY_RUN_ACTIONS}" == "1" ]]; then
   echo "[server] DRY_RUN_ACTIONS=1, skipping websocket server"

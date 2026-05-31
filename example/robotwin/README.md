@@ -161,8 +161,10 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/data/dreamzero}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
 
 PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/lerobot/src:${REPO_ROOT}/third_party/lerobot:${PYTHONPATH:-}" \
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG}" \
 CUDA_VISIBLE_DEVICES="${CLIENT_GPU:-0}" \
 "${ROBOTWIN_PYTHON}" - <<'PY'
 from example.robotwin.robotwin_fast_env import make_robotwin_env
@@ -279,6 +281,7 @@ MAX_CHUNK_SIZE               max returned policy action chunk
 SAVE_VIDEO                   save client rollout videos when nonzero
 VIDEO_FPS                    client rollout video fps
 CLIENT_IMAGE_RESOLUTION      none, auto, or HxW
+ROBOTWIN_TASK_CONFIG         demo_clean or demo_randomized
 PORT                         websocket server port
 HOST                         host used by the local controller to reach the server
 SERVER_HOST                  interface that the local server binds
@@ -296,6 +299,8 @@ ROBOTWIN_PYTHON              RoboTwin Python executable
 
 For real policy eval, action chunk length is controlled by `MAX_CHUNK_SIZE`.
 `OPEN_LOOP_HORIZON` only affects zero-action dry runs.
+`ROBOTWIN_TASK_CONFIG=demo_clean` evaluates the clean/easy RoboTwin setting.
+Use `ROBOTWIN_TASK_CONFIG=demo_randomized` for the randomized/hard setting.
 
 Outputs:
 
@@ -448,6 +453,7 @@ PORT="${PORT:-8100}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_4090_client}"
 CLIENT_GPU="${CLIENT_GPU:-0,1,2,3,4,5,6,7}"
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
 
 PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero/third_party/lerobot/src:/data/dreamzero/third_party/lerobot:${PYTHONPATH:-}" \
 "${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
@@ -459,6 +465,7 @@ PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero
   --env-cuda "${CLIENT_GPU}" \
   --worker-python "${ROBOTWIN_PYTHON}" \
   --output-dir "${OUTPUT_ROOT}" \
+  --task-config "${ROBOTWIN_TASK_CONFIG}" \
   --episode-length "${EPISODE_LENGTH:-0}" \
   --max-steps "${MAX_STEPS:-0}" \
   --seed-start "${SEED_START:-0}" \
@@ -484,6 +491,7 @@ PORT="${PORT:-8100}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_full_eval}"
 CLIENT_GPU="${CLIENT_GPU:-0,1,2,3,4,5,6,7}"
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
 
 PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero/third_party/lerobot/src:/data/dreamzero/third_party/lerobot:${PYTHONPATH:-}" \
 "${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
@@ -495,6 +503,7 @@ PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero
   --env-cuda "${CLIENT_GPU}" \
   --worker-python "${ROBOTWIN_PYTHON}" \
   --output-dir "${OUTPUT_ROOT}" \
+  --task-config "${ROBOTWIN_TASK_CONFIG}" \
   --episode-length "${EPISODE_LENGTH:-0}" \
   --max-steps "${MAX_STEPS:-0}" \
   --seed-start "${SEED_START:-0}" \
