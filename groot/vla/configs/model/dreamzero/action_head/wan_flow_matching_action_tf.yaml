@@ -24,6 +24,8 @@ mot_decoupled_inference_video_final_noise: 0.8
 mot_decoupled_inference_video_refresh_steps: 1
 dynamics_loss_weight: 1.0
 action_loss_weight: 1.0
+static_video_init: false
+static_video_init_noise: 0.0
 num_frame_per_block: 1
 num_action_per_block: 32
 num_state_per_block: 1
@@ -59,6 +61,12 @@ action_head_cfg:
     mot_decoupled_inference_video_refresh_steps: ${mot_decoupled_inference_video_refresh_steps}
     dynamics_loss_weight: ${dynamics_loss_weight}
     action_loss_weight: ${action_loss_weight}
+    # Static video initialization:
+    #   static_video_init=true static_video_init_noise=0.0  -> pure static previous-frame block
+    #   static_video_init=true static_video_init_noise=0.3  -> 70% static latent + 30% Gaussian noise
+    #   static_video_init=false keeps the original pure-noise initialization path
+    static_video_init: ${static_video_init}
+    static_video_init_noise: ${static_video_init_noise}
     use_gradient_checkpointing: true
     add_pos_embed: ${add_pos_embed}
     model_dtype: float32

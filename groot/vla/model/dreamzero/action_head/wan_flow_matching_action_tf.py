@@ -113,6 +113,14 @@ class WANPolicyHeadConfig(PretrainedConfig):
     # spatial size matches. Use height/width divisible by 32 for WanVideoVAE38 (16x) so latent H,W are even.
     target_video_height: int | None = field(default=None, metadata={"help": "Target video height for resize (e.g. 160 for even latent with VAE38)."})
     target_video_width: int | None = field(default=None, metadata={"help": "Target video width for resize (e.g. 320)."})
+    static_video_init: bool = field(
+        default=False,
+        metadata={"help": "Initialize predicted video blocks from a pixel-level static copy of the previous frame instead of pure latent noise."},
+    )
+    static_video_init_noise: float = field(
+        default=0.0,
+        metadata={"help": "Blend ratio of Gaussian latent noise into static video initialization. 0.3 means 70% static latent and 30% noise."},
+    )
 
     lora_rank: int = field(default=4, metadata={"help": "LoRA rank."})
     lora_alpha: int = field(default=4, metadata={"help": "LoRA alpha."})
@@ -320,6 +328,10 @@ class WANPolicyHead(ActionHead):
         self.tile_stride_height = config.tile_stride_height
         self.tile_stride_width = config.tile_stride_width
         self.num_frame_per_block = config.num_frame_per_block
+        self.static_video_init = self._coerce_bool(getattr(config, "static_video_init", False))
+        self.static_video_init_noise = self._validate_static_video_init_noise(
+            getattr(config, "static_video_init_noise", 0.0),
+        )
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
         self.text_encoder = instantiate(config.text_encoder_cfg)
@@ -474,6 +486,165 @@ class WANPolicyHead(ActionHead):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @staticmethod
+    def _validate_static_video_init_noise(value: float | int | str) -> float:
+        noise = float(value)
+        if not 0.0 <= noise <= 1.0:
+            raise ValueError(
+                "static_video_init_noise must be in [0, 1], "
+                f"got {noise}."
+            )
+        return noise
+
+    def _static_video_init_enabled(self) -> bool:
+        return self._coerce_bool(
+            getattr(self.config, "static_video_init", self.static_video_init),
+        )
+
+    def _static_video_init_noise_ratio(self) -> float:
+        return self._validate_static_video_init_noise(
+            getattr(self.config, "static_video_init_noise", self.static_video_init_noise),
+        )
+
+    def _mix_static_init_with_noise(
+        self,
+        static_latents: torch.Tensor,
+        gaussian_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        noise_ratio = self._static_video_init_noise_ratio()
+        if noise_ratio == 0.0:
+            return static_latents
+        return torch.lerp(static_latents, gaussian_noise, noise_ratio)
+
+    def _build_static_prediction_pixels(
+        self,
+        previous_frame: torch.Tensor,
+        latent_frames: int,
+    ) -> torch.Tensor:
+        if previous_frame.ndim != 5 or previous_frame.shape[2] != 1:
+            raise ValueError(
+                "Expected previous_frame with shape [B, C, 1, H, W], "
+                f"got {tuple(previous_frame.shape)}."
+            )
+        if latent_frames < 1:
+            raise ValueError(f"latent_frames must be >= 1, got {latent_frames}.")
+        return previous_frame.repeat(1, 1, 1 + 4 * latent_frames, 1, 1)
+
+    def _encode_static_block_latents(
+        self,
+        previous_frame: torch.Tensor,
+        latent_frames: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        static_pixels = self._build_static_prediction_pixels(previous_frame, latent_frames)
+        static_latents = self.encode_video(
+            static_pixels,
+            self.tiled,
+            (self.tile_size_height, self.tile_size_width),
+            (self.tile_stride_height, self.tile_stride_width),
+        )
+        static_latents = static_latents[:, :, 1:1 + latent_frames]
+        return static_latents.to(device=device, dtype=dtype)
+
+    def _encode_static_training_init(
+        self,
+        videos: torch.Tensor,
+        target_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        if videos.ndim != 5:
+            raise ValueError(
+                "Expected videos with shape [B, C, T, H, W], "
+                f"got {tuple(videos.shape)}."
+            )
+        latent_frames = target_latents.shape[2]
+        future_latent_frames = latent_frames - 1
+        if future_latent_frames <= 0:
+            return target_latents.clone()
+        if future_latent_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                "Static video initialization requires future latent frames to form complete causal blocks: "
+                f"future_latent_frames={future_latent_frames}, "
+                f"num_frame_per_block={self.num_frame_per_block}."
+            )
+
+        block_starts = list(range(1, latent_frames, self.num_frame_per_block))
+        previous_frames = []
+        total_pixel_frames = videos.shape[2]
+        for block_start_latent in block_starts:
+            prev_pixel_index = 4 * (block_start_latent - 1)
+            if prev_pixel_index >= total_pixel_frames:
+                raise ValueError(
+                    "Cannot build static video initialization because the previous block frame is missing: "
+                    f"prev_pixel_index={prev_pixel_index}, total_pixel_frames={total_pixel_frames}."
+                )
+            previous_frames.append(videos[:, :, prev_pixel_index:prev_pixel_index + 1])
+
+        batch_size = videos.shape[0]
+        batched_previous_frames = torch.cat(previous_frames, dim=0)
+        block_latents = self._encode_static_block_latents(
+            batched_previous_frames,
+            latent_frames=self.num_frame_per_block,
+            device=target_latents.device,
+            dtype=target_latents.dtype,
+        )
+        expected_block_shape = torch.Size((
+            len(block_starts) * batch_size,
+            target_latents.shape[1],
+            self.num_frame_per_block,
+            target_latents.shape[3],
+            target_latents.shape[4],
+        ))
+        if block_latents.shape != expected_block_shape:
+            raise ValueError(
+                "Static video initialization latent shape mismatch during training: "
+                f"got {tuple(block_latents.shape)}, expected {tuple(expected_block_shape)}."
+            )
+
+        block_latents = block_latents.reshape(
+            len(block_starts),
+            batch_size,
+            target_latents.shape[1],
+            self.num_frame_per_block,
+            target_latents.shape[3],
+            target_latents.shape[4],
+        )
+        static_init_latents = target_latents.clone()
+        for block_index, block_start_latent in enumerate(block_starts):
+            static_init_latents[
+                :, :, block_start_latent:block_start_latent + self.num_frame_per_block
+            ] = block_latents[block_index]
+        return static_init_latents
+
+    def _encode_static_prediction_init(
+        self,
+        previous_frame: torch.Tensor,
+        latent_shape: tuple[int, int, int, int, int],
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        static_latents = self._encode_static_block_latents(
+            previous_frame,
+            latent_frames=latent_shape[2],
+            device=device,
+            dtype=dtype,
+        )
+        expected_shape = torch.Size(latent_shape)
+        if static_latents.shape != expected_shape:
+            raise ValueError(
+                "Static video initialization latent shape mismatch: "
+                f"got {tuple(static_latents.shape)}, expected {tuple(expected_shape)}."
+            )
+        if self._static_video_init_noise_ratio() == 0.0:
+            return static_latents
+        gaussian_noise = self.generate_noise(
+            latent_shape,
+            seed=self.seed,
+            device=device,
+            dtype=dtype,
+        )
+        return self._mix_static_init_with_noise(static_latents, gaussian_noise)
 
     def _infer_mot_one_step_video_training_timestep(self) -> tuple[int, float, float]:
         num_train_timesteps = float(self.scheduler.num_train_timesteps)
@@ -946,6 +1117,9 @@ class WANPolicyHead(ActionHead):
                 ).reshape(b, c, t, target_h, target_w)
 
         latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
+        static_init_latents = None
+        if self._static_video_init_enabled():
+            static_init_latents = self._encode_static_training_init(videos, latents)
         latent_frame_mask = None
         if video_frame_mask is not None:
             latent_frame_mask = self._video_mask_to_latent_mask(
@@ -977,6 +1151,10 @@ class WANPolicyHead(ActionHead):
 
         # Loss
         noise = torch.randn_like(latents)
+        if static_init_latents is not None:
+            static_init_latents = static_init_latents.to(device=noise.device, dtype=noise.dtype)
+            static_init_latents = self._mix_static_init_with_noise(static_init_latents, noise)
+            noise = torch.cat([noise[:, :, :1], static_init_latents[:, :, 1:]], dim=2)
 
         # specific to autoregressive
         noise = noise.transpose(1, 2)
@@ -2052,9 +2230,11 @@ class WANPolicyHead(ActionHead):
         _, _, num_frames, height, width = videos.shape
         if videos.shape[2] == 4 or videos.shape[2] == 9:
             # special case for real-world eval where language is updated
-            image = videos[:, :, -1:].transpose(1, 2)
+            image_pixels = videos[:, :, -1:]
         else:
-            image = videos[:, :, :1].transpose(1, 2)
+            image_pixels = videos[:, :, :1]
+        static_init_frame_pixels = image_pixels
+        image = image_pixels.transpose(1, 2)
 
         if self.current_start_frame == 0:
             clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
@@ -2069,6 +2249,7 @@ class WANPolicyHead(ActionHead):
 
         if latent_video is not None and self.current_start_frame != 0:
             image = latent_video
+            static_init_frame_pixels = videos[:, :, -1:]
             if self.ip_rank == 0:
                 print("image shape@@", image.shape)
         elif self.current_start_frame != 0:
@@ -2086,6 +2267,7 @@ class WANPolicyHead(ActionHead):
                 first_frame = videos[:, :, 0:1]  # Extract first frame
                 videos = torch.cat([first_frame, videos], dim=2)
 
+            static_init_frame_pixels = videos[:, :, -1:]
             image = self.vae.encode(
                 videos,
                 tiled=self.tiled,
@@ -2095,7 +2277,22 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_obs_shape = (
+            image.shape[0],
+            image.shape[1],
+            self.num_frame_per_block,
+            image.shape[3],
+            image.shape[4],
+        )
+        if self._static_video_init_enabled():
+            noise_obs = self._encode_static_prediction_init(
+                static_init_frame_pixels.to(device=image.device, dtype=torch.bfloat16),
+                latent_shape=noise_obs_shape,
+                device=image.device,
+                dtype=torch.bfloat16,
+            )
+        else:
+            noise_obs = self.generate_noise(noise_obs_shape, seed=self.seed, device='cuda', dtype=torch.bfloat16)
         noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
