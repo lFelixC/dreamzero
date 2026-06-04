@@ -1562,7 +1562,7 @@ class WANPolicyHead(ActionHead):
             else:
                 mode = (
                     "cache_only"
-                    if action_video_attention in {"first_frame", "none", "full_video_unidirectional"}
+                    if action_video_attention in {"first_frame", "none"}
                     else "denoise"
                 )
         if video_reads_action and mode in {"cache_only", "decoupled_denoise"}:
