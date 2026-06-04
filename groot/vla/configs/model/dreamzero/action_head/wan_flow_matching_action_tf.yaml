@@ -60,6 +60,7 @@ action_head_cfg:
     mot_decoupled_inference_video_final_noise: ${mot_decoupled_inference_video_final_noise}
     mot_decoupled_inference_video_refresh_steps: ${mot_decoupled_inference_video_refresh_steps}
     use_gradient_checkpointing: true
+    activation_checkpointing_policy: "off"
     add_pos_embed: ${add_pos_embed}
     model_dtype: float32
     max_state_dim: ${max_state_dim}

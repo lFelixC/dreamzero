@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import os
+from contextvars import ContextVar
+from collections.abc import Iterable
 from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint_utils
 from diffusers.configuration_utils import register_to_config
 
 from groot.vla.model.dreamzero.modules.wan2_1_submodule import (
@@ -21,8 +26,45 @@ from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import 
 )
 
 MoTActionVideoAttention = Literal["first_frame", "full_video", "full_video_unidirectional", "none"]
+ActivationCheckpointingPolicy = Literal["off", "mixed", "both"]
 _MOT_ACTION_VIDEO_ATTENTION_MODES = ("first_frame", "full_video", "full_video_unidirectional", "none")
 _MOT_ACTION_FULL_VIDEO_MODES = ("full_video", "full_video_unidirectional")
+_ACTIVATION_CHECKPOINTING_POLICIES = ("off", "mixed", "both")
+
+
+def _maybe_aten_op(name: str):
+    packet = getattr(torch.ops.aten, name, None)
+    return getattr(packet, "default", None) if packet is not None else None
+
+
+_SAC_ATTENTION_OPS = frozenset(
+    op for op in (
+        _maybe_aten_op("_scaled_dot_product_flash_attention"),
+        _maybe_aten_op("_scaled_dot_product_efficient_attention"),
+        _maybe_aten_op("_scaled_dot_product_cudnn_attention"),
+        _maybe_aten_op("_scaled_dot_product_flash_attention_for_cpu"),
+        _maybe_aten_op("_scaled_dot_product_fused_attention_overrideable"),
+        _maybe_aten_op("_flash_attention_forward"),
+        _maybe_aten_op("_efficient_attention_forward"),
+    )
+    if op is not None
+)
+_SAC_ATTENTION_VALUE_OPS = frozenset(
+    op for op in (
+        _maybe_aten_op("bmm"),
+        _maybe_aten_op("mm"),
+        _maybe_aten_op("matmul"),
+    )
+    if op is not None
+)
+_SAC_CUSTOM_ATTENTION_OP_NAME_PARTS = (
+    "flash_attn",
+    "fused_attn",
+    "fused_attention",
+    "transformer_engine",
+)
+_SAC_REGION: ContextVar[str | None] = ContextVar("dreamzero_sac_region", default=None)
+_SAC_OUTPUT_LAST_DIM: ContextVar[int | None] = ContextVar("dreamzero_sac_output_last_dim", default=None)
 
 
 def _coerce_bool(value: bool | str) -> bool:
@@ -35,6 +77,56 @@ def _coerce_bool(value: bool | str) -> bool:
         if normalized in ("0", "false", "no", "n", "off"):
             return False
     raise ValueError(f"Expected a boolean value, got {value!r}")
+
+
+def _normalize_activation_checkpointing_policy(value: str) -> ActivationCheckpointingPolicy:
+    normalized = str(value).strip().lower()
+    if normalized not in _ACTIVATION_CHECKPOINTING_POLICIES:
+        raise ValueError(
+            "activation_checkpointing_policy must be one of "
+            f"{_ACTIVATION_CHECKPOINTING_POLICIES}, got {value!r}."
+        )
+    return normalized  # type: ignore[return-value]
+
+
+@contextlib.contextmanager
+def _sac_region(region: str, *, output_last_dim: int | None = None):
+    region_token = _SAC_REGION.set(region)
+    output_last_dim_token = _SAC_OUTPUT_LAST_DIM.set(output_last_dim)
+    try:
+        yield
+    finally:
+        _SAC_OUTPUT_LAST_DIM.reset(output_last_dim_token)
+        _SAC_REGION.reset(region_token)
+
+
+def _is_sac_attention_value_op(op, args) -> bool:
+    if op not in _SAC_ATTENTION_VALUE_OPS or len(args) < 2:
+        return False
+    lhs = args[0]
+    rhs = args[1]
+    if not isinstance(lhs, torch.Tensor) or not isinstance(rhs, torch.Tensor):
+        return False
+    if lhs.ndim < 2 or rhs.ndim < 2:
+        return False
+    expected_output_last_dim = _SAC_OUTPUT_LAST_DIM.get()
+    if expected_output_last_dim is None:
+        return False
+    # In the math SDPA path, the QK op produces [*, Q, K] while the final
+    # probability/value op produces [*, Q, D]. Save only the latter so SAC does
+    # not materialize the quadratic attention score/probability matrix.
+    return int(rhs.shape[-1]) == int(expected_output_last_dim)
+
+
+def _is_sac_attention_op(op, args) -> bool:
+    if op in _SAC_ATTENTION_OPS:
+        return True
+    if _is_sac_attention_value_op(op, args):
+        return True
+    if getattr(op, "namespace", None) == "aten":
+        return False
+    op_name = str(op).lower()
+    return any(name_part in op_name for name_part in _SAC_CUSTOM_ATTENTION_OP_NAME_PARTS)
 
 
 def _normalize_rope_freqs(freqs: torch.Tensor, *, complex_freqs: bool) -> torch.Tensor:
@@ -458,6 +550,7 @@ class MoTCausalWanModel(CausalWanModel):
         mot_action_num_heads: int = 8,
         mot_action_video_attention: MoTActionVideoAttention = "full_video",
         mot_action_video_ki: bool | str = False,
+        activation_checkpointing_policy: ActivationCheckpointingPolicy | str = "off",
         **kwargs,
     ):
         for removed_key in (
@@ -471,6 +564,39 @@ class MoTCausalWanModel(CausalWanModel):
             kwargs.pop(f"mot_{removed_key}", None)
         super().__init__(*args, **kwargs)
         self.is_mot_wam = True
+        self.activation_checkpointing_policy = _normalize_activation_checkpointing_policy(
+            activation_checkpointing_policy
+        )
+        if self.activation_checkpointing_policy != "off":
+            if not self.gradient_checkpointing:
+                raise ValueError(
+                    "activation_checkpointing_policy requires use_gradient_checkpointing=true; "
+                    f"got activation_checkpointing_policy={self.activation_checkpointing_policy!r}."
+                )
+            if not hasattr(checkpoint_utils, "create_selective_checkpoint_contexts"):
+                raise RuntimeError(
+                    "activation_checkpointing_policy requires "
+                    "torch.utils.checkpoint.create_selective_checkpoint_contexts."
+                )
+        self._sac_regions_to_save = frozenset(
+            ("mixed", "video_self") if self.activation_checkpointing_policy == "both" else
+            ("mixed",) if self.activation_checkpointing_policy == "mixed" else
+            ()
+        )
+        self._sac_debug = os.getenv("DREAMZERO_SAC_DEBUG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._sac_trace = os.getenv("DREAMZERO_SAC_TRACE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._sac_debug_logged_ops: set[tuple[str, str]] = set()
+        self._sac_trace_logged_ops: set[tuple[str, str, bool]] = set()
         if mot_action_video_attention == "causal":
             raise ValueError(
                 "mot_action_video_attention='causal' was removed; use 'full_video' for block-causal "
@@ -522,6 +648,60 @@ class MoTCausalWanModel(CausalWanModel):
             output_dim=self.dim,
         )
         self.state_context_norm = WanLayerNorm(self.dim, self.eps)
+
+    @staticmethod
+    def _format_sac_arg_shapes(args) -> str:
+        shapes = []
+        for arg in args[:3]:
+            if isinstance(arg, torch.Tensor):
+                shapes.append(str(tuple(arg.shape)))
+        return ", ".join(shapes)
+
+    def _sac_policy_fn(self, active_regions: frozenset[str], ctx, op, *args, **kwargs):
+        region = _SAC_REGION.get()
+        should_save = region in active_regions and _is_sac_attention_op(op, args)
+        if self._sac_trace and region in active_regions:
+            key = (region, str(op), should_save)
+            if key not in self._sac_trace_logged_ops and len(self._sac_trace_logged_ops) < 32:
+                self._sac_trace_logged_ops.add(key)
+                print(
+                    "[DreamZero SAC] trace "
+                    f"region={region} save={should_save} op={op} "
+                    f"args={self._format_sac_arg_shapes(args)}"
+                )
+        if should_save:
+            if self._sac_debug:
+                key = (region, str(op))
+                if key not in self._sac_debug_logged_ops and len(self._sac_debug_logged_ops) < 8:
+                    self._sac_debug_logged_ops.add(key)
+                    print(f"[DreamZero SAC] save region={region} op={op}")
+            return checkpoint_utils.CheckpointPolicy.MUST_SAVE
+        return checkpoint_utils.CheckpointPolicy.PREFER_RECOMPUTE
+
+    def _sac_context_fn(self, active_regions: frozenset[str]):
+        return checkpoint_utils.create_selective_checkpoint_contexts(
+            lambda ctx, op, *args, **kwargs: self._sac_policy_fn(
+                active_regions,
+                ctx,
+                op,
+                *args,
+                **kwargs,
+            ),
+            allow_cache_entry_mutation=True,
+        )
+
+    def _checkpoint_with_sac(self, function, *args, sac_regions: Iterable[str] | None = None):
+        if self.activation_checkpointing_policy == "off":
+            return checkpoint_utils.checkpoint(function, *args, use_reentrant=False)
+        active_regions = frozenset(sac_regions or ()) & self._sac_regions_to_save
+        if not active_regions:
+            return checkpoint_utils.checkpoint(function, *args, use_reentrant=False)
+        return checkpoint_utils.checkpoint(
+            function,
+            *args,
+            use_reentrant=False,
+            context_fn=lambda: self._sac_context_fn(active_regions),
+        )
 
     def _build_text_image_context(
         self,
@@ -823,35 +1003,36 @@ class MoTCausalWanModel(CausalWanModel):
 
             clean_v = v[:, :half_seq_len]
             noisy_v = v[:, half_seq_len:]
-            if key_mask is None:
-                x_clean = self_attn._process_clean_image_only_stable(rq_clean, rk_clean, clean_v)
-                x_noisy = self_attn._process_noisy_image_only_blocks(
-                    rq_noisy,
-                    rk_noisy,
-                    noisy_v,
-                    rk_clean,
-                    clean_v,
-                )
-            else:
-                clean_key_mask = key_mask[:, :half_seq_len]
-                noisy_key_mask = key_mask[:, half_seq_len:]
-                x_clean = self._clean_image_attention_with_mask(
-                    self_attn,
-                    rq_clean,
-                    rk_clean,
-                    clean_v,
-                    clean_key_mask,
-                )
-                x_noisy = self._noisy_image_attention_with_mask(
-                    self_attn,
-                    rq_noisy,
-                    rk_noisy,
-                    noisy_v,
-                    rk_clean,
-                    clean_v,
-                    noisy_key_mask,
-                    clean_key_mask,
-                )
+            with _sac_region("video_self", output_last_dim=d):
+                if key_mask is None:
+                    x_clean = self_attn._process_clean_image_only_stable(rq_clean, rk_clean, clean_v)
+                    x_noisy = self_attn._process_noisy_image_only_blocks(
+                        rq_noisy,
+                        rk_noisy,
+                        noisy_v,
+                        rk_clean,
+                        clean_v,
+                    )
+                else:
+                    clean_key_mask = key_mask[:, :half_seq_len]
+                    noisy_key_mask = key_mask[:, half_seq_len:]
+                    x_clean = self._clean_image_attention_with_mask(
+                        self_attn,
+                        rq_clean,
+                        rk_clean,
+                        clean_v,
+                        clean_key_mask,
+                    )
+                    x_noisy = self._noisy_image_attention_with_mask(
+                        self_attn,
+                        rq_noisy,
+                        rk_noisy,
+                        noisy_v,
+                        rk_clean,
+                        clean_v,
+                        noisy_key_mask,
+                        clean_key_mask,
+                    )
             y = torch.cat([x_clean, x_noisy], dim=1)
             roped_k = torch.cat([rk_clean, rk_noisy], dim=1)
         else:
@@ -869,27 +1050,28 @@ class MoTCausalWanModel(CausalWanModel):
                 freqs_state=self.freqs_state,
                 action_register_length=None,
             ).type_as(v)
-            if key_mask is None:
-                y = self_attn._blockwise_causal_flash_attn(
-                    roped_q,
-                    roped_k,
-                    v,
-                    self.frame_seqlen,
-                    self.num_frame_per_block,
-                    action_horizon=None,
-                    state_horizon=None,
-                    num_action_per_block=None,
-                    num_state_per_block=None,
-                    visualize_mask=False,
-                )
-            else:
-                y = self._video_blockwise_attention_with_mask(
-                    self_attn,
-                    roped_q,
-                    roped_k,
-                    v,
-                    key_mask,
-                )
+            with _sac_region("video_self", output_last_dim=d):
+                if key_mask is None:
+                    y = self_attn._blockwise_causal_flash_attn(
+                        roped_q,
+                        roped_k,
+                        v,
+                        self.frame_seqlen,
+                        self.num_frame_per_block,
+                        action_horizon=None,
+                        state_horizon=None,
+                        num_action_per_block=None,
+                        num_state_per_block=None,
+                        visualize_mask=False,
+                    )
+                else:
+                    y = self._video_blockwise_attention_with_mask(
+                        self_attn,
+                        roped_q,
+                        roped_k,
+                        v,
+                        key_mask,
+                    )
 
         return y.flatten(2), roped_k, v
 
@@ -1236,13 +1418,14 @@ class MoTCausalWanModel(CausalWanModel):
         first_key[..., :1] = True
         attn_mask = attn_mask | (empty_rows & first_key)
 
-        out = F.scaled_dot_product_attention(
-            q_sdpa,
-            k_sdpa,
-            v_sdpa,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-        )
+        with _sac_region("mixed", output_last_dim=v_sdpa.shape[-1]):
+            out = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+            )
         out = out.masked_fill(empty_rows, 0)
         return out.transpose(1, 2).contiguous().to(out_dtype)
 
@@ -2405,7 +2588,11 @@ class MoTCausalWanModel(CausalWanModel):
                     return video_tokens
 
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    x = torch.utils.checkpoint.checkpoint(run_video, x, use_reentrant=False)
+                    x = self._checkpoint_with_sac(
+                        run_video,
+                        x,
+                        sac_regions=("video_self",),
+                    )
                 else:
                     x = run_video(x)
                 continue
@@ -2450,11 +2637,11 @@ class MoTCausalWanModel(CausalWanModel):
                     return video_tokens, action_tokens_out
 
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    x, action_tokens = torch.utils.checkpoint.checkpoint(
+                    x, action_tokens = self._checkpoint_with_sac(
                         run_separate_layer,
                         x,
                         action_tokens,
-                        use_reentrant=False,
+                        sac_regions=("video_self",),
                     )
                 else:
                     x, action_tokens = run_separate_layer(x, action_tokens)
@@ -2477,11 +2664,11 @@ class MoTCausalWanModel(CausalWanModel):
                 )
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x, action_tokens = torch.utils.checkpoint.checkpoint(
+                x, action_tokens = self._checkpoint_with_sac(
                     run_mot_layer,
                     x,
                     action_tokens,
-                    use_reentrant=False,
+                    sac_regions=("mixed",),
                 )
             else:
                 x, action_tokens = run_mot_layer(x, action_tokens)

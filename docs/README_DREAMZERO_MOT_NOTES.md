@@ -35,6 +35,7 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 - `mot_video_noise_beta_beta`
 - `mot_decoupled_inference_video_final_noise`
 - `mot_decoupled_inference_video_refresh_steps`
+- `activation_checkpointing_policy`: `off | mixed | both`
 
 `mot_action_video_attention` 含义：
 
@@ -62,6 +63,14 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 `mot_decouple_video_action_noise=true` 支持 `architecture=mot` 且 `mot_action_video_attention=full_video|full_video_unidirectional`。训练时 video timestep 使用 `Beta(mot_video_noise_beta_alpha, mot_video_noise_beta_beta)` 偏向高噪声，action timestep 独立 Uniform 采样。双向 `full_video` 下 `auto` 会选择 `denoise`；`full_video_unidirectional` 下 `auto` 会选择 `decoupled_denoise`。
 
 `droid_random_drop_exterior_view_prob` 是 DROID 数据增强开关，默认 `0.0`。设置为 `0.5` 时，50% 训练样本会随机把 left/right exterior 其中一个置黑；设置为 `1.0` 时，每个训练样本都 drop 一个 exterior view。该增强只在训练态 DROID 三视角拼图时生效，不 drop wrist view。
+
+`activation_checkpointing_policy` 是 MoT 固定 Selective Activation Checkpointing 开关，默认 `off`，且只有在 `USE_GRADIENT_CHECKPOINTING=true` 时可用：
+
+- `off`: 保持普通 block-level gradient checkpointing 行为。
+- `mixed`: 在 checkpoint 内保存 MoT `_scaled_dot_product_mixed_attention()` 的 attention 输出，减少 backward 重算 mixed video/action attention。
+- `both`: 在 `mixed` 基础上，额外保存当前路径中的 video self-attention 输出。该模式显存增量明显更高，建议先小 batch smoke 再扩大训练。
+
+默认 `full_video` MoT 主路径主要命中 mixed attention；`both` 只有在当前训练路径存在独立 video self-attention 时才会比 `mixed` 多保存。排查 SAC 是否实际命中时可临时设置 `DREAMZERO_SAC_DEBUG=1`，需要查看底层 op 路径时可设置 `DREAMZERO_SAC_TRACE=1`。
 
 ## 固定主链路
 
@@ -96,6 +105,7 @@ bash scripts/train/droid_wan22_mot_full.sh
 - `DATALOADER_PREFETCH_FACTOR`
 - `DATALOADER_PERSISTENT_WORKERS`
 - `USE_GRADIENT_CHECKPOINTING`
+- `ACTIVATION_CHECKPOINTING_POLICY`
 - `MOT_ACTION_VIDEO_ATTENTION`
 - `MOT_ACTION_VIDEO_KI`，也可用短别名 `MOT_KI`
 - `MOT_INFERENCE_VIDEO_MODE`

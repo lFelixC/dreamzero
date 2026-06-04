@@ -54,6 +54,7 @@ from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import Flo
 
 KVCacheType: TypeAlias = torch.Tensor
 _MOT_ACTION_FULL_VIDEO_MODES = {"full_video", "full_video_unidirectional"}
+_ACTIVATION_CHECKPOINTING_POLICIES = {"off", "mixed", "both"}
 
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
@@ -129,6 +130,10 @@ class WANPolicyHeadConfig(PretrainedConfig):
     skip_component_loading: bool = field(default=False, metadata={"help": "Skip loading individual component weights (used when loading from full pretrained model)."})
 
     use_gradient_checkpointing: bool = field(default=True, metadata={"help": "Whether to use gradient checkpointing."})
+    activation_checkpointing_policy: str = field(
+        default="off",
+        metadata={"help": "Selective activation checkpointing policy for MoT: off, mixed, or both."},
+    )
     qformer_cfg: dict = field(default=None, metadata={"help": "Qformer configuration."})
     hidden_size: int = field(default=1024, metadata={"help": "Input embedding dimension."})
     max_seq_len: int = field(default=1024, metadata={"help": "Maxium Sequence Length"})
@@ -385,6 +390,18 @@ class WANPolicyHead(ActionHead):
 
         self.use_gradient_checkpointing = self._coerce_bool(config.use_gradient_checkpointing)
         config.use_gradient_checkpointing = self.use_gradient_checkpointing
+        self.activation_checkpointing_policy = self._normalize_activation_checkpointing_policy(
+            getattr(config, "activation_checkpointing_policy", "off")
+        )
+        config.activation_checkpointing_policy = self.activation_checkpointing_policy
+        if self.activation_checkpointing_policy != "off":
+            if not self.use_gradient_checkpointing:
+                raise ValueError(
+                    "activation_checkpointing_policy requires use_gradient_checkpointing=true; "
+                    f"got activation_checkpointing_policy={self.activation_checkpointing_policy!r}."
+                )
+            if getattr(config, "architecture", "joint") != "mot":
+                raise ValueError("activation_checkpointing_policy is only supported with architecture=mot.")
         if self.training:
             self.scheduler.set_timesteps(1000, training=True)
 
@@ -475,6 +492,16 @@ class WANPolicyHead(ActionHead):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _normalize_activation_checkpointing_policy(value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in _ACTIVATION_CHECKPOINTING_POLICIES:
+            raise ValueError(
+                "activation_checkpointing_policy must be one of "
+                f"{sorted(_ACTIVATION_CHECKPOINTING_POLICIES)}, got {value!r}."
+            )
+        return normalized
+
     def _validate_mot_decoupled_config(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
         action_video_attention = getattr(config, "mot_action_video_attention", "full_video")
@@ -523,13 +550,15 @@ class WANPolicyHead(ActionHead):
         diffusion_model_cfg["mot_action_num_heads"] = config.mot_action_num_heads
         diffusion_model_cfg["mot_action_video_attention"] = config.mot_action_video_attention
         diffusion_model_cfg["mot_action_video_ki"] = config.mot_action_video_ki
+        diffusion_model_cfg["activation_checkpointing_policy"] = config.activation_checkpointing_policy
         effective_action_layers = config.mot_action_num_layers or diffusion_model_cfg.get("num_layers")
         print(
             "[DreamZero] Using MoT WAM architecture "
             f"(action_hidden={config.mot_action_hidden_dim}, "
             f"action_layers={effective_action_layers}, "
             f"action_video_attention={config.mot_action_video_attention}, "
-            f"action_video_ki={config.mot_action_video_ki})"
+            f"action_video_ki={config.mot_action_video_ki}, "
+            f"activation_checkpointing_policy={config.activation_checkpointing_policy})"
         )
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
