@@ -1190,14 +1190,36 @@ class MoTCausalWanModel(CausalWanModel):
                 mask[action_block_rows, action_start:action_end] = True
             return mask
 
+        num_state_per_block = self._infer_action_state_per_block(action_seq_len)
+        num_blocks, state_length, _ = self._infer_action_block_layout(
+            action_register_length=action_seq_len,
+            num_state_per_block=num_state_per_block,
+        )
+
         if self.mot_action_video_attention == "first_frame":
             first_frame_tokens = min(self.frame_seqlen, video_seq_len)
-            mask[action_rows, :first_frame_tokens] = True
         elif self.mot_action_video_attention == "none":
-            pass
+            first_frame_tokens = 0
         else:
             raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
-        mask[action_rows, video_seq_len:total_seq_len] = True
+
+        for block_idx in range(num_blocks):
+            state_start = video_seq_len + block_idx * num_state_per_block
+            state_end = state_start + num_state_per_block
+            action_start = video_seq_len + state_length + block_idx * self.num_action_per_block
+            action_end = action_start + self.num_action_per_block
+
+            if num_state_per_block > 0:
+                state_indices = torch.arange(state_start, state_end, device=device)
+                mask[state_indices, state_indices] = True
+
+            action_block_rows = slice(action_start, action_end)
+            if first_frame_tokens > 0:
+                mask[action_block_rows, :first_frame_tokens] = True
+            if num_state_per_block > 0:
+                mask[action_block_rows, state_start:state_end] = True
+            mask[action_block_rows, action_start:action_end] = True
+
         return mask
 
     @staticmethod
@@ -1965,36 +1987,18 @@ class MoTCausalWanModel(CausalWanModel):
             num_state_per_block=num_state_per_block,
         )
 
-        if self.mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES:
-            mixed = self._run_action_expert_block_joint_causal(
-                block=block,
-                q_action=q_action,
-                k_action=k_action,
-                v_action=v_action,
-                video_kv=video_kv,
-                action_key_mask=action_key_mask,
-                video_key_mask=video_key_mask,
-                num_state_per_block=num_state_per_block,
-                clean_seq_len=clean_seq_len,
-                cached_current_start_frame=None,
-            )
-        else:
-            if video_kv is None:
-                k_context = k_action
-                v_context = v_action
-                key_mask = self._drop_full_true_mask(action_key_mask)
-            else:
-                video_k, video_v = video_kv
-                k_context = torch.cat([video_k, k_action], dim=1)
-                v_context = torch.cat([video_v, v_action], dim=1)
-                key_mask = self._concat_key_masks(
-                    [video_key_mask, action_key_mask],
-                    [video_k.shape[1], k_action.shape[1]],
-                    batch_size=tokens.shape[0],
-                    device=tokens.device,
-                )
-
-            mixed = block.attn(q_action, k_context, v_context, key_mask=key_mask).flatten(2)
+        mixed = self._run_action_expert_block_joint_causal(
+            block=block,
+            q_action=q_action,
+            k_action=k_action,
+            v_action=v_action,
+            video_kv=video_kv,
+            action_key_mask=action_key_mask,
+            video_key_mask=video_key_mask,
+            num_state_per_block=num_state_per_block,
+            clean_seq_len=clean_seq_len,
+            cached_current_start_frame=None,
+        )
         return block.apply_mixed_attention_output(
             residual_x=residual_tokens,
             mixed_attn_out=mixed,
@@ -2044,30 +2048,19 @@ class MoTCausalWanModel(CausalWanModel):
             current_start_frame=current_start_frame,
         )
 
-        if self.mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES:
-            num_state_per_block = self._infer_action_state_per_block(action_register_length)
-            mixed = self._run_action_expert_block_joint_causal(
-                block=block,
-                q_action=q_action,
-                k_action=k_action,
-                v_action=v_action,
-                video_kv=video_kv,
-                action_key_mask=None,
-                video_key_mask=None,
-                num_state_per_block=num_state_per_block,
-                clean_seq_len=0,
-                cached_current_start_frame=current_start_frame,
-            )
-        else:
-            if video_kv is None:
-                k_context = k_action
-                v_context = v_action
-            else:
-                video_k, video_v = video_kv
-                k_context = torch.cat([video_k, k_action], dim=1)
-                v_context = torch.cat([video_v, v_action], dim=1)
-
-            mixed = block.attn(q_action, k_context, v_context).flatten(2)
+        num_state_per_block = self._infer_action_state_per_block(action_register_length)
+        mixed = self._run_action_expert_block_joint_causal(
+            block=block,
+            q_action=q_action,
+            k_action=k_action,
+            v_action=v_action,
+            video_kv=video_kv,
+            action_key_mask=None,
+            video_key_mask=None,
+            num_state_per_block=num_state_per_block,
+            clean_seq_len=0,
+            cached_current_start_frame=current_start_frame,
+        )
         return block.apply_mixed_attention_output(
             residual_x=residual_tokens,
             mixed_attn_out=mixed,
