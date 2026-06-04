@@ -53,14 +53,14 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 
 `mot_inference_video_mode` 含义：
 
-- `auto`: 当前默认。`first_frame`、`none` 和 `full_video_unidirectional` 推理时可用 cached video K/V 做 action denoise；`full_video` 因为 video 也读取 action，保持 video/action 一起 denoise。
+- `auto`: 当前默认。`first_frame` 和 `none` 推理时可用 cached video K/V 做 action denoise；`full_video_unidirectional` 和 `full_video` 默认保持 video/action 一起 denoise。
 - `denoise`: 保持原始推理行为，video/action 每个采样步一起 denoise。
 - `cache_only`: 强制不做 future video denoise，只用已建立的 video K/V cache 做 action conditioning。适用于 `first_frame`/`none`/`full_video_unidirectional`；RTC guidance 当前会自动退回 `denoise`。
 - `decoupled_denoise`: 只适用于 `full_video_unidirectional`；双向 `full_video` 会拒绝该模式。
 
 如果训练使用双向 `mot_action_video_attention=full_video`，推理不能切到 `cache_only` 或 `decoupled_denoise`。这两个模式会让 video cache 跳过当前 action token，造成训练/推理不一致；代码会直接报错。
 
-`mot_decouple_video_action_noise=true` 支持 `architecture=mot` 且 `mot_action_video_attention=full_video|full_video_unidirectional`。训练时 video timestep 使用 `Beta(mot_video_noise_beta_alpha, mot_video_noise_beta_beta)` 偏向高噪声，action timestep 独立 Uniform 采样。双向 `full_video` 下 `auto` 会选择 `denoise`；`full_video_unidirectional` 下 `auto` 会选择 `decoupled_denoise`。
+`mot_decouple_video_action_noise=true` 支持 `architecture=mot` 且 `mot_action_video_attention=full_video|full_video_unidirectional`。训练时 video timestep 使用 `Beta(mot_video_noise_beta_alpha, mot_video_noise_beta_beta)` 偏向高噪声，action timestep 独立 Uniform 采样。双向 `full_video` 下 `auto` 会选择 `denoise`；开启 decoupled noise 的 `full_video_unidirectional` 下 `auto` 会选择 `decoupled_denoise`。
 
 `droid_random_drop_exterior_view_prob` 是 DROID 数据增强开关，默认 `0.0`。设置为 `0.5` 时，50% 训练样本会随机把 left/right exterior 其中一个置黑；设置为 `1.0` 时，每个训练样本都 drop 一个 exterior view。该增强只在训练态 DROID 三视角拼图时生效，不 drop wrist view。
 
@@ -80,7 +80,7 @@ MoT 推理额外保留 video denoise 模式开关，用于在只需要 action �
 - video cross-attn state context: 关闭；state 只通过 action expert 的 state tokens 进入 mixed attention。
 - action expert gate 初始化: AdaLN-zero 默认初始化。
 - 训练 noise/timestep: 默认 video/action 使用标准耦合采样；仅当显式开启 `mot_decouple_video_action_noise` 时进入 MoT 完整 video-action 模式的独立 timestep 采样。
-- 推理模式: 默认 `auto`，双向 `full_video` 默认保持 video/action 一起 denoise；`first_frame`/`none`/`full_video_unidirectional` 可跳过 future video denoise。
+- 推理模式: 默认 `auto`，`full_video` 和 `full_video_unidirectional` 默认保持 video/action 一起 denoise；`first_frame`/`none` 可跳过 future video denoise。
 
 当前 MoT 主链路仍不恢复旧的 action-only cache refresh/no-denoise 诊断组合；双向 `full_video` 必须让 video/action 在每个采样步使用同一组当前 token。
 
@@ -120,7 +120,7 @@ bash scripts/train/droid_wan22_mot_full.sh
 
 ## 推理行为
 
-普通推理和 RTC 兼容路径保留。MoT 下 `mot_inference_video_mode=auto` 会在 `first_frame`/`none`/`full_video_unidirectional` 下跳过 future video denoise，只做 action denoise；双向 `full_video` 默认仍然 video/action 同步 denoise。需要强制行为时可在训练或 checkpoint 配置中设置 `mot_inference_video_mode=denoise|cache_only|decoupled_denoise`，也可在推理进程里用环境变量 `MOT_INFERENCE_VIDEO_MODE` 临时覆盖；双向 `full_video` 会拒绝 `cache_only` 和 `decoupled_denoise`，`decoupled_denoise` 仅适用于 `full_video_unidirectional` 且暂不支持 RTC guidance。
+普通推理和 RTC 兼容路径保留。MoT 下 `mot_inference_video_mode=auto` 会在 `first_frame`/`none` 下跳过 future video denoise，只做 action denoise；`full_video_unidirectional` 和双向 `full_video` 默认 video/action 同步 denoise。需要强制行为时可在训练或 checkpoint 配置中设置 `mot_inference_video_mode=denoise|cache_only|decoupled_denoise`，也可在推理进程里用环境变量 `MOT_INFERENCE_VIDEO_MODE` 临时覆盖；双向 `full_video` 会拒绝 `cache_only` 和 `decoupled_denoise`，`decoupled_denoise` 仅适用于 `full_video_unidirectional` 且暂不支持 RTC guidance。
 
 ## 两卡推理命令
 
