@@ -10,7 +10,7 @@ mot_action_ffn_dim: 4096
 # null means "use the same depth as the selected Wan video DiT" (30 for Wan2.2-TI2V-5B).
 mot_action_num_layers: null
 mot_action_num_heads: 8
-mot_action_video_attention: first_frame
+mot_action_video_attention: full_video
 mot_action_video_ki: false
 mot_inference_video_mode: auto
 mot_decouple_video_action_noise: false

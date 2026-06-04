@@ -4,6 +4,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import register_to_config
 
 from groot.vla.model.dreamzero.modules.wan2_1_submodule import (
@@ -19,7 +20,9 @@ from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import 
     MultiEmbodimentActionEncoder,
 )
 
-MoTActionVideoAttention = Literal["first_frame", "full_video", "none"]
+MoTActionVideoAttention = Literal["first_frame", "full_video", "full_video_unidirectional", "none"]
+_MOT_ACTION_VIDEO_ATTENTION_MODES = ("first_frame", "full_video", "full_video_unidirectional", "none")
+_MOT_ACTION_FULL_VIDEO_MODES = ("full_video", "full_video_unidirectional")
 
 
 def _coerce_bool(value: bool | str) -> bool:
@@ -139,6 +142,8 @@ class DreamZeroActionExpertBlock(nn.Module):
         self.norm_k = WanRMSNorm(self.wan_dim, eps=eps)
         self.attn = AttentionModule(num_heads=wan_num_heads, head_dim=wan_head_dim)
         self.norm3 = WanLayerNorm(hidden_dim, eps)
+        self.action_to_video_cross_proj = nn.Linear(hidden_dim, self.wan_dim)
+        self.video_to_action_cross_proj = nn.Linear(self.wan_dim, hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim,
             num_heads,
@@ -451,7 +456,7 @@ class MoTCausalWanModel(CausalWanModel):
         mot_action_ffn_dim: int | None = None,
         mot_action_num_layers: int | None = None,
         mot_action_num_heads: int = 8,
-        mot_action_video_attention: MoTActionVideoAttention = "first_frame",
+        mot_action_video_attention: MoTActionVideoAttention = "full_video",
         mot_action_video_ki: bool | str = False,
         **kwargs,
     ):
@@ -468,13 +473,16 @@ class MoTCausalWanModel(CausalWanModel):
         self.is_mot_wam = True
         if mot_action_video_attention == "causal":
             raise ValueError(
-                "mot_action_video_attention='causal' was removed; use 'full_video' for the same "
-                "action-visible video K/V route, or choose 'first_frame'/'none'."
+                "mot_action_video_attention='causal' was removed; use 'full_video' for block-causal "
+                "video/action mixed attention, use 'full_video_unidirectional' for full video-to-action "
+                "attention, or choose 'first_frame'/'none'."
             )
-        if mot_action_video_attention not in ("first_frame", "full_video", "none"):
+        if mot_action_video_attention not in _MOT_ACTION_VIDEO_ATTENTION_MODES:
             raise ValueError(f"Unsupported mot_action_video_attention={mot_action_video_attention!r}")
         self.mot_action_video_attention = mot_action_video_attention
         self.mot_action_video_ki = _coerce_bool(mot_action_video_ki)
+        self.mot_action_reads_full_video = mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES
+        self.mot_video_reads_action = mot_action_video_attention == "full_video"
         action_hidden_dim = int(mot_action_hidden_dim)
         action_ffn_dim = int(mot_action_ffn_dim or action_hidden_dim * 4)
         action_num_layers = int(mot_action_num_layers or self.num_layers)
@@ -556,7 +564,7 @@ class MoTCausalWanModel(CausalWanModel):
         text_image_context: torch.Tensor,
         state_context: torch.Tensor | None,
     ) -> torch.Tensor:
-        return self._merge_shared_context(text_image_context, state_context)
+        return text_image_context
 
     @staticmethod
     def _align_wan_modulation(
@@ -885,6 +893,708 @@ class MoTCausalWanModel(CausalWanModel):
 
         return y.flatten(2), roped_k, v
 
+    def _build_video_mixed_attention_io(
+        self,
+        block,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        freqs: torch.Tensor,
+        is_tf: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._align_wan_modulation(
+            block,
+            e,
+            x.shape[1],
+        )
+        attn_input = block.norm1(x) * (1 + scale_msa) + shift_msa
+        b, s = attn_input.shape[:2]
+        n = block.self_attn.num_heads
+        d = block.self_attn.head_dim
+        q = block.self_attn.norm_q(block.self_attn.q(attn_input)).view(b, s, n, d)
+        k = block.self_attn.norm_k(block.self_attn.k(attn_input)).view(b, s, n, d)
+        v = block.self_attn.v(attn_input).view(b, s, n, d)
+
+        if is_tf:
+            half_seq_len = s // 2
+            q_clean = rope_action_apply(
+                x=q[:, :half_seq_len],
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+            k_clean = rope_action_apply(
+                x=k[:, :half_seq_len],
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+            q_noisy = rope_action_apply(
+                x=q[:, half_seq_len:],
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+            k_noisy = rope_action_apply(
+                x=k[:, half_seq_len:],
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+            q = torch.cat([q_clean, q_noisy], dim=1)
+            k = torch.cat([k_clean, k_noisy], dim=1)
+        else:
+            q = rope_action_apply(
+                x=q,
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+            k = rope_action_apply(
+                x=k,
+                freqs=freqs,
+                freqs_action=self.freqs_action,
+                freqs_state=self.freqs_state,
+                action_register_length=None,
+            ).type_as(v)
+
+        return q, k, v, x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+    def _apply_video_mixed_attention_output(
+        self,
+        block,
+        residual_x: torch.Tensor,
+        mixed_attn_out: torch.Tensor,
+        gate_msa: torch.Tensor,
+        shift_mlp: torch.Tensor,
+        scale_mlp: torch.Tensor,
+        gate_mlp: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        y = block.self_attn.o(torch.nan_to_num(mixed_attn_out.flatten(2)))
+        x = residual_x + y * gate_msa
+        if self.model_type == "t2v":
+            context_lens = torch.full(
+                (x.shape[0],),
+                context.shape[1],
+                dtype=torch.long,
+                device=x.device,
+            )
+            x = x + block.cross_attn(block.norm3(x), context, context_lens)
+        else:
+            x = x + block.cross_attn(block.norm3(x), context)
+        y = block.ffn(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
+        return x + y * gate_mlp
+
+    def _apply_mot_shared_cross_attention_output(
+        self,
+        block,
+        action_block: DreamZeroActionExpertBlock,
+        video_residual: torch.Tensor,
+        action_residual: torch.Tensor,
+        mixed_video: torch.Tensor,
+        mixed_action: torch.Tensor,
+        video_gate_msa: torch.Tensor,
+        video_shift_mlp: torch.Tensor,
+        video_scale_mlp: torch.Tensor,
+        video_gate_mlp: torch.Tensor,
+        action_gate_msa: torch.Tensor,
+        action_shift_mlp: torch.Tensor,
+        action_scale_mlp: torch.Tensor,
+        action_gate_mlp: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_y = block.self_attn.o(torch.nan_to_num(mixed_video.flatten(2)))
+        video_x = video_residual + video_y * video_gate_msa
+
+        action_y = torch.nan_to_num(action_block.o(mixed_action.flatten(2)))
+        action_x = action_residual + action_y * action_gate_msa
+
+        video_cross_query = block.norm3(video_x)
+        action_cross_query = action_block.action_to_video_cross_proj(action_block.norm3(action_x))
+        action_cross_query = action_cross_query.to(dtype=video_cross_query.dtype, device=video_cross_query.device)
+        joint_query = torch.cat([video_cross_query, action_cross_query], dim=1)
+
+        if self.model_type == "t2v":
+            context_lens = torch.full(
+                (joint_query.shape[0],),
+                context.shape[1],
+                dtype=torch.long,
+                device=joint_query.device,
+            )
+            joint_cross = block.cross_attn(joint_query, context, context_lens)
+        else:
+            joint_cross = block.cross_attn(joint_query, context)
+
+        video_cross, action_cross = joint_cross.split([video_x.shape[1], action_x.shape[1]], dim=1)
+        video_x = video_x + video_cross
+        action_cross = action_block.video_to_action_cross_proj(action_cross.to(dtype=action_x.dtype))
+        action_x = action_x + torch.nan_to_num(action_cross) * action_block.cross_gate.to(
+            dtype=action_x.dtype,
+            device=action_x.device,
+        )
+
+        video_y = block.ffn(block.norm2(video_x) * (1 + video_scale_mlp) + video_shift_mlp)
+        video_x = video_x + video_y * video_gate_mlp
+
+        action_y = action_block.norm2(action_x) * (1 + action_scale_mlp) + action_shift_mlp
+        action_x = action_x + torch.nan_to_num(action_block.ffn(action_y)) * action_gate_mlp
+        return video_x, action_x
+
+    def _build_video_structural_attention_mask(
+        self,
+        video_seq_len: int,
+        clean_seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        mask = torch.zeros((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+
+        def fill_first_and_blocks(offset: int, length: int, *, local: bool) -> None:
+            first_end = min(self.frame_seqlen, length)
+            if first_end > 0:
+                mask[offset : offset + first_end, offset : offset + first_end] = True
+
+            block_size = self.frame_seqlen * self.num_frame_per_block
+            for block_start in range(self.frame_seqlen, length, block_size):
+                block_end = min(block_start + block_size, length)
+                if local and self.local_attn_size != -1:
+                    kv_start = max(0, block_end - self.local_attn_size * self.frame_seqlen)
+                else:
+                    kv_start = 0
+                mask[
+                    offset + block_start : offset + block_end,
+                    offset + kv_start : offset + block_end,
+                ] = True
+
+        if clean_seq_len > 0:
+            if clean_seq_len > video_seq_len:
+                raise ValueError(
+                    f"clean_seq_len={clean_seq_len} exceeds video_seq_len={video_seq_len}."
+                )
+            noisy_seq_len = video_seq_len - clean_seq_len
+            fill_first_and_blocks(0, clean_seq_len, local=False)
+
+            first_end = min(self.frame_seqlen, noisy_seq_len)
+            if first_end > 0:
+                noisy_offset = clean_seq_len
+                mask[
+                    noisy_offset : noisy_offset + first_end,
+                    noisy_offset : noisy_offset + first_end,
+                ] = True
+
+            block_size = self.frame_seqlen * self.num_frame_per_block
+            for block_start in range(self.frame_seqlen, noisy_seq_len, block_size):
+                block_end = min(block_start + block_size, noisy_seq_len)
+                clean_end = min(block_start, clean_seq_len)
+                if clean_end > 0:
+                    mask[
+                        clean_seq_len + block_start : clean_seq_len + block_end,
+                        :clean_end,
+                    ] = True
+                mask[
+                    clean_seq_len + block_start : clean_seq_len + block_end,
+                    clean_seq_len + block_start : clean_seq_len + block_end,
+                ] = True
+        else:
+            fill_first_and_blocks(0, video_seq_len, local=True)
+
+        return mask
+
+    def build_mot_mixed_attention_mask(
+        self,
+        video_seq_len: int,
+        action_seq_len: int,
+        clean_seq_len: int = 0,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = self.patch_embedding.weight.device
+        total_seq_len = video_seq_len + action_seq_len
+        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        mask[:video_seq_len, :video_seq_len] = self._build_video_structural_attention_mask(
+            video_seq_len=video_seq_len,
+            clean_seq_len=clean_seq_len,
+            device=device,
+        )
+        if action_seq_len <= 0:
+            return mask
+
+        action_rows = slice(video_seq_len, total_seq_len)
+        if self.mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES:
+            num_state_per_block = self._infer_action_state_per_block(action_seq_len)
+            num_blocks, state_length, _ = self._infer_action_block_layout(
+                action_register_length=action_seq_len,
+                num_state_per_block=num_state_per_block,
+            )
+            block_video_len = self.frame_seqlen * self.num_frame_per_block
+            video_reads_action = self.mot_action_video_attention == "full_video"
+
+            for block_idx in range(num_blocks):
+                state_start = video_seq_len + block_idx * num_state_per_block
+                state_end = state_start + num_state_per_block
+                action_start = video_seq_len + state_length + block_idx * self.num_action_per_block
+                action_end = action_start + self.num_action_per_block
+
+                if num_state_per_block > 0:
+                    state_indices = torch.arange(state_start, state_end, device=device)
+                    mask[state_indices, state_indices] = True
+
+                if clean_seq_len > 0:
+                    noisy_seq_len = video_seq_len - clean_seq_len
+                    video_block_start = self.frame_seqlen + block_idx * block_video_len
+                    video_block_end = min(video_block_start + block_video_len, noisy_seq_len)
+                    clean_end = min(video_block_start, clean_seq_len)
+                    video_rows = slice(
+                        clean_seq_len + video_block_start,
+                        clean_seq_len + video_block_end,
+                    )
+                    visible_video_slices = []
+                    if clean_end > 0:
+                        visible_video_slices.append(slice(0, clean_end))
+                    if video_block_start < video_block_end:
+                        visible_video_slices.append(video_rows)
+                else:
+                    video_block_start = self.frame_seqlen + block_idx * block_video_len
+                    video_block_end = min(video_block_start + block_video_len, video_seq_len)
+                    visible_video_end = min(
+                        self.frame_seqlen + (block_idx + 1) * block_video_len,
+                        video_seq_len,
+                    )
+                    video_rows = slice(video_block_start, video_block_end)
+                    visible_video_slices = [slice(0, visible_video_end)] if visible_video_end > 0 else []
+
+                if video_reads_action and video_rows.start < video_rows.stop:
+                    if num_state_per_block > 0:
+                        mask[video_rows, state_start:state_end] = True
+                    mask[video_rows, action_start:action_end] = True
+
+                action_block_rows = slice(action_start, action_end)
+                for video_cols in visible_video_slices:
+                    if video_cols.start < video_cols.stop:
+                        mask[action_block_rows, video_cols] = True
+                if num_state_per_block > 0:
+                    mask[action_block_rows, state_start:state_end] = True
+                mask[action_block_rows, action_start:action_end] = True
+            return mask
+
+        if self.mot_action_video_attention == "first_frame":
+            first_frame_tokens = min(self.frame_seqlen, video_seq_len)
+            mask[action_rows, :first_frame_tokens] = True
+        elif self.mot_action_video_attention == "none":
+            pass
+        else:
+            raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
+        mask[action_rows, video_seq_len:total_seq_len] = True
+        return mask
+
+    @staticmethod
+    def _scaled_dot_product_mixed_attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor,
+        key_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out_dtype = q.dtype
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k.transpose(1, 2)
+        v_sdpa = v.transpose(1, 2)
+        attn_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+        if attn_mask.ndim != 2:
+            raise ValueError(f"attention_mask must have shape [Q,K], got {tuple(attn_mask.shape)}")
+        if attn_mask.shape != (q.shape[1], k.shape[1]):
+            raise ValueError(
+                "attention_mask shape must match mixed attention Q/K lengths: "
+                f"got {tuple(attn_mask.shape)}, expected {(q.shape[1], k.shape[1])}"
+            )
+        attn_mask = attn_mask[None, None, :, :]
+
+        if key_mask is not None:
+            key_mask = key_mask.to(device=q.device, dtype=torch.bool)
+            if key_mask.shape != (q.shape[0], k.shape[1]):
+                raise ValueError(
+                    "key_mask shape must match batch/key lengths: "
+                    f"got {tuple(key_mask.shape)}, expected {(q.shape[0], k.shape[1])}"
+                )
+            attn_mask = attn_mask & key_mask[:, None, None, :]
+
+        empty_rows = ~attn_mask.any(dim=-1, keepdim=True)
+        first_key = torch.zeros_like(attn_mask)
+        first_key[..., :1] = True
+        attn_mask = attn_mask | (empty_rows & first_key)
+
+        out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+        )
+        out = out.masked_fill(empty_rows, 0)
+        return out.transpose(1, 2).contiguous().to(out_dtype)
+
+    def _run_mot_mixed_attention_layer(
+        self,
+        block,
+        action_block: DreamZeroActionExpertBlock,
+        video_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,
+        e: torch.Tensor,
+        action_e: torch.Tensor,
+        freqs: torch.Tensor,
+        text_context: torch.Tensor,
+        is_tf: bool,
+        clean_seq_len: int,
+        video_key_mask: torch.Tensor | None,
+        action_key_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        (
+            q_video,
+            k_video,
+            v_video,
+            video_residual,
+            video_gate_msa,
+            video_shift_mlp,
+            video_scale_mlp,
+            video_gate_mlp,
+        ) = self._build_video_mixed_attention_io(
+            block=block,
+            x=video_tokens,
+            e=e,
+            freqs=freqs,
+            is_tf=is_tf,
+        )
+
+        action_register_length = action_tokens.shape[1]
+        num_state_per_block = self._infer_action_state_per_block(action_register_length)
+        (
+            q_action,
+            k_action,
+            v_action,
+            action_residual,
+            action_gate_msa,
+            action_shift_mlp,
+            action_scale_mlp,
+            action_gate_mlp,
+        ) = action_block.build_mixed_attention_io(
+            x=action_tokens,
+            e=action_e,
+            freqs_action=self.freqs_action,
+            freqs_state=self.freqs_state,
+            action_register_length=action_register_length,
+            num_action_per_block=self.num_action_per_block,
+            num_state_per_block=num_state_per_block,
+        )
+
+        video_key_mask = self._align_token_mask(video_key_mask, q_video.shape[1], q_video.device)
+        action_key_mask = self._align_token_mask(action_key_mask, q_action.shape[1], q_action.device)
+
+        if self.mot_action_video_ki:
+            attention_mask = self.build_mot_mixed_attention_mask(
+                video_seq_len=q_video.shape[1],
+                action_seq_len=q_action.shape[1],
+                clean_seq_len=clean_seq_len,
+                device=q_video.device,
+            )
+            mixed_key_mask = self._concat_key_masks(
+                [video_key_mask, action_key_mask],
+                [q_video.shape[1], q_action.shape[1]],
+                batch_size=q_video.shape[0],
+                device=q_video.device,
+            )
+            mixed_video = self._scaled_dot_product_mixed_attention(
+                q=q_video,
+                k=torch.cat([k_video, k_action], dim=1),
+                v=torch.cat([v_video, v_action], dim=1),
+                attention_mask=attention_mask[: q_video.shape[1]],
+                key_mask=mixed_key_mask,
+            )
+            detached_video_k, detached_video_v = self._detach_video_kv((k_video, v_video))
+            assert detached_video_k is not None and detached_video_v is not None
+            mixed_action = self._scaled_dot_product_mixed_attention(
+                q=q_action,
+                k=torch.cat([detached_video_k, k_action], dim=1),
+                v=torch.cat([detached_video_v, v_action], dim=1),
+                attention_mask=attention_mask[q_video.shape[1] :],
+                key_mask=mixed_key_mask,
+            )
+        else:
+            attention_mask = self.build_mot_mixed_attention_mask(
+                video_seq_len=q_video.shape[1],
+                action_seq_len=q_action.shape[1],
+                clean_seq_len=clean_seq_len,
+                device=q_video.device,
+            )
+            mixed_key_mask = self._concat_key_masks(
+                [video_key_mask, action_key_mask],
+                [q_video.shape[1], q_action.shape[1]],
+                batch_size=q_video.shape[0],
+                device=q_video.device,
+            )
+            mixed = self._scaled_dot_product_mixed_attention(
+                q=torch.cat([q_video, q_action], dim=1),
+                k=torch.cat([k_video, k_action], dim=1),
+                v=torch.cat([v_video, v_action], dim=1),
+                attention_mask=attention_mask,
+                key_mask=mixed_key_mask,
+            )
+            mixed_video = mixed[:, : q_video.shape[1]]
+            mixed_action = mixed[:, q_video.shape[1] :]
+
+        video_tokens, action_tokens = self._apply_mot_shared_cross_attention_output(
+            block=block,
+            action_block=action_block,
+            video_residual=video_residual,
+            action_residual=action_residual,
+            mixed_video=mixed_video,
+            mixed_action=mixed_action,
+            video_gate_msa=video_gate_msa,
+            video_shift_mlp=video_shift_mlp,
+            video_scale_mlp=video_scale_mlp,
+            video_gate_mlp=video_gate_mlp,
+            action_gate_msa=action_gate_msa,
+            action_shift_mlp=action_shift_mlp,
+            action_scale_mlp=action_scale_mlp,
+            action_gate_mlp=action_gate_mlp,
+            context=text_context,
+        )
+        return video_tokens, action_tokens
+
+    def _build_cached_mot_mixed_attention_mask(
+        self,
+        cached_video_seq_len: int,
+        current_video_seq_len: int,
+        action_seq_len: int,
+        device: torch.device,
+        current_start_frame: int | None = None,
+    ) -> torch.Tensor:
+        video_key_len = cached_video_seq_len + current_video_seq_len
+        total_query_len = current_video_seq_len + action_seq_len
+        total_key_len = video_key_len + action_seq_len
+        mask = torch.zeros((total_query_len, total_key_len), dtype=torch.bool, device=device)
+        block_video_len = self.frame_seqlen * self.num_frame_per_block
+        starts_at_first_frame = current_start_frame == 0 if current_start_frame is not None else cached_video_seq_len == 0
+
+        def fill_cached_video_rows(
+            *,
+            block_idx: int,
+            state_key_start: int | None = None,
+            state_key_end: int | None = None,
+            action_key_start: int | None = None,
+            action_key_end: int | None = None,
+        ) -> int:
+            if starts_at_first_frame:
+                if block_idx == 0:
+                    first_end = min(self.frame_seqlen, current_video_seq_len)
+                    if first_end > 0:
+                        mask[:first_end, :first_end] = True
+                video_block_start = min(self.frame_seqlen + block_idx * block_video_len, current_video_seq_len)
+                visible_video_end = min(
+                    self.frame_seqlen + (block_idx + 1) * block_video_len,
+                    video_key_len,
+                )
+            else:
+                video_block_start = min(block_idx * block_video_len, current_video_seq_len)
+                visible_video_end = min(
+                    cached_video_seq_len + (block_idx + 1) * block_video_len,
+                    video_key_len,
+                )
+            video_block_end = min(video_block_start + block_video_len, current_video_seq_len)
+            if video_block_start < video_block_end:
+                video_rows = slice(video_block_start, video_block_end)
+                if visible_video_end > 0:
+                    mask[video_rows, :visible_video_end] = True
+                if (
+                    self.mot_action_video_attention == "full_video"
+                    and state_key_start is not None
+                    and state_key_end is not None
+                    and state_key_start < state_key_end
+                ):
+                    mask[video_rows, state_key_start:state_key_end] = True
+                if (
+                    self.mot_action_video_attention == "full_video"
+                    and action_key_start is not None
+                    and action_key_end is not None
+                ):
+                    mask[video_rows, action_key_start:action_key_end] = True
+            return visible_video_end
+
+        if action_seq_len <= 0:
+            regular_video_tokens = (
+                max(current_video_seq_len - self.frame_seqlen, 0)
+                if starts_at_first_frame
+                else current_video_seq_len
+            )
+            num_video_blocks = (regular_video_tokens + block_video_len - 1) // block_video_len
+            if starts_at_first_frame and current_video_seq_len > 0:
+                num_video_blocks = max(num_video_blocks, 1)
+            for block_idx in range(num_video_blocks):
+                fill_cached_video_rows(block_idx=block_idx)
+            return mask
+
+        num_state_per_block = self._infer_action_state_per_block(action_seq_len)
+        num_blocks, state_length, _ = self._infer_action_block_layout(
+            action_register_length=action_seq_len,
+            num_state_per_block=num_state_per_block,
+        )
+        action_key_offset = video_key_len
+        action_query_offset = current_video_seq_len
+
+        for block_idx in range(num_blocks):
+            state_start = block_idx * num_state_per_block
+            state_end = state_start + num_state_per_block
+            action_start = state_length + block_idx * self.num_action_per_block
+            action_end = action_start + self.num_action_per_block
+
+            state_key_start = action_key_offset + state_start
+            state_key_end = action_key_offset + state_end
+            action_key_start = action_key_offset + action_start
+            action_key_end = action_key_offset + action_end
+
+            visible_video_end = fill_cached_video_rows(
+                block_idx=block_idx,
+                state_key_start=state_key_start if num_state_per_block > 0 else None,
+                state_key_end=state_key_end if num_state_per_block > 0 else None,
+                action_key_start=action_key_start,
+                action_key_end=action_key_end,
+            )
+
+            if num_state_per_block > 0:
+                state_query_start = action_query_offset + state_start
+                state_query_end = action_query_offset + state_end
+                state_query_indices = torch.arange(state_query_start, state_query_end, device=device)
+                state_key_indices = torch.arange(state_key_start, state_key_end, device=device)
+                mask[state_query_indices, state_key_indices] = True
+
+            action_query_start = action_query_offset + action_start
+            action_query_end = action_query_offset + action_end
+            if visible_video_end > 0:
+                mask[action_query_start:action_query_end, :visible_video_end] = True
+            if num_state_per_block > 0:
+                mask[action_query_start:action_query_end, state_key_start:state_key_end] = True
+            mask[action_query_start:action_query_end, action_key_start:action_key_end] = True
+
+        return mask
+
+    def _run_mot_mixed_attention_layer_cached(
+        self,
+        block,
+        action_block: DreamZeroActionExpertBlock,
+        video_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,
+        e: torch.Tensor,
+        action_e: torch.Tensor,
+        freqs: torch.Tensor,
+        text_context: torch.Tensor,
+        kv_cache: torch.Tensor,
+        current_start_frame: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            q_video,
+            k_video,
+            v_video,
+            video_residual,
+            video_gate_msa,
+            video_shift_mlp,
+            video_scale_mlp,
+            video_gate_mlp,
+        ) = self._build_video_mixed_attention_io(
+            block=block,
+            x=video_tokens,
+            e=e,
+            freqs=freqs,
+            is_tf=False,
+        )
+
+        action_register_length = action_tokens.shape[1]
+        (
+            q_action,
+            k_action,
+            v_action,
+            action_residual,
+            action_gate_msa,
+            action_shift_mlp,
+            action_scale_mlp,
+            action_gate_mlp,
+        ) = action_block.build_mixed_attention_io(
+            x=action_tokens,
+            e=action_e,
+            freqs_action=None,
+            freqs_state=None,
+            action_register_length=None,
+            num_action_per_block=None,
+            num_state_per_block=None,
+        )
+        q_action = self._apply_cached_action_rope(
+            q_action,
+            action_register_length=action_register_length,
+            current_start_frame=current_start_frame,
+        )
+        k_action = self._apply_cached_action_rope(
+            k_action,
+            action_register_length=action_register_length,
+            current_start_frame=current_start_frame,
+        )
+
+        cached_k = kv_cache[0]
+        cached_v = kv_cache[1]
+        video_k = torch.cat([cached_k, k_video], dim=1)
+        video_v = torch.cat([cached_v, v_video], dim=1)
+        max_attention_size = int(getattr(block.self_attn, "max_attention_size", video_k.shape[1]))
+        if video_k.shape[1] > max_attention_size:
+            video_k = video_k[:, -max_attention_size:]
+            video_v = video_v[:, -max_attention_size:]
+        cached_video_seq_len = max(video_k.shape[1] - k_video.shape[1], 0)
+        updated_kv_cache = torch.stack([video_k, video_v], dim=0)
+
+        attention_mask = self._build_cached_mot_mixed_attention_mask(
+            cached_video_seq_len=cached_video_seq_len,
+            current_video_seq_len=q_video.shape[1],
+            action_seq_len=q_action.shape[1],
+            device=q_video.device,
+            current_start_frame=current_start_frame,
+        )
+        mixed = self._scaled_dot_product_mixed_attention(
+            q=torch.cat([q_video, q_action], dim=1),
+            k=torch.cat([video_k, k_action], dim=1),
+            v=torch.cat([video_v, v_action], dim=1),
+            attention_mask=attention_mask,
+        )
+        mixed_video = mixed[:, : q_video.shape[1]]
+        mixed_action = mixed[:, q_video.shape[1] :]
+
+        video_tokens, action_tokens = self._apply_mot_shared_cross_attention_output(
+            block=block,
+            action_block=action_block,
+            video_residual=video_residual,
+            action_residual=action_residual,
+            mixed_video=mixed_video,
+            mixed_action=mixed_action,
+            video_gate_msa=video_gate_msa,
+            video_shift_mlp=video_shift_mlp,
+            video_scale_mlp=video_scale_mlp,
+            video_gate_mlp=video_gate_mlp,
+            action_gate_msa=action_gate_msa,
+            action_shift_mlp=action_shift_mlp,
+            action_scale_mlp=action_scale_mlp,
+            action_gate_mlp=action_gate_mlp,
+            context=text_context,
+        )
+        return video_tokens, action_tokens, updated_kv_cache
+
     def _run_video_expert_block(
         self,
         block,
@@ -937,7 +1647,7 @@ class MoTCausalWanModel(CausalWanModel):
         if mode == "first_frame":
             end = min(self.frame_seqlen, video_k.shape[1])
             return video_k[:, :end], video_v[:, :end]
-        if mode == "full_video":
+        if mode in _MOT_ACTION_FULL_VIDEO_MODES:
             return video_k, video_v
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
@@ -955,7 +1665,7 @@ class MoTCausalWanModel(CausalWanModel):
         if mode == "first_frame":
             end = min(self.frame_seqlen, video_key_mask.shape[1])
             return self._drop_full_true_mask(video_key_mask[:, :end])
-        if mode == "full_video":
+        if mode in _MOT_ACTION_FULL_VIDEO_MODES:
             return self._drop_full_true_mask(video_key_mask)
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
@@ -972,7 +1682,7 @@ class MoTCausalWanModel(CausalWanModel):
         if mode == "first_frame":
             end = min(self.frame_seqlen, video_k.shape[1])
             return video_k[:, :end], video_v[:, :end]
-        if mode == "full_video":
+        if mode in _MOT_ACTION_FULL_VIDEO_MODES:
             return video_k, video_v
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
@@ -1236,7 +1946,7 @@ class MoTCausalWanModel(CausalWanModel):
             num_state_per_block=num_state_per_block,
         )
 
-        if self.mot_action_video_attention == "full_video":
+        if self.mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES:
             mixed = self._run_action_expert_block_joint_causal(
                 block=block,
                 q_action=q_action,
@@ -1315,7 +2025,7 @@ class MoTCausalWanModel(CausalWanModel):
             current_start_frame=current_start_frame,
         )
 
-        if self.mot_action_video_attention == "full_video":
+        if self.mot_action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES:
             num_state_per_block = self._infer_action_state_per_block(action_register_length)
             mixed = self._run_action_expert_block_joint_causal(
                 block=block,
@@ -1409,13 +2119,7 @@ class MoTCausalWanModel(CausalWanModel):
         elif embodiment_id is None and state is not None:
             embodiment_id = torch.zeros(batch_size, device=x.device, dtype=torch.long)
         text_image_context = self._build_text_image_context(context, clip_feature)
-        state_context = self._build_state_context(
-            state=state,
-            embodiment_id=embodiment_id,
-            batch_size=batch_size,
-            device=x.device,
-        )
-        text_context = self._build_video_context(text_image_context, state_context)
+        text_context = self._build_video_context(text_image_context, None)
 
         action_tokens = None
         action_e = None
@@ -1433,6 +2137,23 @@ class MoTCausalWanModel(CausalWanModel):
 
         updated_kv_caches: list[torch.Tensor] = []
         for layer_idx, block in enumerate(self.blocks):
+            if action_tokens is not None and self.mot_video_reads_action:
+                assert action_e is not None
+                x, action_tokens, updated_kv_cache = self._run_mot_mixed_attention_layer_cached(
+                    block=block,
+                    action_block=self.action_expert.blocks[layer_idx],
+                    video_tokens=x,
+                    action_tokens=action_tokens,
+                    e=e0,
+                    action_e=action_e,
+                    freqs=freqs,
+                    text_context=text_context,
+                    kv_cache=kv_cache[layer_idx],
+                    current_start_frame=current_start_frame,
+                )
+                updated_kv_caches.append(updated_kv_cache)
+                continue
+
             x, updated_kv_cache = self._run_video_expert_block_cached(
                 block=block,
                 x=x,
@@ -1485,10 +2206,15 @@ class MoTCausalWanModel(CausalWanModel):
         require_full_video: bool = False,
     ) -> torch.Tensor:
         """Run only the MoT action expert using a supplied per-layer video K/V cache."""
-        if require_full_video and self.mot_action_video_attention != "full_video":
+        if self.mot_video_reads_action:
+            raise RuntimeError(
+                "Action-only video-cache inference is incompatible with bidirectional MoT attention; "
+                "use joint denoise inference instead."
+            )
+        if require_full_video and self.mot_action_video_attention not in _MOT_ACTION_FULL_VIDEO_MODES:
             raise ValueError(
                 "MoT refreshed-video action path requires "
-                "mot_action_video_attention=full_video."
+                "mot_action_video_attention=full_video or full_video_unidirectional."
             )
         batch_size = action.shape[0]
         # Match the existing cached inference path, which uses the default
@@ -1616,13 +2342,7 @@ class MoTCausalWanModel(CausalWanModel):
         elif embodiment_id is None and state is not None:
             embodiment_id = torch.zeros(batch_size, device=x.device, dtype=torch.long)
         text_image_context = self._build_text_image_context(context, clip_feature)
-        state_context = self._build_state_context(
-            state=state,
-            embodiment_id=embodiment_id,
-            batch_size=batch_size,
-            device=x.device,
-        )
-        text_context = self._build_video_context(text_image_context, state_context)
+        text_context = self._build_video_context(text_image_context, None)
 
         clean_seq_len = 0
         if clean_x is not None:
@@ -1693,40 +2413,68 @@ class MoTCausalWanModel(CausalWanModel):
             assert action_e is not None
             action_block = self.action_expert.blocks[layer_idx]
 
+            if not self.mot_video_reads_action:
+                def run_separate_layer(video_tokens, action_tokens_in, _block=block, _action_block=action_block):
+                    video_tokens, video_k, video_v = self._run_video_expert_block(
+                        block=_block,
+                        x=video_tokens,
+                        e=e0,
+                        freqs=freqs,
+                        context=text_context,
+                        is_tf=is_tf,
+                        key_mask=video_attention_mask,
+                    )
+                    video_kv = self._select_video_kv_for_action(
+                        video_k=video_k,
+                        video_v=video_v,
+                        seq_len=seq_len,
+                        clean_seq_len=clean_seq_len,
+                    )
+                    video_kv_mask = self._select_video_mask_for_action(
+                        video_attention_mask,
+                        seq_len=seq_len,
+                        clean_seq_len=clean_seq_len,
+                    )
+                    if self.mot_action_video_ki:
+                        video_kv = self._detach_video_kv(video_kv)
+                    action_tokens_out = self._run_action_expert_block(
+                        block=_action_block,
+                        tokens=action_tokens_in,
+                        e=action_e,
+                        context=None,
+                        video_kv=video_kv,
+                        action_key_mask=action_register_mask,
+                        video_key_mask=video_kv_mask,
+                        clean_seq_len=clean_seq_len,
+                    )
+                    return video_tokens, action_tokens_out
+
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    x, action_tokens = torch.utils.checkpoint.checkpoint(
+                        run_separate_layer,
+                        x,
+                        action_tokens,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, action_tokens = run_separate_layer(x, action_tokens)
+                continue
+
             def run_mot_layer(video_tokens, action_tokens_in, _block=block, _action_block=action_block):
-                video_tokens, video_k, video_v = self._run_video_expert_block(
+                return self._run_mot_mixed_attention_layer(
                     block=_block,
-                    x=video_tokens,
+                    action_block=_action_block,
+                    video_tokens=video_tokens,
+                    action_tokens=action_tokens_in,
                     e=e0,
+                    action_e=action_e,
                     freqs=freqs,
-                    context=text_context,
+                    text_context=text_context,
                     is_tf=is_tf,
-                    key_mask=video_attention_mask,
-                )
-                video_kv = self._select_video_kv_for_action(
-                    video_k=video_k,
-                    video_v=video_v,
-                    seq_len=seq_len,
                     clean_seq_len=clean_seq_len,
-                )
-                video_kv_mask = self._select_video_mask_for_action(
-                    video_attention_mask,
-                    seq_len=seq_len,
-                    clean_seq_len=clean_seq_len,
-                )
-                if self.mot_action_video_ki:
-                    video_kv = self._detach_video_kv(video_kv)
-                action_tokens_out = self._run_action_expert_block(
-                    block=_action_block,
-                    tokens=action_tokens_in,
-                    e=action_e,
-                    context=None,
-                    video_kv=video_kv,
+                    video_key_mask=video_attention_mask,
                     action_key_mask=action_register_mask,
-                    video_key_mask=video_kv_mask,
-                    clean_seq_len=clean_seq_len,
                 )
-                return video_tokens, action_tokens_out
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x, action_tokens = torch.utils.checkpoint.checkpoint(

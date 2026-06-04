@@ -46,7 +46,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-4}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
-MOT_ACTION_VIDEO_ATTENTION="full_video"
+MOT_ACTION_VIDEO_ATTENTION="${MOT_ACTION_VIDEO_ATTENTION:-full_video}"
 # KI means keep the video/action experts independent for action loss.
 # false: action loss gradients flow through causal video K/V into the video expert.
 # true: action sees causal video K/V, but the K/V is detached for action loss.

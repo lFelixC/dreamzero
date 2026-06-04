@@ -254,3 +254,4 @@ video_pred_output*/
 .codex
 example/libero/
 example/remote_infer/rtc_trace.jsonl
+/tests

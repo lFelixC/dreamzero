@@ -53,6 +53,7 @@ from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import Flo
 
 
 KVCacheType: TypeAlias = torch.Tensor
+_MOT_ACTION_FULL_VIDEO_MODES = {"full_video", "full_video_unidirectional"}
 
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
@@ -72,8 +73,8 @@ class WANPolicyHeadConfig(PretrainedConfig):
     mot_action_num_layers: int | None = field(default=None, metadata={"help": "Number of transformer layers for the MoT action expert. None matches the video DiT depth."})
     mot_action_num_heads: int = field(default=8, metadata={"help": "Attention heads for the MoT action expert."})
     mot_action_video_attention: str = field(
-        default="first_frame",
-        metadata={"help": "Video K/V visible to the mixed-attention action expert: first_frame, full_video, or none."},
+        default="full_video",
+        metadata={"help": "MoT mixed-attention visibility mode: first_frame, full_video, full_video_unidirectional, or none."},
     )
     mot_action_video_ki: bool = field(
         default=False,
@@ -81,11 +82,11 @@ class WANPolicyHeadConfig(PretrainedConfig):
     )
     mot_inference_video_mode: str = field(
         default="auto",
-        metadata={"help": "MoT inference video path: auto, denoise, cache_only, or decoupled_denoise."},
+        metadata={"help": "MoT inference video path: auto, denoise, cache_only, or decoupled_denoise. Use denoise when video reads action."},
     )
     mot_decouple_video_action_noise: bool = field(
         default=False,
-        metadata={"help": "MoT full-video training: video uses high-noise Beta timesteps, action uses independent uniform timesteps."},
+        metadata={"help": "MoT full-video action training: video uses high-noise Beta timesteps, action uses independent uniform timesteps."},
     )
     mot_video_noise_beta_alpha: float = field(
         default=3.0,
@@ -476,24 +477,24 @@ class WANPolicyHead(ActionHead):
 
     def _validate_mot_decoupled_config(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
-        action_video_attention = getattr(config, "mot_action_video_attention", "first_frame")
+        action_video_attention = getattr(config, "mot_action_video_attention", "full_video")
         decoupled = self._coerce_bool(getattr(config, "mot_decouple_video_action_noise", False))
         inference_mode = str(getattr(config, "mot_inference_video_mode", "auto")).strip().lower()
 
         if decoupled and architecture != "mot":
             raise ValueError("mot_decouple_video_action_noise=true requires architecture=mot.")
-        if decoupled and action_video_attention != "full_video":
+        if decoupled and action_video_attention not in _MOT_ACTION_FULL_VIDEO_MODES:
             raise ValueError(
                 "mot_decouple_video_action_noise=true requires "
-                "mot_action_video_attention=full_video."
+                "mot_action_video_attention=full_video or full_video_unidirectional."
             )
         if inference_mode == "decoupled_denoise":
             if architecture != "mot":
                 raise ValueError("mot_inference_video_mode=decoupled_denoise requires architecture=mot.")
-            if action_video_attention != "full_video":
+            if action_video_attention != "full_video_unidirectional":
                 raise ValueError(
                     "mot_inference_video_mode=decoupled_denoise requires "
-                    "mot_action_video_attention=full_video."
+                    "mot_action_video_attention=full_video_unidirectional."
                 )
 
     def _select_diffusion_model_architecture(self, config: WANPolicyHeadConfig) -> None:
@@ -1298,12 +1299,27 @@ class WANPolicyHead(ActionHead):
             if mode == "decoupled_denoise":
                 raise ValueError("mot_inference_video_mode=decoupled_denoise requires MoT architecture.")
             return "denoise"
+        video_reads_action = self._coerce_bool(getattr(self.model, "mot_video_reads_action", False))
         if mode == "auto":
-            action_video_attention = getattr(self.model, "mot_action_video_attention", "first_frame")
-            if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
+            action_video_attention = getattr(self.model, "mot_action_video_attention", "full_video")
+            action_reads_full_video = action_video_attention in _MOT_ACTION_FULL_VIDEO_MODES
+            if (
+                self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False))
+                and action_reads_full_video
+                and not video_reads_action
+            ):
                 mode = "decoupled_denoise"
             else:
-                mode = "cache_only" if action_video_attention in {"first_frame", "none"} else "denoise"
+                mode = (
+                    "cache_only"
+                    if action_video_attention in {"first_frame", "none", "full_video_unidirectional"}
+                    else "denoise"
+                )
+        if video_reads_action and mode in {"cache_only", "decoupled_denoise"}:
+            raise RuntimeError(
+                "Bidirectional MoT attention requires mot_inference_video_mode=denoise; "
+                f"got {mode!r}."
+            )
         if mode == "cache_only" and use_rtc:
             if self.ip_rank == 0:
                 print("[MoT] mot_inference_video_mode=cache_only is not used with RTC guidance; falling back to denoise.")
@@ -1311,10 +1327,10 @@ class WANPolicyHead(ActionHead):
         if mode == "decoupled_denoise":
             if use_rtc:
                 raise RuntimeError("mot_inference_video_mode=decoupled_denoise does not support RTC guidance yet.")
-            if getattr(self.model, "mot_action_video_attention", None) != "full_video":
+            if getattr(self.model, "mot_action_video_attention", None) != "full_video_unidirectional":
                 raise ValueError(
                     "mot_inference_video_mode=decoupled_denoise requires "
-                    "mot_action_video_attention=full_video."
+                    "mot_action_video_attention=full_video_unidirectional."
                 )
         return mode
 
