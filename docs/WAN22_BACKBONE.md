@@ -8,10 +8,10 @@ For a `uv`-based training environment setup, see [README_DROID_WAN22_UV.md](READ
 
 | Component | Wan2.1-I2V-14B | Wan2.2-TI2V-5B |
 |-----------|-----------------|----------------|
-| DiT dim | 5120 | 3072 |
+| DiT dim | 2048 | 3072 |
 | DiT layers | 32 | 30 |
 | DiT heads | 16 | 24 |
-| FFN dim | 13824 | 14336 |
+| FFN dim | 8192 | 14336 |
 | VAE latent channels | 16 | 48 |
 | VAE spatial stride | 8× | 16× |
 | Model type | i2v | ti2v |
