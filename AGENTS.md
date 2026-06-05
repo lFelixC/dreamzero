@@ -1,23 +1,23 @@
 # AGENTS.md
 
-## 目的
+## Purpose
 
-这份文件记录 DreamZero 在本仓库中的算法结构和关键不变量。后续 agent 在修改代码前，应先用这里的算法地图理解：数据如何进入模型、模型在预测什么、action 和 video 如何对齐、训练与推理共享哪些隐式契约。
+This file records the DreamZero algorithm structure and key invariants in this repository. Before changing code, future agents should use this algorithm map to understand how data enters the model, what the model predicts, how action and video are aligned, and which implicit contracts are shared by training and inference.
 
-## 算法总览
+## Algorithm Overview
 
-DreamZero 在这里实现的是 World Action Model，而不是纯 action-only policy。
+DreamZero implements a World Action Model here, not a pure action-only policy.
 
-核心思想：
+Core idea:
 
-- 模型同时学习 world dynamics 和 robot policy。
-- 输入是多视角视频、语言、当前 state、未来 action chunk。
-- 视频经 VAE 进入 latent space，action/state 被编码成 DiT 里的 action-state register。
-- DiT 对视频 latent 和 action register 做联合 flow matching / denoising。
-- 训练时同时预测 video flow/noise 和 action flow/noise。
-- 推理时给定真实观测帧和 state，模型在因果 KV cache 上逐块预测下一个 action chunk，并可同时生成 video latent 作为 world prediction。
+- The model learns both world dynamics and robot policy.
+- Inputs include multi-view video, language, current state, and a future action chunk.
+- Video is encoded into latent space by the VAE, while action/state is encoded as an action-state register inside the DiT.
+- The DiT performs joint flow matching / denoising over video latents and action registers.
+- During training, the model predicts both video flow/noise and action flow/noise.
+- During inference, given real observation frames and state, the model predicts the next action chunk block by block using a causal KV cache, and can also generate video latents as world prediction.
 
-高层路径：
+High-level path:
 
 ```text
 LeRobot + DreamZero meta
@@ -30,11 +30,11 @@ LeRobot + DreamZero meta
   -> causal chunked action prediction during inference
 ```
 
-## 数据表示
+## Data Representation
 
-DreamZero 的数据契约由 `meta/`、Hydra data config 和 transform pipeline 共同定义。不要只看 tensor shape；modality key、view order、normalization 统计和 action horizon 同样是算法的一部分。
+The DreamZero data contract is jointly defined by `meta/`, Hydra data config, and the transform pipeline. Do not only check tensor shape; modality key, view order, normalization statistics, and action horizon are also part of the algorithm.
 
-关键文件：
+Key files:
 
 - `groot/vla/data/schema/`
 - `groot/vla/data/dataset/`
@@ -44,14 +44,14 @@ DreamZero 的数据契约由 `meta/`、Hydra data config 和 transform pipeline 
 
 ### Modality Contract
 
-每个 embodiment 的 dataset root 需要有 DreamZero metadata：
+Each embodiment dataset root needs DreamZero metadata:
 
-- `meta/modality.json` 定义 state/action/video/annotation 的 key 和 index range。
-- `meta/stats.json` 提供普通 state/action normalization 统计。
-- `meta/relative_stats_dreamzero.json` 提供 relative action 统计。
-- `meta/embodiment.json` 给出 embodiment tag。
+- `meta/modality.json` defines state/action/video/annotation keys and index ranges.
+- `meta/stats.json` provides standard state/action normalization statistics.
+- `meta/relative_stats_dreamzero.json` provides relative-action statistics.
+- `meta/embodiment.json` provides the embodiment tag.
 
-Hydra YAML 里的 `modality_keys` 必须和 `modality.json` 中的 key 精确匹配。例如 DROID 常见 key 是：
+`modality_keys` in Hydra YAML must exactly match the keys in `modality.json`. Common DROID keys are:
 
 - video: `video.exterior_image_1_left`, `video.exterior_image_2_left`, `video.wrist_image_left`
 - state: `state.joint_position`, `state.gripper_position`
@@ -60,52 +60,52 @@ Hydra YAML 里的 `modality_keys` 必须和 `modality.json` 中的 key 精确匹
 
 ### Multi-View Video Layout
 
-`ConcatTransform` 先把多个 `video.*` key 按 config 顺序拼成 `video`，随后 `DreamTransform` 把多视角视频排成单张 grid image，再作为 Wan video model 的输入。
+`ConcatTransform` first concatenates multiple `video.*` keys into `video` in config order. `DreamTransform` then lays the multi-view video out as a single grid image before passing it to the Wan video model.
 
-DROID / `EmbodimentTag.OXE_DROID` 的布局特殊：
+DROID / `EmbodimentTag.OXE_DROID` has a special layout:
 
 ```text
 [ wrist view stretched across top row ]
 [ left exterior | right exterior       ]
 ```
 
-其他多视角 embodiment 通常使用 2x2 grid：
+Other multi-view embodiments usually use a 2x2 grid:
 
 ```text
 [ view 0 | view 2 ]
 [ view 1 | black  ]
 ```
 
-这个布局会进入语言 prompt 中的 view description，也会影响视觉 token 的空间语义。修改 camera order、grid layout 或 prompt view description，会改变模型学到的跨视角对应关系。
+This layout is also described in the language prompt and affects the spatial semantics of visual tokens. Changing camera order, grid layout, or prompt view description changes the cross-view correspondences the model learns.
 
 ### State / Action Representation
 
-state 和 action 在 transform 中按固定 key order concat，并 pad 到模型配置的最大维度：
+State and action are concatenated by fixed key order in the transform, then padded to the model-configured maximum dimension:
 
-- `state` shape 语义是当前或短历史 proprio token。
-- `action` shape 语义是未来 action chunk。
-- `state_mask` 和 `action_mask` 标记真实维度，避免 padded dim 参与 loss。
-- `has_real_action` 控制样本是否贡献 action loss。
-- `embodiment_id` 表示 embodiment tag 映射后的整数 id，用于 action/state 编码路径。
+- `state` semantically represents current or short-history proprio tokens.
+- `action` semantically represents the future action chunk.
+- `state_mask` and `action_mask` mark real dimensions so padded dimensions do not contribute to loss.
+- `has_real_action` controls whether a sample contributes action loss.
+- `embodiment_id` is the integer id mapped from the embodiment tag and is used by the action/state encoding path.
 
-数值归一化通常使用 `q99`，范围被裁剪到 `[-1, 1]`。action 进入 diffusion 前必须已经在该归一化空间内；推理输出也先在归一化空间，再由 policy wrapper unnormalize 回机器人动作空间。
+Numerical normalization usually uses `q99` and clips values to `[-1, 1]`. Actions must already be in this normalized space before diffusion; inference outputs are also in normalized space until the policy wrapper explicitly unnormalizes them back to robot action space.
 
 ### Language Processing
 
-语言不是裸 task string。`DreamTransform` 和 collator 会按 embodiment 注入 view layout 描述，例如“multi-view video shows...”和每个 view 对应的相机含义。
+Language is not a raw task string. `DreamTransform` and the collator inject view-layout descriptions by embodiment, such as "multi-view video shows..." and camera meanings for each view.
 
-这意味着 language prompt 同时承担两个角色：
+This means the language prompt has two roles:
 
-- task instruction。
-- 视觉 grid 语义说明。
+- task instruction.
+- visual grid semantic description.
 
-如果改 view layout，必须同步改 language formalization，否则模型会收到互相矛盾的视觉语义。
+If the view layout changes, the language formalization must change with it. Otherwise the model receives contradictory visual semantics.
 
-## 模型结构
+## Model Structure
 
-高层模型是 `VLA = backbone + action_head`，核心在 action head。
+The high-level model is `VLA = backbone + action_head`; the action head contains the core algorithm.
 
-关键文件：
+Key files:
 
 - `groot/vla/model/dreamzero/base_vla.py`
 - `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py`
@@ -116,7 +116,7 @@ state 和 action 在 transform 中按固定 key order concat，并 pad 到模型
 
 ### VLA Boundary
 
-`base_vla.py` 只做模型级调度：
+`base_vla.py` only performs model-level dispatch:
 
 ```text
 inputs
@@ -126,7 +126,7 @@ inputs
   -> action_head(backbone_outputs, action_inputs)
 ```
 
-当前 DreamZero 的主要算法负载在 `WANPolicyHead`，包括：
+Most DreamZero algorithm logic currently lives in `WANPolicyHead`, including:
 
 - text encoder
 - image encoder
@@ -138,19 +138,19 @@ inputs
 
 ### Conditioning
 
-Action head 构造三类 conditioning：
+The action head constructs three types of conditioning:
 
-- Text conditioning: UMT5/T5 text encoder 输出 prompt embedding。
-- Image conditioning: 首帧经 CLIP image encoder 得到 `clip_feature`。
-- Video latent conditioning: 输入视频经 Wan VAE 编码为 latent `y` 或 denoising target。
+- Text conditioning: UMT5/T5 text encoder output prompt embeddings.
+- Image conditioning: the first frame is passed through the CLIP image encoder to produce `clip_feature`.
+- Video latent conditioning: input video is encoded by the Wan VAE into latent `y` or a denoising target.
 
-Wan2.1 和 Wan2.2 的 image/video conditioning 方式不同，但外部 policy API 不应因此改变。
+Wan2.1 and Wan2.2 use different image/video conditioning details, but the external policy API should not change because of that.
 
 ### CausalWanModel Sequence
 
-`CausalWanModel` 将视频 token 和机器人 action/state token 放入同一个 transformer 序列。
+`CausalWanModel` puts video tokens and robot action/state tokens into one transformer sequence.
 
-训练时的概念布局：
+Conceptual training layout:
 
 ```text
 [ first image latent tokens ]
@@ -165,21 +165,21 @@ Wan2.1 和 Wan2.2 的 image/video conditioning 方式不同，但外部 policy A
 ...
 ```
 
-其中每个 block 满足：
+Each block satisfies:
 
 ```text
 one image block <-> one action chunk <-> one state token group
 ```
 
-关键配置：
+Key config fields:
 
-- `num_frame_per_block`: 一个 causal video block 中的 latent frame 数。
-- `num_action_per_block`: 每个 video block 对应的 action token 数。
-- `num_state_per_block`: 每个 video block 对应的 state token 数。
-- `action_horizon`: 一次预测的 action steps 数。
-- `frame_seqlen`: 单个 latent frame patch embedding 后的 token 数。
+- `num_frame_per_block`: latent frames in one causal video block.
+- `num_action_per_block`: action tokens corresponding to each video block.
+- `num_state_per_block`: state tokens corresponding to each video block.
+- `action_horizon`: action steps predicted per call.
+- `frame_seqlen`: token count after patch embedding one latent frame.
 
-必须满足：
+These must hold:
 
 ```text
 num_image_blocks == num_action_blocks == num_state_blocks
@@ -187,7 +187,7 @@ action_horizon = num_image_blocks * num_action_per_block
 state_horizon  = num_image_blocks * num_state_per_block
 ```
 
-代码里还隐含训练 shape 约束：
+The code also has implicit training shape constraints:
 
 ```text
 actions.shape[1] / (latent_frames - 1)
@@ -197,11 +197,11 @@ actions.shape[1] / (latent_frames - 1)
   == num_frame_per_block / num_state_per_block
 ```
 
-如果这些关系被破坏，action register 会和 video block 错位，即使 tensor 能 broadcast，算法语义也是错的。
+If these relationships are broken, the action register becomes misaligned with the video blocks. Even if tensors can broadcast, the algorithmic semantics are wrong.
 
 ### Action-State Register
 
-Action/state 不是作为普通条件向量加到 hidden state 上，而是作为 transformer 序列尾部的 register token：
+Action/state is not added to hidden states as a normal conditioning vector. It is appended to the transformer sequence tail as register tokens:
 
 ```text
 action_features = action_encoder(noisy_action, action_timestep, embodiment_id)
@@ -210,35 +210,35 @@ action_register = concat(action_features, state_features)
 x = concat(video_tokens, action_register)
 ```
 
-DiT 输出后：
+After DiT output:
 
 ```text
 video token slice  -> video flow/noise prediction
 action token slice -> action_decoder(...) -> action flow/noise prediction
 ```
 
-这就是 DreamZero 能够把 world prediction 和 policy prediction 绑定在同一个 denoising process 里的核心。
+This is the core mechanism that lets DreamZero bind world prediction and policy prediction inside one denoising process.
 
 ### Positional Encoding And Causality
 
-Video token 使用 3D RoPE：time、height、width。Action/state register 使用 1D RoPE：沿 action/state temporal index 编码。
+Video tokens use 3D RoPE: time, height, width. Action/state registers use 1D RoPE along the action/state temporal index.
 
-attention 是 blockwise causal：
+Attention is blockwise causal:
 
-- first image frame 是全局 conditioning anchor。
-- 后续 video block 只能看过去和当前允许的 block。
-- action/state token 按 block 对齐，只能访问对应 causal context。
-- `local_attn_size` 可限制 KV 可见窗口，当前实现由 `max_chunk_size * num_frame_per_block + 1` 推导。
+- The first image frame is the global conditioning anchor.
+- Later video blocks can only see past blocks and the currently allowed block.
+- Action/state tokens are block-aligned and can only access the corresponding causal context.
+- `local_attn_size` can restrict the visible KV window. The current implementation derives it from `max_chunk_size * num_frame_per_block + 1`.
 
-推理时 `current_start_frame` 决定 RoPE 的时间 offset 和 KV cache 位置。它不是日志变量，而是因果序列坐标。
+During inference, `current_start_frame` determines the RoPE time offset and KV cache position. It is not a logging variable; it is the causal sequence coordinate.
 
-## 训练目标
+## Training Objective
 
-训练入口最终调用 `WANPolicyHead.forward(...)`。
+The training entrypoint eventually calls `WANPolicyHead.forward(...)`.
 
 ### Video Flow Matching
 
-视频处理流程：
+Video processing flow:
 
 ```text
 uint8 video
@@ -252,13 +252,13 @@ uint8 video
   -> dynamics MSE against scheduler.training_target(...)
 ```
 
-`frame_seqlen` 必须和 VAE latent size 以及 DiT patch embedding 一致：
+`frame_seqlen` must match VAE latent size and DiT patch embedding:
 
 ```text
 frame_seqlen = (latent_height // 2) * (latent_width // 2)
 ```
 
-Wan2.2 5B 常用 `160x320` 输入：
+Wan2.2 5B commonly uses `160x320` input:
 
 ```text
 VAE38 spatial downscale 16x
@@ -269,7 +269,7 @@ frame_seqlen = 50
 
 ### Action Flow Matching
 
-action 处理流程：
+Action processing flow:
 
 ```text
 raw action
@@ -282,32 +282,41 @@ raw action
   -> action MSE against scheduler.training_target(...)
 ```
 
-video timestep 和 action timestep 可以是 coupled，也可以通过 config decouple。默认语义是 action timestep 从 video block timestep 推导，以保持 action chunk 和 causal video block 对齐。
+Video timestep and action timestep can be coupled, or decoupled by config. The default semantics derive the action timestep from the video block timestep so the action chunk and causal video block stay aligned.
 
 ### Loss Composition
 
-总 loss 是 dynamics loss 与 action loss 相加：
+Total loss is the sum of dynamics loss and action loss:
 
 ```text
 loss = weighted_dynamics_loss + weighted_action_loss
 ```
 
-重要细节：
+Important details:
 
-- dynamics loss 按 latent frame mask 忽略 padded video frames。
-- action loss 乘 `action_mask`，忽略 padded action dims。
-- action loss 再乘 `has_real_action`，无真实 action 的样本只贡献 video dynamics。
-- scheduler 的 training weight 会作用到 video/action 的 timestep loss。
+- Dynamics loss uses the latent frame mask to ignore padded video frames.
+- Action loss is multiplied by `action_mask`, ignoring padded action dimensions.
+- Action loss is also multiplied by `has_real_action`; samples without real action only contribute video dynamics.
+- The scheduler training weight is applied to video/action timestep loss.
 
-这允许同一训练框架混合“有 action 的机器人样本”和“更偏 video dynamics 的样本”，但 action/no-action 的 mask 语义必须保持准确。
+This allows one training framework to mix robot samples with actions and samples that are more video-dynamics-oriented, but the action/no-action mask semantics must remain accurate.
 
-## 推理算法
+## Inference Algorithm
 
-推理主要走 `GrootSimPolicy.lazy_joint_forward_causal(...)` 到 `VLA.lazy_joint_video_action_causal(...)`，再到 `WANPolicyHead.lazy_joint_video_action(...)`。
+Inference mainly goes through `GrootSimPolicy.lazy_joint_forward_causal(...)`, then `VLA.lazy_joint_video_action_causal(...)`, then `WANPolicyHead.lazy_joint_video_action(...)`.
 
-### Causal Closed-Loop
+### Inference Entrypoints
 
-每次 policy call 预测一个 action chunk：
+`eval_utils/serve_dreamzero_wan22.py` is the original official Wan2.2 websocket serve script. It is kept mostly as a reference/compatibility entrypoint. The current repository primarily uses the root-level socket server versions for evaluation and deployment, for example:
+
+- `socket_test_optimized_AR.py`
+- `socket_test_optimized_aloha_x5lite_bimanual.py`
+
+When reviewing or changing inference logic, prioritize the contracts between these root-level socket servers and their corresponding clients. Do not infer the current main-path behavior from `eval_utils/serve_dreamzero_wan22.py` alone.
+
+### Causal Closed Loop
+
+Each policy call predicts one action chunk:
 
 ```text
 current observation frames + current state + prompt
@@ -319,17 +328,17 @@ current observation frames + current state + prompt
   -> current_start_frame += num_frame_per_block
 ```
 
-机器人或 eval client 执行返回的 action chunk 的一部分或全部，再把新的真实观测发给下一次 policy call。
+The robot or eval client executes part or all of the returned action chunk, then sends new real observations to the next policy call.
 
 ### First Call vs Later Calls
 
-first call 和 later call 语义不同：
+The first call and later calls have different semantics:
 
-- first call 用首帧建立 CLIP conditioning、VAE conditioning 和 KV cache。
-- later call 复用 language/image conditioning，并把新观测 block 追加进 causal cache。
-- 如果 prompt/language 改变、输入退回单帧、或 `current_start_frame` 超过 local attention window，必须 reset causal state。
+- The first call establishes CLIP conditioning, VAE conditioning, and KV cache from the first frame.
+- Later calls reuse language/image conditioning and append the new observation block to the causal cache.
+- If prompt/language changes, the input falls back to a single frame, or `current_start_frame` exceeds the local attention window, causal state must be reset.
 
-需要一起 reset 的状态包括：
+State that must be reset together includes:
 
 - `current_start_frame`
 - positive/negative KV cache
@@ -338,27 +347,27 @@ first call 和 later call 语义不同：
 - cached `ys`
 - cached language identity
 
-只 reset 其中一个会造成时间坐标、conditioning 或 cache 内容不一致。
+Resetting only one of these creates inconsistencies between time coordinates, conditioning, and cache contents.
 
 ### Denoising Loop
 
-推理使用 `FlowUniPCMultistepScheduler`：
+Inference uses `FlowUniPCMultistepScheduler`:
 
-- video latent 从 noise 逐步 denoise。
-- action chunk 从 noise 逐步 denoise。
-- CFG 下 video flow 使用 conditional/unconditional mixing。
-- 当前实现的 action prediction 使用 conditional action branch。
+- Video latent is denoised step by step from noise.
+- Action chunk is denoised step by step from noise.
+- Under CFG, video flow uses conditional/unconditional mixing.
+- The current implementation uses the conditional action branch for action prediction.
 
-输出：
+Outputs:
 
-- `action_pred`: normalized action chunk，后续由 policy wrapper unnormalize。
-- `video_pred`: latent/video prediction，用于调试或视频评估，不应改变 action chunk 对齐。
+- `action_pred`: normalized action chunk, later unnormalized by the policy wrapper.
+- `video_pred`: latent/video prediction for debugging or video evaluation. It should not change action chunk alignment.
 
-## Wan2.1 与 Wan2.2
+## Wan2.1 And Wan2.2
 
-本仓库用同一个 action head 实现兼容 Wan2.1-I2V-14B 和 Wan2.2-TI2V-5B，主要差异来自 config、VAE 和 resolution。
+This repository uses one action head implementation compatible with Wan2.1-I2V-14B and Wan2.2-TI2V-5B. The main differences come from config, VAE, and resolution.
 
-| 项 | Wan2.1-I2V-14B | Wan2.2-TI2V-5B |
+| Item | Wan2.1-I2V-14B | Wan2.2-TI2V-5B |
 | --- | --- | --- |
 | config | `wan_flow_matching_action_tf.yaml` | `wan_flow_matching_action_tf_wan22.yaml` |
 | model type | `i2v` | `ti2v` |
@@ -369,47 +378,47 @@ first call 和 later call 语义不同：
 | common `frame_seqlen` | config-dependent | `50` |
 | first-frame handling | may concat first-frame latent | CLIP first-frame conditioning, no latent concat |
 
-不要把 backbone swap 当成外部接口变化。算法外壳仍然是：
+Do not treat a backbone swap as an external interface change. The algorithm shell remains:
 
 ```text
 one observed block -> one action chunk
 ```
 
-变化的是 latent channel、token count、VAE downscale、conditioning 细节和 checkpoint component path。
+What changes is latent channel count, token count, VAE downscale, conditioning details, and checkpoint component paths.
 
-## Embodiment 适配
+## Embodiment Adaptation
 
-新增或修改 embodiment 时，真正需要对齐的是算法契约：
+When adding or modifying an embodiment, the real target is the algorithm contract:
 
-- `EmbodimentTag` 中的 tag。
-- dataset `meta/modality.json` 中 state/action/video/language key。
-- data YAML 中的 `modality_config_*` 和 `transform_*`。
-- video view order 和 `DreamTransform` grid layout。
-- language prompt 中对 view layout 的描述。
-- state/action concat order。
-- normalization mode 和统计。
-- `max_state_dim`、`max_action_dim`、`state_horizon`、`action_horizon`。
-- 推理 wrapper 中输出 action 的拆分、unnormalize 和机器人执行顺序。
+- The tag in `EmbodimentTag`.
+- State/action/video/language keys in dataset `meta/modality.json`.
+- `modality_config_*` and `transform_*` in data YAML.
+- Video view order and `DreamTransform` grid layout.
+- View layout description in the language prompt.
+- State/action concat order.
+- Normalization mode and statistics.
+- `max_state_dim`, `max_action_dim`, `state_horizon`, `action_horizon`.
+- Action splitting, unnormalization, and robot execution order in the inference wrapper.
 
-对机器人而言，action dimension 对了不等于语义对了。left/right arm order、gripper sign、absolute/relative action、joint order、camera order 都是 policy 语义的一部分。
+For a robot, a matching action dimension does not imply matching semantics. Left/right arm order, gripper sign, absolute vs relative action, joint order, and camera order are all policy semantics.
 
-## 修改算法代码时必须保护的不变量
+## Invariants To Protect When Modifying Algorithm Code
 
-- `modality.json`、Hydra `modality_keys`、transform concat order 必须一致。
-- 多视角 grid layout 和 language view description 必须一致。
-- action/state normalization 和 unnormalization 必须互为逆变换。
-- `action_mask`、`state_mask`、`has_real_action` 不应在 collate 或 device move 中丢失。
-- `frame_seqlen` 必须匹配 VAE latent spatial size 和 DiT patch embedding。
-- `num_frame_per_block`、`num_action_per_block`、`num_state_per_block` 必须让 image/action/state block 数相等。
-- first frame conditioning 不能和 denoised future block 混为同一语义。
-- `current_start_frame` 必须和 KV cache、RoPE time index 同步。
-- 推理 reset 必须同时处理 language、CLIP/VAE conditioning、KV cache 和 cross-attn cache。
-- 训练和推理使用的目标 video resolution 必须一致，否则 latent token count 会错。
-- action output 必须停留在 normalized space，直到 policy wrapper 显式 unnormalize。
+- `modality.json`, Hydra `modality_keys`, and transform concat order must match.
+- Multi-view grid layout and language view description must match.
+- Action/state normalization and unnormalization must be inverse transforms.
+- `action_mask`, `state_mask`, and `has_real_action` must not be lost during collation or device moves.
+- `frame_seqlen` must match VAE latent spatial size and DiT patch embedding.
+- `num_frame_per_block`, `num_action_per_block`, and `num_state_per_block` must make image/action/state block counts equal.
+- First-frame conditioning must not be mixed with denoised future-block semantics.
+- `current_start_frame` must stay synchronized with KV cache and RoPE time index.
+- Inference reset must handle language, CLIP/VAE conditioning, KV cache, and cross-attention cache together.
+- Training and inference must use the same target video resolution, otherwise latent token count is wrong.
+- Action output must remain in normalized space until the policy wrapper explicitly unnormalizes it.
 
-## 推荐阅读路径
+## Recommended Reading Path
 
-理解算法时按这个顺序读代码：
+Read the code in this order to understand the algorithm:
 
 1. `groot/vla/model/dreamzero/base_vla.py`
 2. `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py`

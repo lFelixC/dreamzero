@@ -14,7 +14,5 @@ mot_action_video_attention: first_frame
 mot_action_video_ki: false
 mot_inference_video_mode: auto
 mot_decouple_video_action_noise: false
-mot_video_noise_beta_alpha: 3.0
-mot_video_noise_beta_beta: 1.0
 mot_decoupled_inference_video_final_noise: 0.8
-mot_decoupled_inference_video_refresh_steps: 8
+mot_decoupled_inference_video_refresh_steps: 1

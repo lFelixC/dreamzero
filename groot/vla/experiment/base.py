@@ -19,6 +19,7 @@ from abc import ABC
 from collections.abc import Mapping
 import contextlib
 import gc
+import inspect
 import json
 import logging
 import os
@@ -495,6 +496,13 @@ class BaseTrainer(transformers.Trainer):
             self.loss_grad_logging_steps = self._coerce_positive_int(
                 os.environ["DREAMZERO_LOSS_GRAD_LOGGING_STEPS"],
                 default=self.loss_grad_logging_steps,
+            )
+        self.dataloader_in_order = self._coerce_bool(
+            kwargs.pop("dataloader_in_order", True)
+        )
+        if "DREAMZERO_DATALOADER_IN_ORDER" in os.environ:
+            self.dataloader_in_order = self._coerce_bool(
+                os.environ["DREAMZERO_DATALOADER_IN_ORDER"]
             )
         self._loss_grad_disabled_warning_printed = False
         if self.timing_debug:
@@ -1290,6 +1298,8 @@ class BaseTrainer(transformers.Trainer):
             )
             if dataloader_prefetch_factor is not None:
                 dataloader_params["prefetch_factor"] = dataloader_prefetch_factor
+            if "in_order" in inspect.signature(DataLoader).parameters:
+                dataloader_params["in_order"] = self.dataloader_in_order
 
         return DataLoader(train_dataset, **dataloader_params)
 

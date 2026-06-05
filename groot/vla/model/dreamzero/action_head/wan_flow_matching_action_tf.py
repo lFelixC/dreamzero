@@ -85,23 +85,15 @@ class WANPolicyHeadConfig(PretrainedConfig):
     )
     mot_decouple_video_action_noise: bool = field(
         default=False,
-        metadata={"help": "MoT full-video training: video uses high-noise Beta timesteps, action uses independent uniform timesteps."},
-    )
-    mot_video_noise_beta_alpha: float = field(
-        default=3.0,
-        metadata={"help": "MoT decoupled video timestep Beta alpha; larger values bias video toward higher noise."},
-    )
-    mot_video_noise_beta_beta: float = field(
-        default=1.0,
-        metadata={"help": "MoT decoupled video timestep Beta beta."},
+        metadata={"help": "MoT full-video training: video uses the fixed one-step inference initial timestep, action uses independent uniform timesteps."},
     )
     mot_decoupled_inference_video_final_noise: float = field(
         default=0.8,
         metadata={"help": "Final video sigma for MoT decoupled_denoise inference."},
     )
     mot_decoupled_inference_video_refresh_steps: int = field(
-        default=8,
-        metadata={"help": "Number of full video-expert refresh steps in MoT decoupled_denoise inference: 5, 6, 7, 8, or 16."},
+        default=1,
+        metadata={"help": "Number of full video-expert refresh steps in MoT decoupled_denoise inference: 1, 5, 6, 7, 8, or 16."},
     )
     dynamics_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the video dynamics loss."})
     action_loss_weight: float = field(default=1.0, metadata={"help": "Coefficient for the action denoising loss."})
@@ -121,6 +113,14 @@ class WANPolicyHeadConfig(PretrainedConfig):
     # spatial size matches. Use height/width divisible by 32 for WanVideoVAE38 (16x) so latent H,W are even.
     target_video_height: int | None = field(default=None, metadata={"help": "Target video height for resize (e.g. 160 for even latent with VAE38)."})
     target_video_width: int | None = field(default=None, metadata={"help": "Target video width for resize (e.g. 320)."})
+    static_video_init: bool = field(
+        default=False,
+        metadata={"help": "Initialize predicted video blocks from a pixel-level static copy of the previous frame instead of pure latent noise."},
+    )
+    static_video_init_noise: float = field(
+        default=0.0,
+        metadata={"help": "Blend ratio of Gaussian latent noise into static video initialization. 0.3 means 70% static latent and 30% noise."},
+    )
 
     lora_rank: int = field(default=4, metadata={"help": "LoRA rank."})
     lora_alpha: int = field(default=4, metadata={"help": "LoRA alpha."})
@@ -328,6 +328,10 @@ class WANPolicyHead(ActionHead):
         self.tile_stride_height = config.tile_stride_height
         self.tile_stride_width = config.tile_stride_width
         self.num_frame_per_block = config.num_frame_per_block
+        self.static_video_init = self._coerce_bool(getattr(config, "static_video_init", False))
+        self.static_video_init_noise = self._validate_static_video_init_noise(
+            getattr(config, "static_video_init_noise", 0.0),
+        )
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
         self.text_encoder = instantiate(config.text_encoder_cfg)
@@ -391,6 +395,11 @@ class WANPolicyHead(ActionHead):
         config.use_gradient_checkpointing = self.use_gradient_checkpointing
         if self.training:
             self.scheduler.set_timesteps(1000, training=True)
+        (
+            self.mot_one_step_video_timestep_index,
+            self.mot_one_step_video_timestep,
+            self.mot_one_step_video_target_timestep,
+        ) = self._infer_mot_one_step_video_training_timestep()
 
 
         self.input_embedding_dim = config.input_embedding_dim
@@ -462,7 +471,6 @@ class WANPolicyHead(ActionHead):
         else:
             print("Skipping external component loading (expecting checkpoint state_dict to provide full weights)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
-        self.video_beta_dist = Beta(config.mot_video_noise_beta_alpha, config.mot_video_noise_beta_beta)
         # self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self._noise_logged = False
@@ -478,6 +486,175 @@ class WANPolicyHead(ActionHead):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @staticmethod
+    def _validate_static_video_init_noise(value: float | int | str) -> float:
+        noise = float(value)
+        if not 0.0 <= noise <= 1.0:
+            raise ValueError(
+                "static_video_init_noise must be in [0, 1], "
+                f"got {noise}."
+            )
+        return noise
+
+    def _static_video_init_enabled(self) -> bool:
+        return self._coerce_bool(
+            getattr(self.config, "static_video_init", self.static_video_init),
+        )
+
+    def _static_video_init_noise_ratio(self) -> float:
+        return self._validate_static_video_init_noise(
+            getattr(self.config, "static_video_init_noise", self.static_video_init_noise),
+        )
+
+    def _mix_static_init_with_noise(
+        self,
+        static_latents: torch.Tensor,
+        gaussian_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        noise_ratio = self._static_video_init_noise_ratio()
+        if noise_ratio == 0.0:
+            return static_latents
+        return torch.lerp(static_latents, gaussian_noise, noise_ratio)
+
+    def _build_static_prediction_pixels(
+        self,
+        previous_frame: torch.Tensor,
+        latent_frames: int,
+    ) -> torch.Tensor:
+        if previous_frame.ndim != 5 or previous_frame.shape[2] != 1:
+            raise ValueError(
+                "Expected previous_frame with shape [B, C, 1, H, W], "
+                f"got {tuple(previous_frame.shape)}."
+            )
+        if latent_frames < 1:
+            raise ValueError(f"latent_frames must be >= 1, got {latent_frames}.")
+        return previous_frame.repeat(1, 1, 1 + 4 * latent_frames, 1, 1)
+
+    def _encode_static_block_latents(
+        self,
+        previous_frame: torch.Tensor,
+        latent_frames: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        static_pixels = self._build_static_prediction_pixels(previous_frame, latent_frames)
+        static_latents = self.encode_video(
+            static_pixels,
+            self.tiled,
+            (self.tile_size_height, self.tile_size_width),
+            (self.tile_stride_height, self.tile_stride_width),
+        )
+        static_latents = static_latents[:, :, 1:1 + latent_frames]
+        return static_latents.to(device=device, dtype=dtype)
+
+    def _encode_static_training_init(
+        self,
+        videos: torch.Tensor,
+        target_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        if videos.ndim != 5:
+            raise ValueError(
+                "Expected videos with shape [B, C, T, H, W], "
+                f"got {tuple(videos.shape)}."
+            )
+        latent_frames = target_latents.shape[2]
+        future_latent_frames = latent_frames - 1
+        if future_latent_frames <= 0:
+            return target_latents.clone()
+        if future_latent_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                "Static video initialization requires future latent frames to form complete causal blocks: "
+                f"future_latent_frames={future_latent_frames}, "
+                f"num_frame_per_block={self.num_frame_per_block}."
+            )
+
+        block_starts = list(range(1, latent_frames, self.num_frame_per_block))
+        previous_frames = []
+        total_pixel_frames = videos.shape[2]
+        for block_start_latent in block_starts:
+            prev_pixel_index = 4 * (block_start_latent - 1)
+            if prev_pixel_index >= total_pixel_frames:
+                raise ValueError(
+                    "Cannot build static video initialization because the previous block frame is missing: "
+                    f"prev_pixel_index={prev_pixel_index}, total_pixel_frames={total_pixel_frames}."
+                )
+            previous_frames.append(videos[:, :, prev_pixel_index:prev_pixel_index + 1])
+
+        batch_size = videos.shape[0]
+        batched_previous_frames = torch.cat(previous_frames, dim=0)
+        block_latents = self._encode_static_block_latents(
+            batched_previous_frames,
+            latent_frames=self.num_frame_per_block,
+            device=target_latents.device,
+            dtype=target_latents.dtype,
+        )
+        expected_block_shape = torch.Size((
+            len(block_starts) * batch_size,
+            target_latents.shape[1],
+            self.num_frame_per_block,
+            target_latents.shape[3],
+            target_latents.shape[4],
+        ))
+        if block_latents.shape != expected_block_shape:
+            raise ValueError(
+                "Static video initialization latent shape mismatch during training: "
+                f"got {tuple(block_latents.shape)}, expected {tuple(expected_block_shape)}."
+            )
+
+        block_latents = block_latents.reshape(
+            len(block_starts),
+            batch_size,
+            target_latents.shape[1],
+            self.num_frame_per_block,
+            target_latents.shape[3],
+            target_latents.shape[4],
+        )
+        static_init_latents = target_latents.clone()
+        for block_index, block_start_latent in enumerate(block_starts):
+            static_init_latents[
+                :, :, block_start_latent:block_start_latent + self.num_frame_per_block
+            ] = block_latents[block_index]
+        return static_init_latents
+
+    def _encode_static_prediction_init(
+        self,
+        previous_frame: torch.Tensor,
+        latent_shape: tuple[int, int, int, int, int],
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        static_latents = self._encode_static_block_latents(
+            previous_frame,
+            latent_frames=latent_shape[2],
+            device=device,
+            dtype=dtype,
+        )
+        expected_shape = torch.Size(latent_shape)
+        if static_latents.shape != expected_shape:
+            raise ValueError(
+                "Static video initialization latent shape mismatch: "
+                f"got {tuple(static_latents.shape)}, expected {tuple(expected_shape)}."
+            )
+        if self._static_video_init_noise_ratio() == 0.0:
+            return static_latents
+        gaussian_noise = self.generate_noise(
+            latent_shape,
+            seed=self.seed,
+            device=device,
+            dtype=dtype,
+        )
+        return self._mix_static_init_with_noise(static_latents, gaussian_noise)
+
+    def _infer_mot_one_step_video_training_timestep(self) -> tuple[int, float, float]:
+        num_train_timesteps = float(self.scheduler.num_train_timesteps)
+        base_sigma = 1.0 - 1.0 / num_train_timesteps
+        shift = float(self.sigma_shift)
+        target_sigma = shift * base_sigma / (1.0 + (shift - 1.0) * base_sigma)
+        target_timestep = target_sigma * num_train_timesteps
+        timesteps = self.scheduler.timesteps.detach().cpu().float()
+        timestep_index = int(torch.argmin((timesteps - target_timestep).abs()).item())
+        return timestep_index, float(timesteps[timestep_index].item()), float(target_timestep)
 
     def _validate_mot_decoupled_config(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
@@ -500,7 +677,6 @@ class WANPolicyHead(ActionHead):
                     "mot_inference_video_mode=decoupled_denoise requires "
                     "mot_action_video_attention=full_video."
                 )
-
     def _select_diffusion_model_architecture(self, config: WANPolicyHeadConfig) -> None:
         architecture = getattr(config, "architecture", "joint")
         if architecture not in ("joint", "mot"):
@@ -941,6 +1117,9 @@ class WANPolicyHead(ActionHead):
                 ).reshape(b, c, t, target_h, target_w)
 
         latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
+        static_init_latents = None
+        if self._static_video_init_enabled():
+            static_init_latents = self._encode_static_training_init(videos, latents)
         latent_frame_mask = None
         if video_frame_mask is not None:
             latent_frame_mask = self._video_mask_to_latent_mask(
@@ -972,31 +1151,64 @@ class WANPolicyHead(ActionHead):
 
         # Loss
         noise = torch.randn_like(latents)
+        if static_init_latents is not None:
+            static_init_latents = static_init_latents.to(device=noise.device, dtype=noise.dtype)
+            static_init_latents = self._mix_static_init_with_noise(static_init_latents, noise)
+            noise = torch.cat([noise[:, :, :1], static_init_latents[:, :, 1:]], dim=2)
 
         # specific to autoregressive
         noise = noise.transpose(1, 2)
         latents = latents.transpose(1, 2)
 
         if self._coerce_bool(getattr(self.config, "mot_decouple_video_action_noise", False)):
-            # MoT decoupled mode: train action against full-video K/V while keeping
-            # video at a higher-noise distribution, matching decoupled inference.
-            video_noise_ratio = self.video_beta_dist.sample([noise.shape[0], noise.shape[1]])
-            timestep_id = ((1.0 - video_noise_ratio) * self.scheduler.num_train_timesteps).long()
-            timestep_id = torch.clamp(timestep_id, 0, self.scheduler.num_train_timesteps - 1)
+            # Match the one-step decoupled inference video refresh: action sees
+            # video K/V from the initial high-noise video forward.
+            timestep_id = torch.full(
+                (noise.shape[0], noise.shape[1]),
+                self.mot_one_step_video_timestep_index,
+                dtype=torch.long,
+            )
             noise_mode = "MOT_DECOUPLED"
         else:
             # Video/action use the production coupled timestep schedule.
             timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (noise.shape[0], noise.shape[1]))
             noise_mode = "STANDARD"
 
+        future_video_frames = noise.shape[1] - 1
+        if future_video_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                "Video latent frames after the first frame must form complete causal blocks: "
+                f"future_video_frames={future_video_frames}, "
+                f"num_frame_per_block={self.num_frame_per_block}, "
+                f"noise.shape={noise.shape}, video.shape={videos.shape}, latents.shape={latents.shape}"
+            )
+        num_video_blocks = future_video_frames // self.num_frame_per_block
+        expected_state_tokens = num_video_blocks * self.model.num_state_per_block
+
         timestep_id_block = timestep_id[:, 1:].reshape(
-                    timestep_id.shape[0], -1, self.num_frame_per_block)
+            timestep_id.shape[0], num_video_blocks, self.num_frame_per_block
+        )
         timestep_id_block[:, :, 1:] = timestep_id_block[:, :, 0:1]
 
         if actions.numel() > 0:
             noise_action = torch.randn_like(actions)
-            assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
-            assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
+            expected_action_tokens = num_video_blocks * self.model.num_action_per_block
+            if actions.shape[1] != expected_action_tokens:
+                raise ValueError(
+                    "Action token count must match the video causal block layout: "
+                    f"actions.shape={actions.shape}, expected_action_tokens={expected_action_tokens}, "
+                    f"num_video_blocks={num_video_blocks}, "
+                    f"num_action_per_block={self.model.num_action_per_block}, "
+                    f"noise.shape={noise.shape}, video.shape={videos.shape}, latents.shape={latents.shape}"
+                )
+            if state_features.shape[1] != expected_state_tokens:
+                raise ValueError(
+                    "State token count must match the video causal block layout: "
+                    f"state_features.shape={state_features.shape}, expected_state_tokens={expected_state_tokens}, "
+                    f"num_video_blocks={num_video_blocks}, "
+                    f"num_state_per_block={self.model.num_state_per_block}, "
+                    f"noise.shape={noise.shape}, video.shape={videos.shape}, latents.shape={latents.shape}"
+                )
 
             if noise_mode == "MOT_DECOUPLED":
                 timestep_action_id = torch.randint(
@@ -1006,7 +1218,9 @@ class WANPolicyHead(ActionHead):
                 )
                 action_mode = "INDEPENDENT"
             else:
-                timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
+                timestep_action_id = timestep_id_block[:, :, :1].repeat(
+                    1, 1, self.model.num_action_per_block
+                )
                 timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
                 action_mode = "COUPLED"
 
@@ -1017,8 +1231,10 @@ class WANPolicyHead(ActionHead):
                 if noise_mode == "MOT_DECOUPLED":
                     print(
                         "[NOISE] Mode=MOT_DECOUPLED | "
-                        f"Video: Beta({self.config.mot_video_noise_beta_alpha},"
-                        f"{self.config.mot_video_noise_beta_beta}) mean_t={video_mean:.0f} | "
+                        "Video: fixed one-step "
+                        f"idx={self.mot_one_step_video_timestep_index} "
+                        f"t={self.mot_one_step_video_timestep:.1f} "
+                        f"target_t={self.mot_one_step_video_target_timestep:.1f} | "
                         f"Action: {action_mode} Uniform mean_t={action_mean:.0f}"
                     )
                 else:
@@ -1076,6 +1292,8 @@ class WANPolicyHead(ActionHead):
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             if actions.numel() > 0:
+                # Full teacher forcing: one video denoise forward over clean/noisy
+                # tokens produces the K/V that the action expert reuses.
                 video_noise_pred, action_noise_pred = self.model(
                     noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
@@ -1344,6 +1562,8 @@ class WANPolicyHead(ActionHead):
 
     @staticmethod
     def _build_mot_video_refresh_mask(refresh_steps: int, total_steps: int) -> list[bool]:
+        if refresh_steps == 1:
+            return [True] + [False] * max(total_steps - 1, 0)
         masks = {
             5: [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False],
             6: [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True],
@@ -1354,7 +1574,7 @@ class WANPolicyHead(ActionHead):
         if refresh_steps not in masks:
             raise ValueError(
                 "mot_decoupled_inference_video_refresh_steps must be one of "
-                "5, 6, 7, 8, or 16."
+                "1, 5, 6, 7, 8, or 16."
             )
         mask = masks[refresh_steps]
         if len(mask) != total_steps:
@@ -1497,6 +1717,8 @@ class WANPolicyHead(ActionHead):
         embodiment_id: torch.Tensor,
         video_kv_cache: list[torch.Tensor] | None,
         current_start_frame: int,
+        prefix_kv_cache: list[torch.Tensor] | None = None,
+        current_video_token_len: int | None = None,
     ) -> torch.Tensor:
         if self.ip_size > 1 and self.ip_rank != 0:
             return self._broadcast_cond_tensor(torch.empty_like(noisy_input_action))
@@ -1512,6 +1734,8 @@ class WANPolicyHead(ActionHead):
             embodiment_id=embodiment_id,
             video_kv_cache=video_kv_cache,
             current_start_frame=current_start_frame,
+            prefix_kv_cache=prefix_kv_cache,
+            current_video_token_len=current_video_token_len,
         )
         if self.ip_size > 1:
             action_noise_pred = self._broadcast_cond_tensor(action_noise_pred)
@@ -2006,9 +2230,11 @@ class WANPolicyHead(ActionHead):
         _, _, num_frames, height, width = videos.shape
         if videos.shape[2] == 4 or videos.shape[2] == 9:
             # special case for real-world eval where language is updated
-            image = videos[:, :, -1:].transpose(1, 2)
+            image_pixels = videos[:, :, -1:]
         else:
-            image = videos[:, :, :1].transpose(1, 2)
+            image_pixels = videos[:, :, :1]
+        static_init_frame_pixels = image_pixels
+        image = image_pixels.transpose(1, 2)
 
         if self.current_start_frame == 0:
             clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
@@ -2023,6 +2249,7 @@ class WANPolicyHead(ActionHead):
 
         if latent_video is not None and self.current_start_frame != 0:
             image = latent_video
+            static_init_frame_pixels = videos[:, :, -1:]
             if self.ip_rank == 0:
                 print("image shape@@", image.shape)
         elif self.current_start_frame != 0:
@@ -2040,6 +2267,7 @@ class WANPolicyHead(ActionHead):
                 first_frame = videos[:, :, 0:1]  # Extract first frame
                 videos = torch.cat([first_frame, videos], dim=2)
 
+            static_init_frame_pixels = videos[:, :, -1:]
             image = self.vae.encode(
                 videos,
                 tiled=self.tiled,
@@ -2049,7 +2277,22 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_obs_shape = (
+            image.shape[0],
+            image.shape[1],
+            self.num_frame_per_block,
+            image.shape[3],
+            image.shape[4],
+        )
+        if self._static_video_init_enabled():
+            noise_obs = self._encode_static_prediction_init(
+                static_init_frame_pixels.to(device=image.device, dtype=torch.bfloat16),
+                latent_shape=noise_obs_shape,
+                device=image.device,
+                dtype=torch.bfloat16,
+            )
+        else:
+            noise_obs = self.generate_noise(noise_obs_shape, seed=self.seed, device='cuda', dtype=torch.bfloat16)
         noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
@@ -2205,92 +2448,182 @@ class WANPolicyHead(ActionHead):
             output = image
             condition_latent_frames = image.shape[1]
         elif inference_video_mode == "decoupled_denoise":
-            video_final_noise = self._rescale_video_scheduler_final_noise(sample_scheduler)
-            video_refresh_steps = int(getattr(self.config, "mot_decoupled_inference_video_refresh_steps", 8))
-            video_refresh_mask = self._build_mot_video_refresh_mask(
-                video_refresh_steps,
-                total_steps=len(sample_scheduler.timesteps),
-            )
-            if self.ip_rank == 0:
-                print(
-                    "[MoT] decoupled_denoise: "
-                    f"video_final_noise={video_final_noise:.3f}, "
-                    f"video_refresh_steps={sum(video_refresh_mask)}/{len(video_refresh_mask)}, "
-                    "action_steps=every_step"
-                )
-
-            latest_video_flow: torch.Tensor | None = None
+            video_refresh_steps = int(getattr(self.config, "mot_decoupled_inference_video_refresh_steps", 1))
             latest_cond_video_kv: list[torch.Tensor] | None = None
             action_compute_steps = 0
 
-            for index, current_timestep in enumerate(sample_scheduler.timesteps):
-                start_diffusion_events[index].record()
-
-                action_timestep = sample_scheduler_action.timesteps[index]
-                video_timestep = sample_scheduler.timesteps[index]
-                timestep = torch.ones(
-                    [batch_size, self.num_frame_per_block],
+            if video_refresh_steps == 1:
+                video_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.scheduler.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                )
+                video_scheduler.set_timesteps(
+                    1,
                     device=noise_obs.device,
-                    dtype=torch.int64,
-                ) * video_timestep
-                timestep_action = torch.ones(
-                    [batch_size, self.action_horizon],
-                    device=noise_obs.device,
-                    dtype=torch.int64,
-                ) * action_timestep
+                    shift=self.sigma_shift,
+                )
+                video_final_noise = self._rescale_video_scheduler_final_noise(video_scheduler)
+                if self.ip_rank == 0:
+                    print(
+                        "[MoT] decoupled_denoise: "
+                        f"video_final_noise={video_final_noise:.3f}, "
+                        "video_refresh_steps=1/1, "
+                        "action_steps=every_step"
+                    )
 
-                if video_refresh_mask[index]:
-                    dit_compute_steps += 1
-                    action_compute_steps += 1
-                    if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
-                        y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                for index, action_timestep in enumerate(sample_scheduler_action.timesteps):
+                    start_diffusion_events[index].record()
+
+                    timestep_action = torch.ones(
+                        [batch_size, self.action_horizon],
+                        device=noise_obs.device,
+                        dtype=torch.int64,
+                    ) * action_timestep
+
+                    if index == 0:
+                        video_timestep = video_scheduler.timesteps[0]
+                        timestep = torch.ones(
+                            [batch_size, self.num_frame_per_block],
+                            device=noise_obs.device,
+                            dtype=torch.int64,
+                        ) * video_timestep
+                        dit_compute_steps += 1
+                        action_compute_steps += 1
+                        if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                            y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                        else:
+                            y = self.ys[:, :, -self.num_frame_per_block:]
+                        flow_pred, flow_pred_cond_action, latest_cond_video_kv = self._run_mot_decoupled_refresh_step(
+                            noisy_input=noisy_input.transpose(1, 2),
+                            timestep=timestep,
+                            noisy_input_action=noisy_input_action,
+                            timestep_action=timestep_action,
+                            state_features=state_features,
+                            embodiment_id=embodiment_id,
+                            prompt_embs=prompt_embs,
+                            seq_len=seq_len,
+                            y=y,
+                            kv_caches=kv_caches,
+                            crossattn_caches=crossattn_caches,
+                            current_start_frame=self.current_start_frame,
+                        )
                     else:
-                        y = self.ys[:, :, -self.num_frame_per_block:]
-                    flow_pred, flow_pred_cond_action, latest_cond_video_kv = self._run_mot_decoupled_refresh_step(
-                        noisy_input=noisy_input.transpose(1, 2),
-                        timestep=timestep,
-                        noisy_input_action=noisy_input_action,
-                        timestep_action=timestep_action,
-                        state_features=state_features,
-                        embodiment_id=embodiment_id,
-                        prompt_embs=prompt_embs,
-                        seq_len=seq_len,
-                        y=y,
-                        kv_caches=kv_caches,
-                        crossattn_caches=crossattn_caches,
-                        current_start_frame=self.current_start_frame,
-                    )
-                    latest_video_flow = flow_pred
-                else:
-                    if latest_video_flow is None:
-                        raise RuntimeError("MoT decoupled denoise requires the first video refresh step to run.")
-                    flow_pred = latest_video_flow
-                    action_compute_steps += 1
-                    flow_pred_cond_action = self._run_action_from_refreshed_video_kv_step(
-                        noisy_input_action=noisy_input_action,
-                        timestep_action=timestep_action,
-                        state_features=state_features,
-                        embodiment_id=embodiment_id,
-                        video_kv_cache=latest_cond_video_kv,
-                        current_start_frame=self.current_start_frame,
+                        action_compute_steps += 1
+                        flow_pred_cond_action = self._run_action_from_refreshed_video_kv_step(
+                            noisy_input_action=noisy_input_action,
+                            timestep_action=timestep_action,
+                            state_features=state_features,
+                            embodiment_id=embodiment_id,
+                            video_kv_cache=latest_cond_video_kv,
+                            current_start_frame=self.current_start_frame,
+                            prefix_kv_cache=kv_caches[0],
+                            current_video_token_len=seq_len,
+                        )
+
+                    end_diffusion_events[index].record()
+
+                    if index == 0:
+                        noisy_input = video_scheduler.step(
+                            model_output=flow_pred.transpose(1, 2),
+                            timestep=video_timestep,
+                            sample=noisy_input,
+                            step_index=0,
+                            return_dict=False,
+                        )[0]
+                    noisy_input_action = sample_scheduler_action.step(
+                        model_output=flow_pred_cond_action,
+                        timestep=action_timestep,
+                        sample=noisy_input_action,
+                        step_index=index,
+                        return_dict=False,
+                    )[0]
+            else:
+                video_final_noise = self._rescale_video_scheduler_final_noise(sample_scheduler)
+                video_refresh_mask = self._build_mot_video_refresh_mask(
+                    video_refresh_steps,
+                    total_steps=len(sample_scheduler.timesteps),
+                )
+                if self.ip_rank == 0:
+                    print(
+                        "[MoT] decoupled_denoise: "
+                        f"video_final_noise={video_final_noise:.3f}, "
+                        f"video_refresh_steps={sum(video_refresh_mask)}/{len(video_refresh_mask)}, "
+                        "action_steps=every_step"
                     )
 
-                end_diffusion_events[index].record()
+                latest_video_flow: torch.Tensor | None = None
 
-                noisy_input = sample_scheduler.step(
-                    model_output=flow_pred.transpose(1, 2),
-                    timestep=video_timestep,
-                    sample=noisy_input,
-                    step_index=index,
-                    return_dict=False,
-                )[0]
-                noisy_input_action = sample_scheduler_action.step(
-                    model_output=flow_pred_cond_action,
-                    timestep=action_timestep,
-                    sample=noisy_input_action,
-                    step_index=index,
-                    return_dict=False,
-                )[0]
+                for index, current_timestep in enumerate(sample_scheduler.timesteps):
+                    start_diffusion_events[index].record()
+
+                    action_timestep = sample_scheduler_action.timesteps[index]
+                    video_timestep = sample_scheduler.timesteps[index]
+                    timestep = torch.ones(
+                        [batch_size, self.num_frame_per_block],
+                        device=noise_obs.device,
+                        dtype=torch.int64,
+                    ) * video_timestep
+                    timestep_action = torch.ones(
+                        [batch_size, self.action_horizon],
+                        device=noise_obs.device,
+                        dtype=torch.int64,
+                    ) * action_timestep
+
+                    if video_refresh_mask[index]:
+                        dit_compute_steps += 1
+                        action_compute_steps += 1
+                        if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                            y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                        else:
+                            y = self.ys[:, :, -self.num_frame_per_block:]
+                        flow_pred, flow_pred_cond_action, latest_cond_video_kv = self._run_mot_decoupled_refresh_step(
+                            noisy_input=noisy_input.transpose(1, 2),
+                            timestep=timestep,
+                            noisy_input_action=noisy_input_action,
+                            timestep_action=timestep_action,
+                            state_features=state_features,
+                            embodiment_id=embodiment_id,
+                            prompt_embs=prompt_embs,
+                            seq_len=seq_len,
+                            y=y,
+                            kv_caches=kv_caches,
+                            crossattn_caches=crossattn_caches,
+                            current_start_frame=self.current_start_frame,
+                        )
+                        latest_video_flow = flow_pred
+                    else:
+                        if latest_video_flow is None:
+                            raise RuntimeError("MoT decoupled denoise requires the first video refresh step to run.")
+                        flow_pred = latest_video_flow
+                        action_compute_steps += 1
+                        flow_pred_cond_action = self._run_action_from_refreshed_video_kv_step(
+                            noisy_input_action=noisy_input_action,
+                            timestep_action=timestep_action,
+                            state_features=state_features,
+                            embodiment_id=embodiment_id,
+                            video_kv_cache=latest_cond_video_kv,
+                            current_start_frame=self.current_start_frame,
+                            prefix_kv_cache=kv_caches[0],
+                            current_video_token_len=seq_len,
+                        )
+
+                    end_diffusion_events[index].record()
+
+                    noisy_input = sample_scheduler.step(
+                        model_output=flow_pred.transpose(1, 2),
+                        timestep=video_timestep,
+                        sample=noisy_input,
+                        step_index=index,
+                        return_dict=False,
+                    )[0]
+                    noisy_input_action = sample_scheduler_action.step(
+                        model_output=flow_pred_cond_action,
+                        timestep=action_timestep,
+                        sample=noisy_input_action,
+                        step_index=index,
+                        return_dict=False,
+                    )[0]
 
             output = noisy_input
             if self.current_start_frame == 1:
