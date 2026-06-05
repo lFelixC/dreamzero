@@ -155,10 +155,8 @@ bash scripts/train/a800_train/run_mot_full_video_2node.sh
 Decoupled 脚本可覆盖：
 
 ```bash
-MOT_VIDEO_NOISE_BETA_ALPHA=5.0 \
-MOT_VIDEO_NOISE_BETA_BETA=1.0 \
 MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE=0.85 \
-MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=6 \
+MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=1 \
 bash scripts/train/a800_train/run_mot_full_video_decoupled_2node.sh
 ```
 
