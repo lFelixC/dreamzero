@@ -42,6 +42,8 @@ ROBOTWIN_CAMERA_TO_DREAMZERO = {
 }
 ROBOTWIN_CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
 ROBOTWIN_ACTION_DIM = 14
+DEFAULT_ROBOTWIN_TASK_CONFIG = "demo_clean"
+ROBOTWIN_TASK_CONFIG_ENV = "ROBOTWIN_TASK_CONFIG"
 ROBOTWIN_ACTION_LOW = -np.inf
 ROBOTWIN_ACTION_HIGH = np.inf
 ROBOTWIN_CAMERA_H = 240
@@ -284,14 +286,92 @@ def robotwin_obs_sequence_to_payload(
     return payload
 
 
-def load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
+def _pad_observation_sequence(
+    observations: Sequence[dict[str, Any]],
+    target_length: int,
+) -> list[dict[str, Any]]:
+    if not observations:
+        raise ValueError("Cannot pad an empty observation sequence")
+    values = list(observations)[-target_length:]
+    if len(values) >= target_length:
+        return values
+    return [values[0]] * (target_length - len(values)) + values
+
+
+def _batched_state_array(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected per-env state shape [T,D] or [D], got {arr.shape}")
+    return arr
+
+
+def robotwin_obs_sequences_to_batched_payload(
+    observation_sequences: Sequence[Sequence[dict[str, Any]]],
+    prompt: str,
+    session_id: str,
+    *,
+    image_resolution: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    if not observation_sequences:
+        raise ValueError("Cannot build a batched payload from zero observation sequences")
+
+    max_length = max(len(sequence) for sequence in observation_sequences)
+    if max_length <= 0:
+        raise ValueError("Cannot build a batched payload from an empty observation sequence")
+
+    per_env_payloads = [
+        robotwin_obs_sequence_to_payload(
+            _pad_observation_sequence(sequence, max_length),
+            prompt,
+            session_id,
+            image_resolution=image_resolution,
+        )
+        for sequence in observation_sequences
+    ]
+
+    batch_size = len(per_env_payloads)
+    payload: dict[str, Any] = {}
+    for key in ROBOTWIN_CAMERA_TO_DREAMZERO:
+        payload[key] = np.ascontiguousarray(np.stack([item[key] for item in per_env_payloads], axis=0))
+    for key in (
+        "state.left_joint_pos",
+        "state.left_gripper_pos",
+        "state.right_joint_pos",
+        "state.right_gripper_pos",
+    ):
+        payload[key] = np.ascontiguousarray(
+            np.stack([_batched_state_array(item[key]) for item in per_env_payloads], axis=0)
+        )
+
+    prompts = [prompt] * batch_size
+    payload.update(
+        {
+            "prompt": prompts,
+            "annotation.task": prompts,
+            "session_id": session_id,
+        }
+    )
+    return payload
+
+
+def get_robotwin_task_config() -> str:
+    return os.environ.get(ROBOTWIN_TASK_CONFIG_ENV, DEFAULT_ROBOTWIN_TASK_CONFIG).strip() or DEFAULT_ROBOTWIN_TASK_CONFIG
+
+
+def load_robotwin_setup_kwargs(task_name: str, task_config: str | None = None) -> dict[str, Any]:
     ensure_robotwin_workdir()
     import yaml
     from envs import CONFIGS_PATH
 
-    task_config = "demo_clean"
-    with open(os.path.join(CONFIGS_PATH, f"{task_config}.yml"), encoding="utf-8") as f:
+    resolved_task_config = (task_config or get_robotwin_task_config()).strip()
+    config_path = os.path.join(CONFIGS_PATH, f"{resolved_task_config}.yml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"RoboTwin task config not found: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
         args = yaml.safe_load(f)
+    args["_robotwin_task_config"] = resolved_task_config
 
     with open(os.path.join(CONFIGS_PATH, "_embodiment_config.yml"), encoding="utf-8") as f:
         embodiment_types = yaml.safe_load(f)
@@ -858,6 +938,13 @@ class DreamZeroRoboTwinEnv:
             "expert_filter": expert_filter_info,
             "prompt": prompt,
         }
+
+    def set_prompt(self, prompt: str) -> dict[str, Any]:
+        if self.env is None:
+            raise RuntimeError("set_prompt called before reset")
+        self.prompt = str(prompt)
+        set_robotwin_instruction(self.env, self.prompt)
+        return {"prompt": self.prompt}
 
     def step_chunk(
         self,

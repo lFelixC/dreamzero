@@ -52,6 +52,7 @@ class Args:
     enable_dit_cache: bool = False
     max_chunk_size: int | None = None
     output_root: str | None = None
+    save_server_video: bool = False
     index: int = 0
     use_rtc: bool = False
     rtc_execution_horizon: int = 20
@@ -949,7 +950,11 @@ def main(args: Args) -> None:
             mot_inference_video_mode,
         )
 
-    output_dir = _build_output_dir(args.output_root, args.model_path, args.index) if rank == 0 else None
+    output_dir = (
+        _build_output_dir(args.output_root, args.model_path, args.index)
+        if rank == 0 and args.save_server_video
+        else None
+    )
     if output_dir:
         logger.info("Server outputs will be written under %s", output_dir)
 

@@ -30,8 +30,8 @@ from groot.vla.data.schema import EmbodimentTag
 import imageio
 import numpy as np
 
-from openpi_client import base_policy as _base_policy
-from openpi_client import msgpack_numpy
+from eval_utils import base_policy as _base_policy
+from eval_utils import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
 from tianshou.data import Batch

@@ -18,7 +18,6 @@ for extra in (
     REPO_ROOT / "third_party" / "RoboTwin",
     REPO_ROOT / "third_party" / "lerobot" / "src",
     REPO_ROOT / "third_party" / "lerobot",
-    Path("/data/openpi/packages/openpi-client/src"),
 ):
     if extra.exists() and str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
@@ -102,6 +101,13 @@ def main() -> None:
                     max_keyframes=int(cmd.get("max_keyframes", 9)),
                 )
                 conn.send(ok(type="step_chunk", worker_id=args.worker_id, **result))
+                continue
+
+            if name == "set_prompt":
+                if runner is None:
+                    raise RuntimeError("set_prompt received before reset")
+                result = runner.set_prompt(str(cmd.get("prompt", "")))
+                conn.send(ok(type="set_prompt", worker_id=args.worker_id, **result))
                 continue
 
             if name == "finish_episode":

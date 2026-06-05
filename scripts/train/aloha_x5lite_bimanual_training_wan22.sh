@@ -1,92 +1,131 @@
 #!/bin/bash
 set -euo pipefail
 
-# A800 multi-node MoT experiment: action expert sees full-video K/V.
-# Run this script on every node with the same MASTER_ADDR and MASTER_PORT,
-# changing only NODE_RANK.
+# ALOHA X5lite bimanual Wan2.2 training entrypoint.
+# Switch architectures with ARCH=joint or ARCH=mot.
+# Select data explicitly with ALOHA_DATA_ROOT=/path/to/lerobot_dataset.
 
-# -----------------------------
-# Fixed runtime environment
-# -----------------------------
-export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venvs/dreamzero}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+ARCH="${ARCH:-joint}"
+if [[ "${ARCH}" != "joint" && "${ARCH}" != "mot" ]]; then
+  echo "ERROR: ARCH must be joint or mot, got '${ARCH}'"
+  exit 1
+fi
+
+export VIRTUAL_ENV="${VIRTUAL_ENV:-/data/dreamzero/.venv}"
 export PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV}/bin/python}"
 export PATH="${VIRTUAL_ENV}/bin:/usr/local/bin:/root/.local/bin:${PATH:-}"
-export DREAMZERO_ROOT="${DREAMZERO_ROOT:-/2023133163/liuf/dreamzero}"
-export DATASET_ROOT="${DATASET_ROOT:-/2023133163/datasets/dreamzero}"
-export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/2023133163/checkpoints/dreamzero}"
+export DREAMZERO_ROOT="${DREAMZERO_ROOT:-/data/dreamzero_mot}"
+export DATASET_ROOT="${DATASET_ROOT:-/data/datasets/dreamzero}"
+export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
 export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
 
 EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py}"
+ALOHA_DATA_ROOT="${ALOHA_DATA_ROOT:-}"
+if [[ -z "${ALOHA_DATA_ROOT}" ]]; then
+  echo "ERROR: ALOHA_DATA_ROOT must be set to the dataset root you want to train."
+  echo "Example: ALOHA_DATA_ROOT=/path/to/aloha_dataset_160x320 bash $0"
+  exit 1
+fi
+ALOHA_DATA_NAME="${ALOHA_DATA_NAME:-$(basename "${ALOHA_DATA_ROOT%/}")}"
+ALOHA_DATA_NAME="${ALOHA_DATA_NAME//[^[:alnum:]_.-]/_}"
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
 IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${WAN22_CKPT_DIR}}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
-OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/mot_seq200_ki_off}"
+OUTPUT_DIR_WAS_SET="${OUTPUT_DIR+x}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_wan22_${ALOHA_DATA_NAME}_${ARCH}}"
 
-# -----------------------------
-# User-tunable training knobs
-# -----------------------------
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
-PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
-MAX_STEPS="${MAX_STEPS:-30000}"
-EVAL_STEPS="${EVAL_STEPS:-100}"
-SAVE_STEPS="${SAVE_STEPS:-2000}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-32}"
+MAX_STEPS="${MAX_STEPS:-50000}"
+SAVE_STEPS="${SAVE_STEPS:-5000}"
+SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
 DEEPSPEED_CFG="${DEEPSPEED_CFG:-zero2}"
 NUM_FRAMES="${NUM_FRAMES:-33}"
 IMAGE_RESOLUTION_WIDTH="${IMAGE_RESOLUTION_WIDTH:-320}"
 IMAGE_RESOLUTION_HEIGHT="${IMAGE_RESOLUTION_HEIGHT:-160}"
-TARGET_VIDEO_HEIGHT="${TARGET_VIDEO_HEIGHT:-${TARGET_HEIGHT:-${MODEL_TARGET_HEIGHT:-320}}}"
-TARGET_VIDEO_WIDTH="${TARGET_VIDEO_WIDTH:-${TARGET_WIDTH:-${MODEL_TARGET_WIDTH:-640}}}"
-FRAME_SEQLEN="${FRAME_SEQLEN:-${MODEL_FRAME_SEQLEN:-${FRAMESEQ:-200}}}"
+TARGET_VIDEO_HEIGHT="${TARGET_VIDEO_HEIGHT:-${TARGET_HEIGHT:-${MODEL_TARGET_HEIGHT:-160}}}"
+TARGET_VIDEO_WIDTH="${TARGET_VIDEO_WIDTH:-${TARGET_WIDTH:-${MODEL_TARGET_WIDTH:-320}}}"
+FRAME_SEQLEN="${FRAME_SEQLEN:-${MODEL_FRAME_SEQLEN:-${FRAMESEQ:-50}}}"
 ACTION_HORIZON="${ACTION_HORIZON:-24}"
 MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-4}"
 NUM_FRAME_PER_BLOCK="${NUM_FRAME_PER_BLOCK:-2}"
 NUM_ACTION_PER_BLOCK="${NUM_ACTION_PER_BLOCK:-24}"
 NUM_STATE_PER_BLOCK="${NUM_STATE_PER_BLOCK:-1}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-4}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
-USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
-MOT_ACTION_VIDEO_ATTENTION="${MOT_ACTION_VIDEO_ATTENTION:-full_video}"
-# KI means keep the video/action experts independent for action loss.
-# false: action loss gradients flow through causal video K/V into the video expert.
-# true: action sees causal video K/V, but the K/V is detached for action loss.
-MOT_ACTION_VIDEO_KI="${MOT_ACTION_VIDEO_KI:-${MOT_KI:-false}}"
-MOT_INFERENCE_VIDEO_MODE="${MOT_INFERENCE_VIDEO_MODE:-auto}"
-MOT_DECOUPLE_VIDEO_ACTION_NOISE="${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"
-MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE="${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE:-0.8}"
-MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS="${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-1}"
-DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB="${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB:-0.0}"
 DATASET_SHARD_SAMPLING_RATE="${DATASET_SHARD_SAMPLING_RATE:-0.1}"
 DATASET_SHARD_SAMPLING_STRATEGY="${DATASET_SHARD_SAMPLING_STRATEGY:-random}"
 DATASET_SHARD_SAMPLING_BLOCK_SIZE="${DATASET_SHARD_SAMPLING_BLOCK_SIZE:-64}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
+EPISODE_FILTER_PATH="${EPISODE_FILTER_PATH:-null}"
+MOT_ACTION_VIDEO_ATTENTION="${MOT_ACTION_VIDEO_ATTENTION:-full_video}"
 
-# -----------------------------
-# Multi-node envs
-# -----------------------------
-NNODES="${NNODES:-2}"
+NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29420}"
+MASTER_PORT="${MASTER_PORT:-29432}"
 
-# -----------------------------
-# Runtime env
-# -----------------------------
-GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
-if [[ -n "${GPU_IDS}" ]]; then
+if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
+  NNODES=1
+  NODE_RANK=0
+  MASTER_ADDR="127.0.0.1"
+  if [[ -n "${SMOKE_GPU_IDS:-}" ]]; then
+    GPU_IDS="${SMOKE_GPU_IDS}"
+  elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    GPU_IDS="${CUDA_VISIBLE_DEVICES}"
+  elif [[ -n "${GPU_IDS:-}" ]]; then
+    GPU_IDS="${GPU_IDS}"
+  else
+    GPU_IDS="$("${PYTHON_BIN}" - <<'PY'
+import torch
+count = torch.cuda.device_count()
+print(",".join(str(i) for i in range(count)) if count else "0")
+PY
+)"
+  fi
+  if [[ "${SMOKE_FORCE_SINGLE_GPU:-false}" == "true" && "${GPU_IDS}" == *,* ]]; then
+    GPU_IDS="${GPU_IDS%%,*}"
+  fi
+  PER_DEVICE_BS="${SMOKE_PER_DEVICE_BS:-1}"
+  MAX_STEPS="${SMOKE_MAX_STEPS:-2}"
+  SAVE_STEPS="${SMOKE_SAVE_STEPS:-1}"
+  SAVE_STRATEGY="${SMOKE_SAVE_STRATEGY:-no}"
+  SAVE_TOTAL_LIMIT="${SMOKE_SAVE_TOTAL_LIMIT:-5}"
+  DATALOADER_NUM_WORKERS="${SMOKE_DATALOADER_NUM_WORKERS:-1}"
+  DATALOADER_PREFETCH_FACTOR="${SMOKE_DATALOADER_PREFETCH_FACTOR:-2}"
+  DATALOADER_PERSISTENT_WORKERS="${SMOKE_DATALOADER_PERSISTENT_WORKERS:-false}"
+  DATASET_SHARD_SAMPLING_RATE="${SMOKE_DATASET_SHARD_SAMPLING_RATE:-1.0}"
+  DATASET_SHARD_SAMPLING_STRATEGY="${SMOKE_DATASET_SHARD_SAMPLING_STRATEGY:-${DATASET_SHARD_SAMPLING_STRATEGY}}"
+  DATASET_SHARD_SAMPLING_BLOCK_SIZE="${SMOKE_DATASET_SHARD_SAMPLING_BLOCK_SIZE:-${DATASET_SHARD_SAMPLING_BLOCK_SIZE}}"
+  if [[ -z "${OUTPUT_DIR_WAS_SET}" ]]; then
+    OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_wan22_${ALOHA_DATA_NAME}_${ARCH}_smoke"
+  fi
+  if [[ "${EPISODE_FILTER_PATH}" == "null" && -f "${ALOHA_DATA_ROOT}/meta/smoke_episode_filter.json" ]]; then
+    EPISODE_FILTER_PATH="${ALOHA_DATA_ROOT}/meta/smoke_episode_filter.json"
+  fi
+  export DREAMZERO_SKIP_FINAL_SAVE="${DREAMZERO_SKIP_FINAL_SAVE:-1}"
+fi
+
+if [[ "${SMOKE_TEST:-0}" == "1" && -n "${GPU_IDS:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  GPU_IDS="${CUDA_VISIBLE_DEVICES}"
+else
+  GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
   export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 fi
 
 export HYDRA_FULL_ERROR=1
-export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-0}"
+export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT_NAME}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
-
-if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
-  export SWANLAB_API_KEY
-fi
 
 if command -v nvcc >/dev/null 2>&1; then
   CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
@@ -105,17 +144,21 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "ERROR: Python not found or not executable at ${PYTHON_BIN}"
   exit 1
 fi
-
 if [[ ! -f "${EXPERIMENT_PY}" ]]; then
   echo "ERROR: experiment.py not found at ${EXPERIMENT_PY}"
   exit 1
 fi
+if [[ ! -f "${ALOHA_DATA_ROOT}/meta/modality.json" ]]; then
+  echo "ERROR: ALOHA metadata missing at ${ALOHA_DATA_ROOT}/meta/modality.json"
+  echo "Prepare the dataset and DreamZero metadata first."
+  exit 1
+fi
 
-if [[ -n "${NUM_GPUS:-}" ]]; then
-  LOCAL_NUM_GPUS="${NUM_GPUS}"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
   LOCAL_NUM_GPUS="${#_GPU_ID_ARRAY[@]}"
+elif [[ -n "${NUM_GPUS:-}" ]]; then
+  LOCAL_NUM_GPUS="${NUM_GPUS}"
 else
   LOCAL_NUM_GPUS="$("${PYTHON_BIN}" - <<'PY'
 import torch
@@ -123,52 +166,35 @@ print(torch.cuda.device_count())
 PY
 )"
 fi
-
 if [[ -z "${LOCAL_NUM_GPUS}" ]] || [[ "${LOCAL_NUM_GPUS}" -lt 1 ]]; then
   echo "ERROR: No visible GPU found"
   exit 1
 fi
+export NUM_GPUS="${LOCAL_NUM_GPUS}"
 
 WORLD_GPUS=$((NNODES * LOCAL_NUM_GPUS))
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((WORLD_GPUS * PER_DEVICE_BS))}"
 
-resolve_dataset_root() {
-  local base="$1"
-  local candidate
-
-  if [[ -f "${base}/meta/modality.json" ]]; then
-    echo "${base}"
-    return 0
+download_hf() {
+  if command -v hf >/dev/null 2>&1; then
+    hf download "$@"
+  elif command -v huggingface-cli >/dev/null 2>&1; then
+    huggingface-cli download "$@"
+  else
+    echo "ERROR: neither hf nor huggingface-cli is available"
+    exit 1
   fi
-
-  if [[ -f "${base}/droid_lerobot/meta/modality.json" ]]; then
-    echo "${base}/droid_lerobot"
-    return 0
-  fi
-
-  candidate="$(find "${base}" -maxdepth 3 -path '*/meta/modality.json' 2>/dev/null | head -n 1 || true)"
-  if [[ -n "${candidate}" ]]; then
-    dirname "$(dirname "${candidate}")"
-    return 0
-  fi
-
-  return 1
 }
-
-if ! DROID_DATA_ROOT="$(resolve_dataset_root "${DATASET_ROOT}")"; then
-  echo "ERROR: Could not find meta/modality.json under ${DATASET_ROOT}"
-  exit 1
-fi
 
 prepare_assets() {
   if [[ ! -d "${WAN22_CKPT_DIR}" ]] || [[ -z "$(ls -A "${WAN22_CKPT_DIR}" 2>/dev/null)" ]]; then
-    echo "Downloading Wan2.2-TI2V-5B ..."
-    huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir "${WAN22_CKPT_DIR}"
+    echo "Downloading Wan2.2-TI2V-5B to ${WAN22_CKPT_DIR} ..."
+    download_hf Wan-AI/Wan2.2-TI2V-5B --local-dir "${WAN22_CKPT_DIR}"
   fi
 
   if [[ ! -d "${TOKENIZER_DIR}" ]] || [[ -z "$(ls -A "${TOKENIZER_DIR}" 2>/dev/null)" ]]; then
-    echo "Downloading umt5-xxl tokenizer files ..."
-    huggingface-cli download google/umt5-xxl \
+    echo "Downloading umt5-xxl tokenizer files to ${TOKENIZER_DIR} ..."
+    download_hf google/umt5-xxl \
       --local-dir "${TOKENIZER_DIR}" \
       --include tokenizer.json tokenizer_config.json special_tokens_map.json spiece.model
   fi
@@ -177,7 +203,6 @@ prepare_assets() {
     local image_encoder_name="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
     local image_encoder_cache_dir="${CHECKPOINT_ROOT}/Wan2.1-I2V-14B-480P"
     local src
-
     for src in \
       "${image_encoder_cache_dir}/${image_encoder_name}" \
       "${CHECKPOINT_ROOT}/DreamZero-DROID/${image_encoder_name}"; do
@@ -190,7 +215,7 @@ prepare_assets() {
     done
 
     echo "Downloading Wan2.1-I2V-14B-480P image encoder cache ..."
-    huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir "${image_encoder_cache_dir}"
+    download_hf Wan-AI/Wan2.1-I2V-14B-480P --local-dir "${image_encoder_cache_dir}"
     mkdir -p "${IMAGE_ENCODER_DIR}"
     cp -L "${image_encoder_cache_dir}/${image_encoder_name}" "${IMAGE_ENCODER_DIR}/${image_encoder_name}"
   fi
@@ -209,64 +234,75 @@ if [[ "${PREPARE_ASSETS:-true}" == "true" ]]; then
   fi
 fi
 
+if [[ "${ARCH}" == "mot" ]]; then
+  ACTION_HEAD_CONFIG="wan_flow_matching_action_tf_wan22_mot"
+else
+  ACTION_HEAD_CONFIG="wan_flow_matching_action_tf_wan22"
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 cd "${DREAMZERO_ROOT}"
 
-echo "========== full-video MoT multi-node launch config =========="
+echo "========== ALOHA X5lite Wan2.2 launch config =========="
+echo "ARCH=${ARCH}"
 echo "DREAMZERO_ROOT=${DREAMZERO_ROOT}"
+echo "SCRIPT_DIR=${SCRIPT_DIR}"
 echo "HOSTNAME=${HOSTNAME:-unknown}"
 echo "NNODES=${NNODES}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
+echo "DATASET_ROOT=${DATASET_ROOT}"
+echo "ALOHA_DATA_ROOT=${ALOHA_DATA_ROOT}"
+echo "ALOHA_DATA_NAME=${ALOHA_DATA_NAME}"
+echo "WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
-echo "NUM_GPUS(local)=${LOCAL_NUM_GPUS}"
+echo "NUM_GPUS(local)=${NUM_GPUS}"
 echo "WORLD_GPUS(total)=${WORLD_GPUS}"
 echo "PER_DEVICE_BS=${PER_DEVICE_BS}"
 echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
-echo "OUTPUT_DIR=${OUTPUT_DIR}"
-echo "DROID_DATA_ROOT=${DROID_DATA_ROOT}"
-echo "WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
-echo "IMAGE_ENCODER_DIR=${IMAGE_ENCODER_DIR}"
-echo "TOKENIZER_DIR=${TOKENIZER_DIR}"
+echo "MAX_STEPS=${MAX_STEPS}"
+echo "SAVE_STEPS=${SAVE_STEPS}"
+echo "SAVE_STRATEGY=${SAVE_STRATEGY}"
+echo "LEARNING_RATE=${LEARNING_RATE}"
+echo "DEEPSPEED_CFG=${DEEPSPEED_CFG}"
+echo "NUM_FRAMES=${NUM_FRAMES}"
 echo "IMAGE_RESOLUTION_HEIGHT=${IMAGE_RESOLUTION_HEIGHT}"
 echo "IMAGE_RESOLUTION_WIDTH=${IMAGE_RESOLUTION_WIDTH}"
 echo "TARGET_VIDEO_HEIGHT=${TARGET_VIDEO_HEIGHT}"
 echo "TARGET_VIDEO_WIDTH=${TARGET_VIDEO_WIDTH}"
 echo "FRAME_SEQLEN=${FRAME_SEQLEN}"
-echo "MOT_ACTION_VIDEO_ATTENTION=${MOT_ACTION_VIDEO_ATTENTION}"
-echo "MOT_ACTION_VIDEO_KI=${MOT_ACTION_VIDEO_KI}"
-echo "MOT_INFERENCE_VIDEO_MODE=${MOT_INFERENCE_VIDEO_MODE}"
-echo "MOT_DECOUPLE_VIDEO_ACTION_NOISE=${MOT_DECOUPLE_VIDEO_ACTION_NOISE}"
-echo "DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB=${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB}"
+echo "ACTION_HORIZON=${ACTION_HORIZON}"
+echo "MAX_CHUNK_SIZE=${MAX_CHUNK_SIZE}"
+echo "NUM_FRAME_PER_BLOCK=${NUM_FRAME_PER_BLOCK}"
+echo "NUM_ACTION_PER_BLOCK=${NUM_ACTION_PER_BLOCK}"
+echo "NUM_STATE_PER_BLOCK=${NUM_STATE_PER_BLOCK}"
+echo "DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS}"
+echo "DATALOADER_PREFETCH_FACTOR=${DATALOADER_PREFETCH_FACTOR}"
+echo "DATALOADER_PERSISTENT_WORKERS=${DATALOADER_PERSISTENT_WORKERS}"
 echo "DATASET_SHARD_SAMPLING_RATE=${DATASET_SHARD_SAMPLING_RATE}"
 echo "DATASET_SHARD_SAMPLING_STRATEGY=${DATASET_SHARD_SAMPLING_STRATEGY}"
 echo "DATASET_SHARD_SAMPLING_BLOCK_SIZE=${DATASET_SHARD_SAMPLING_BLOCK_SIZE}"
 echo "USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING}"
-echo "============================================================="
+echo "MOT_ACTION_VIDEO_ATTENTION=${MOT_ACTION_VIDEO_ATTENTION}"
+echo "SMOKE_TEST=${SMOKE_TEST:-0}"
+echo "SMOKE_FORCE_SINGLE_GPU=${SMOKE_FORCE_SINGLE_GPU:-false}"
+echo "DREAMZERO_SKIP_FINAL_SAVE=${DREAMZERO_SKIP_FINAL_SAVE:-<unset>}"
+echo "EPISODE_FILTER_PATH=${EPISODE_FILTER_PATH}"
+echo "========================================================"
 
 TRAIN_OVERRIDES=(
   "report_to=wandb"
-  "data=dreamzero/droid_relative_wan22"
+  "data=dreamzero/aloha_x5lite_bimanual_relative_wan22"
   "wandb_project=${WANDB_PROJECT_NAME}"
   "train_architecture=full"
-  "architecture=mot"
-  "mot_action_hidden_dim=1024"
-  "mot_action_ffn_dim=4096"
-  "mot_action_num_layers=null"
-  "mot_action_num_heads=8"
-  "mot_action_video_attention=${MOT_ACTION_VIDEO_ATTENTION}"
-  "mot_action_video_ki=${MOT_ACTION_VIDEO_KI}"
-  "mot_inference_video_mode=${MOT_INFERENCE_VIDEO_MODE}"
-  "mot_decouple_video_action_noise=${MOT_DECOUPLE_VIDEO_ACTION_NOISE}"
-  "mot_decoupled_inference_video_final_noise=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE}"
-  "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS}"
-  "droid_random_drop_exterior_view_prob=${DROID_RANDOM_DROP_EXTERIOR_VIEW_PROB}"
+  "architecture=${ARCH}"
   "num_frames=${NUM_FRAMES}"
   "action_horizon=${ACTION_HORIZON}"
   "num_views=3"
   "model=dreamzero/vla"
-  "model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_mot"
+  "model/dreamzero/action_head=${ACTION_HEAD_CONFIG}"
   "action_head_cfg.config.use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING}"
   "frame_seqlen=${FRAME_SEQLEN}"
   "action_head_cfg.config.target_video_height=${TARGET_VIDEO_HEIGHT}"
@@ -289,10 +325,9 @@ TRAIN_OVERRIDES=(
   "max_steps=${MAX_STEPS}"
   "save_steps=${SAVE_STEPS}"
   "eval_strategy=no"
-  "eval_steps=${EVAL_STEPS}"
   "do_eval=false"
   "weight_decay=1e-5"
-  "save_total_limit=10"
+  "save_total_limit=${SAVE_TOTAL_LIMIT}"
   "upload_checkpoints=false"
   "bf16=true"
   "tf32=true"
@@ -304,8 +339,9 @@ TRAIN_OVERRIDES=(
   "image_resolution_height=${IMAGE_RESOLUTION_HEIGHT}"
   "save_lora_only=false"
   "max_chunk_size=${MAX_CHUNK_SIZE}"
-  "save_strategy=steps"
-  "droid_data_root=${DROID_DATA_ROOT}"
+  "save_strategy=${SAVE_STRATEGY}"
+  "aloha_data_root=${ALOHA_DATA_ROOT}"
+  "episode_filter_path=${EPISODE_FILTER_PATH}"
   "dit_version=${WAN22_CKPT_DIR}"
   "text_encoder_pretrained_path=${WAN22_CKPT_DIR}/models_t5_umt5-xxl-enc-bf16.pth"
   "image_encoder_pretrained_path=${IMAGE_ENCODER_DIR}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
@@ -316,6 +352,23 @@ TRAIN_OVERRIDES=(
   "dataset_shard_sampling_block_size=${DATASET_SHARD_SAMPLING_BLOCK_SIZE}"
   "+training_args.dataloader_prefetch_factor=${DATALOADER_PREFETCH_FACTOR}"
 )
+
+if [[ "${ARCH}" == "mot" ]]; then
+  TRAIN_OVERRIDES+=(
+    "mot_action_hidden_dim=${MOT_ACTION_HIDDEN_DIM:-1024}"
+    "mot_action_ffn_dim=${MOT_ACTION_FFN_DIM:-4096}"
+    "mot_action_num_layers=${MOT_ACTION_NUM_LAYERS:-null}"
+    "mot_action_num_heads=${MOT_ACTION_NUM_HEADS:-8}"
+    "mot_action_video_attention=${MOT_ACTION_VIDEO_ATTENTION}"
+    "mot_action_video_ki=${MOT_ACTION_VIDEO_KI:-false}"
+    "mot_inference_video_mode=${MOT_INFERENCE_VIDEO_MODE:-auto}"
+    "mot_decouple_video_action_noise=${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"
+    "mot_video_noise_beta_alpha=${MOT_VIDEO_NOISE_BETA_ALPHA:-3.0}"
+    "mot_video_noise_beta_beta=${MOT_VIDEO_NOISE_BETA_BETA:-1.0}"
+    "mot_decoupled_inference_video_final_noise=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE:-0.8}"
+    "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-8}"
+  )
+fi
 
 exec "${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \

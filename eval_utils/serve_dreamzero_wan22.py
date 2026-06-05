@@ -63,7 +63,7 @@ from eval_utils.torch_compile_backend import configure_torch_compile_backend
 
 DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
 
-from openpi_client.base_policy import BasePolicy
+from eval_utils.base_policy import BasePolicy
 
 from eval_utils.policy_server import WebsocketPolicyServer, PolicyServerConfig
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
