@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import csv
 import json
@@ -49,6 +50,26 @@ from eval_utils import msgpack_numpy  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = Path("/data/checkpoints/dreamzero/robotwin_eval_runs/lingbot_style_eval")
 KEYFRAMES_PER_CHUNK = 9
+PROFILE_TIMER_FIELDS = (
+    "T_load_model",
+    "T_server_ready",
+    "T_env_reset",
+    "T_expert_seed_filter",
+    "T_render_obs",
+    "T_send_obs",
+    "T_policy_infer",
+    "T_recv_action",
+    "T_step_chunk",
+    "T_write_log/video",
+    "T_microbatch_wait",
+)
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 @dataclass
@@ -293,8 +314,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-host", default="127.0.0.1")
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--tasks", default=os.environ.get("TASKS", os.environ.get("TASK", "beat_block_hammer")))
-    parser.add_argument("--episodes", type=int, default=8)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--num-envs", type=int, default=1, help="Number of synchronized RoboTwin env workers.")
+    parser.add_argument(
+        "--eval-mode",
+        choices=("lingbot", "batch", "microbatch"),
+        default="lingbot",
+        help=(
+            "lingbot runs one episode at a time; batch keeps the legacy synchronized-wave evaluator; "
+            "microbatch runs independent sessions against robotwin_microbatch_server."
+        ),
+    )
     parser.add_argument("--env-cuda", default=os.environ.get("ENV_CUDA", "0"))
     parser.add_argument("--worker-python", default=sys.executable)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -306,7 +336,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-length", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0, help="Max inference requests per episode; 0 derives from task step limit.")
     parser.add_argument("--open-loop-horizon", type=int, default=24, help="Dry-run action chunk length only.")
-    parser.add_argument("--seed-start", type=int, default=0)
+    parser.add_argument("--seed-start", type=int, default=10000)
+    parser.add_argument("--use-seed-cache", action=argparse.BooleanOptionalAction, default=env_flag("USE_SEED_CACHE", False))
+    parser.add_argument("--seed-cache-root", type=Path, default=None)
     parser.add_argument("--reset-retries", type=int, default=5)
     parser.add_argument("--expert-filter-max-candidates", type=int, default=1000)
     parser.add_argument("--clip-action", action=argparse.BooleanOptionalAction, default=False)
@@ -375,6 +407,54 @@ def parse_tasks(raw: str) -> list[str]:
     if any(part.lower() == "all" for part in parts):
         raise ValueError("Use --tasks all by itself, or provide explicit task names")
     return parts
+
+
+def resolve_seed_cache_root(args: argparse.Namespace) -> Path:
+    if args.seed_cache_root is not None:
+        return args.seed_cache_root.expanduser().resolve()
+    return (args.output_dir / "expert_seed_cache").expanduser().resolve()
+
+
+def load_seed_cache_for_task(args: argparse.Namespace, task: str) -> list[dict[str, Any]]:
+    root = resolve_seed_cache_root(args)
+    path = root / str(args.task_config) / f"{task}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing seed cache for task={task!r}: {path}. "
+            "Run example/robotwin/expert_seed_cache.py first or pass --seed-cache-root."
+        )
+    rows: list[dict[str, Any]] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("task") != task:
+            raise ValueError(f"{path}:{line_no} has task={row.get('task')!r}, expected {task!r}")
+        if row.get("task_config") != args.task_config:
+            raise ValueError(
+                f"{path}:{line_no} has task_config={row.get('task_config')!r}, expected {args.task_config!r}"
+            )
+        if not bool(row.get("accepted", False)):
+            raise ValueError(f"{path}:{line_no} is not an accepted cache row")
+        if "seed" not in row or "prompt" not in row:
+            raise ValueError(f"{path}:{line_no} must contain seed and prompt")
+        rows.append(row)
+    if len(rows) < args.episodes:
+        raise ValueError(
+            f"Seed cache for task={task!r} has {len(rows)} rows but --episodes={args.episodes}. "
+            "Generate more cache rows instead of reusing episodes implicitly."
+        )
+    return rows
+
+
+def get_seed_cache_entry(args: argparse.Namespace, task: str, episode_index: int) -> dict[str, Any] | None:
+    cache = getattr(args, "seed_cache_by_task", None)
+    if not isinstance(cache, dict):
+        return None
+    rows = cache.get(task)
+    if not rows:
+        return None
+    return rows[int(episode_index)]
 
 
 def parse_cuda_list(raw: str, count: int) -> list[str]:
@@ -621,6 +701,116 @@ def checkpoint_result(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
+def server_timing_seconds(args: argparse.Namespace, key: str) -> float:
+    server_timing = getattr(args, "server_timing", {}) or {}
+    if not isinstance(server_timing, dict):
+        return 0.0
+    try:
+        return float(server_timing.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def reset_profile_value(reset_response: dict[str, Any], key: str, default: float = 0.0) -> float:
+    reset_profile = reset_response.get("reset_profile") or {}
+    if not isinstance(reset_profile, dict):
+        reset_profile = {}
+    try:
+        return float(reset_profile.get(key, default) or 0.0)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def make_episode_metrics(
+    reset_response: dict[str, Any],
+    *,
+    reset_start: float,
+    now: float,
+) -> dict[str, float | int]:
+    reset_time = float(reset_response.get("reset_time", now - reset_start))
+    reset_render_obs_time = reset_profile_value(reset_response, "get_obs_time", 0.0)
+    env_reset_time = reset_profile_value(
+        reset_response,
+        "env_reset_time",
+        max(reset_time - reset_render_obs_time, 0.0),
+    )
+    return {
+        "reset_time": reset_time,
+        "env_reset_time": env_reset_time,
+        "expert_filter_time": float((reset_response.get("expert_filter") or {}).get("total_time", 0.0)),
+        "infer_wait_time": 0.0,
+        "env_step_time": 0.0,
+        "get_obs_time": 0.0,
+        "render_obs_time": reset_render_obs_time,
+        "reset_render_obs_time": reset_render_obs_time,
+        "step_chunk_time": 0.0,
+        "infer_payload_size_bytes": 0,
+        "payload_build_time": 0.0,
+        "payload_pack_time": 0.0,
+        "ws_roundtrip_time": 0.0,
+        "send_obs_time": 0.0,
+        "recv_action_time": 0.0,
+        "policy_infer_time": 0.0,
+        "server_policy_infer_time": 0.0,
+        "action_normalize_time": 0.0,
+        "worker_step_wait_time": 0.0,
+        "batch_infer_time": 0.0,
+        "per_env_infer_time": 0.0,
+        "batch_infer_calls": 0,
+        "microbatch_wait_time": 0.0,
+        "microbatch_calls": 0,
+        "microbatch_size_sum": 0,
+        "microbatch_size_max": 0,
+        "session_queue_depth_sum": 0,
+        "session_queue_depth_max": 0,
+        "server_vram_allocated_mb_max": 0.0,
+        "server_vram_reserved_mb_max": 0.0,
+        "sync_idle_steps": 0,
+        "video_write_time": 0.0,
+        "finish_episode_time": 0.0,
+        "episode_result_write_time": 0.0,
+        "write_log_video_time": 0.0,
+    }
+
+
+def add_client_server_timing(
+    metrics: dict[str, float | int],
+    client_timing: dict[str, Any],
+    server_timing: dict[str, Any],
+) -> None:
+    metrics["send_obs_time"] = float(metrics.get("send_obs_time", 0.0)) + float(
+        client_timing.get("T_send_obs", 0.0) or 0.0
+    )
+    metrics["recv_action_time"] = float(metrics.get("recv_action_time", 0.0)) + float(
+        client_timing.get("T_recv_action", 0.0) or 0.0
+    )
+    policy_infer = float(
+        server_timing.get("T_policy_infer", server_timing.get("policy_infer_time", 0.0)) or 0.0
+    )
+    metrics["policy_infer_time"] = float(metrics.get("policy_infer_time", 0.0)) + policy_infer
+    metrics["server_policy_infer_time"] = float(metrics.get("server_policy_infer_time", 0.0)) + policy_infer
+    microbatch_wait = float(server_timing.get("T_microbatch_wait", 0.0) or 0.0)
+    microbatch_size = int(server_timing.get("microbatch_size", 0) or 0)
+    queue_depth = int(server_timing.get("session_queue_depth", 0) or 0)
+    vram_allocated = float(server_timing.get("server_vram_allocated_mb", 0.0) or 0.0)
+    vram_reserved = float(server_timing.get("server_vram_reserved_mb", 0.0) or 0.0)
+    if microbatch_wait or microbatch_size:
+        metrics["microbatch_wait_time"] = float(metrics.get("microbatch_wait_time", 0.0)) + microbatch_wait
+        metrics["microbatch_calls"] = int(metrics.get("microbatch_calls", 0)) + 1
+        metrics["microbatch_size_sum"] = int(metrics.get("microbatch_size_sum", 0)) + microbatch_size
+        metrics["microbatch_size_max"] = max(int(metrics.get("microbatch_size_max", 0)), microbatch_size)
+        metrics["session_queue_depth_sum"] = int(metrics.get("session_queue_depth_sum", 0)) + queue_depth
+        metrics["session_queue_depth_max"] = max(int(metrics.get("session_queue_depth_max", 0)), queue_depth)
+    metrics["server_vram_allocated_mb_max"] = max(
+        float(metrics.get("server_vram_allocated_mb_max", 0.0)),
+        vram_allocated,
+    )
+    metrics["server_vram_reserved_mb_max"] = max(
+        float(metrics.get("server_vram_reserved_mb_max", 0.0)),
+        vram_reserved,
+    )
+
+
 def git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -651,12 +841,18 @@ def write_run_config(
     workers: list[WorkerHandle],
     server_metadata: dict[str, Any] | None,
 ) -> None:
+    args_payload = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"seed_cache_by_task"}
+    }
+    mode = "robotwin_microbatch_eval" if args.eval_mode == "microbatch" else "lingbot_style_robotwin"
     payload = {
-        "mode": "lingbot_style_robotwin",
+        "mode": mode,
         "timestamp": time.time(),
         "git_commit": git_commit(),
         "argv": sys.argv,
-        "args": vars(args),
+        "args": args_payload,
         "tasks": tasks,
         "server_metadata": server_metadata or {},
         "workers": [
@@ -675,10 +871,22 @@ def write_run_config(
     )
 
 
-def write_episode_result(task_dir: Path, result: dict[str, Any]) -> None:
+def write_episode_result(task_dir: Path, result: dict[str, Any]) -> float:
     task_dir.mkdir(parents=True, exist_ok=True)
     path = task_dir / f"episode_{int(result['episode_index']):06d}.json"
+    write_start = time.perf_counter()
     path.write_text(json.dumps(result, indent=2, default=json_default, ensure_ascii=False), encoding="utf-8")
+    write_time = time.perf_counter() - write_start
+    profile = result.get("profile")
+    timing = result.get("timing")
+    if isinstance(profile, dict) and profile:
+        profile["episode_result_write_time"] = write_time
+        profile["T_write_log/video"] = float(profile.get("T_write_log/video", 0.0)) + write_time
+        if isinstance(timing, dict):
+            timing["episode_result_write_time"] = write_time
+            timing["write_log_video_time"] = float(timing.get("write_log_video_time", 0.0)) + write_time
+        path.write_text(json.dumps(result, indent=2, default=json_default, ensure_ascii=False), encoding="utf-8")
+    return write_time
 
 
 def aggregate_wave_batch_stats(results: list[dict[str, Any]]) -> dict[str, float | int]:
@@ -720,8 +928,21 @@ def write_task_summary(task_dir: Path, task: str, results: list[dict[str, Any]])
     per_env_batch_call_count = sum(int(result.get("batch_infer_calls", result.get("infer_calls", 0))) for result in results)
     per_env_infer_time = sum(float((result.get("timing") or {}).get("per_env_infer_time", 0.0)) for result in results)
     sync_idle_steps = sum(int(result.get("sync_idle_steps", 0)) for result in results)
+    microbatch_calls = sum(int((result.get("timing") or {}).get("microbatch_calls", 0)) for result in results)
+    microbatch_size_sum = sum(
+        float((result.get("timing") or {}).get("avg_microbatch_size", 0.0))
+        * int((result.get("timing") or {}).get("microbatch_calls", 0))
+        for result in results
+    )
+    session_queue_depth_sum = sum(
+        float((result.get("timing") or {}).get("avg_session_queue_depth", 0.0))
+        * int((result.get("timing") or {}).get("microbatch_calls", 0))
+        for result in results
+    )
     summary = {
-        "mode": "lingbot_style_robotwin",
+        "mode": "robotwin_microbatch_eval"
+        if results and str(results[0].get("eval_mode", "")) == "microbatch"
+        else "lingbot_style_robotwin",
         "task": task,
         "episodes": len(results),
         "successes": successes,
@@ -739,9 +960,34 @@ def write_task_summary(task_dir: Path, task: str, results: list[dict[str, Any]])
         "batch_infer_calls": int(wave_batch_stats["batch_infer_calls"]),
         "avg_batch_infer_time": float(wave_batch_stats["avg_batch_infer_time"]),
         "avg_per_env_infer_time": per_env_infer_time / per_env_batch_call_count if per_env_batch_call_count else 0.0,
+        "microbatch_calls": microbatch_calls,
+        "avg_microbatch_size": microbatch_size_sum / microbatch_calls if microbatch_calls else 0.0,
+        "max_microbatch_size": max(
+            (int((result.get("timing") or {}).get("max_microbatch_size", 0)) for result in results),
+            default=0,
+        ),
+        "avg_session_queue_depth": session_queue_depth_sum / microbatch_calls if microbatch_calls else 0.0,
+        "max_session_queue_depth": max(
+            (int((result.get("timing") or {}).get("max_session_queue_depth", 0)) for result in results),
+            default=0,
+        ),
+        "server_vram_allocated_mb_max": max(
+            (float((result.get("timing") or {}).get("server_vram_allocated_mb_max", 0.0)) for result in results),
+            default=0.0,
+        ),
+        "server_vram_reserved_mb_max": max(
+            (float((result.get("timing") or {}).get("server_vram_reserved_mb_max", 0.0)) for result in results),
+            default=0.0,
+        ),
         "sync_idle_steps": sync_idle_steps,
         "timestamp": time.time(),
     }
+    for field in PROFILE_TIMER_FIELDS:
+        values = [
+            float((result.get("profile") or {}).get(field, 0.0) or 0.0)
+            for result in results
+        ]
+        summary[f"avg_{field}"] = sum(values) / len(values) if values else 0.0
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, default=json_default, ensure_ascii=False),
@@ -775,6 +1021,7 @@ def error_episode_result(
         "checkpoint": checkpoint_result(args),
         "video_path": None,
         "video_frames": 0,
+        "eval_mode": str(args.eval_mode),
         "lingbot_style_eval": True,
         "fast_eval": True,
         "env_reuse_mode": "cold_reset",
@@ -788,16 +1035,30 @@ def error_episode_result(
         "sync_idle_steps": 0,
         "timing": {
             "reset_time": 0.0,
+            "env_reset_time": 0.0,
             "expert_filter_time": 0.0,
             "infer_wait_time": 0.0,
             "env_step_time": 0.0,
             "get_obs_time": 0.0,
+            "render_obs_time": 0.0,
+            "step_chunk_time": 0.0,
             "episode_wall_time": 0.0,
             "infer_payload_size_bytes": 0,
             "batch_infer_time": 0.0,
             "per_env_infer_time": 0.0,
+            "send_obs_time": 0.0,
+            "policy_infer_time": 0.0,
+            "recv_action_time": 0.0,
+            "microbatch_wait_time": 0.0,
+            "avg_microbatch_size": 0.0,
+            "max_microbatch_size": 0,
+            "avg_session_queue_depth": 0.0,
+            "max_session_queue_depth": 0,
+            "server_vram_allocated_mb_max": 0.0,
+            "server_vram_reserved_mb_max": 0.0,
+            "write_log_video_time": 0.0,
         },
-        "profile": {},
+        "profile": {key: 0.0 for key in PROFILE_TIMER_FIELDS} if args.profile else {},
         "last_info": {},
     }
 
@@ -808,23 +1069,70 @@ def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_
     batch_infer_calls = int(metrics.get("batch_infer_calls", state["infer_calls"]))
     batch_infer_time = float(metrics.get("batch_infer_time", 0.0))
     per_env_infer_time = float(metrics.get("per_env_infer_time", 0.0))
+    write_log_video_time = float(metrics.get("write_log_video_time", 0.0))
+    microbatch_calls = int(metrics.get("microbatch_calls", 0))
+    avg_microbatch_size = (
+        float(metrics.get("microbatch_size_sum", 0)) / microbatch_calls if microbatch_calls else 0.0
+    )
+    avg_session_queue_depth = (
+        float(metrics.get("session_queue_depth_sum", 0)) / microbatch_calls if microbatch_calls else 0.0
+    )
     timing = {
         "reset_time": float(metrics.get("reset_time", 0.0)),
+        "env_reset_time": float(metrics.get("env_reset_time", metrics.get("reset_time", 0.0))),
         "expert_filter_time": float(metrics.get("expert_filter_time", 0.0)),
         "infer_wait_time": float(metrics.get("infer_wait_time", 0.0)),
         "env_step_time": float(metrics.get("env_step_time", 0.0)),
         "get_obs_time": float(metrics.get("get_obs_time", 0.0)),
+        "render_obs_time": float(metrics.get("render_obs_time", metrics.get("get_obs_time", 0.0))),
+        "reset_render_obs_time": float(metrics.get("reset_render_obs_time", 0.0)),
+        "step_chunk_time": float(metrics.get("step_chunk_time", 0.0)),
         "episode_wall_time": episode_wall_time,
         "infer_payload_size_bytes": int(metrics.get("infer_payload_size_bytes", 0)),
         "batch_infer_time": batch_infer_time,
         "per_env_infer_time": per_env_infer_time,
+        "send_obs_time": float(metrics.get("send_obs_time", 0.0)),
+        "policy_infer_time": float(metrics.get("policy_infer_time", 0.0)),
+        "recv_action_time": float(metrics.get("recv_action_time", 0.0)),
+        "microbatch_wait_time": float(metrics.get("microbatch_wait_time", 0.0)),
+        "microbatch_calls": microbatch_calls,
+        "avg_microbatch_size": avg_microbatch_size,
+        "max_microbatch_size": int(metrics.get("microbatch_size_max", 0)),
+        "avg_session_queue_depth": avg_session_queue_depth,
+        "max_session_queue_depth": int(metrics.get("session_queue_depth_max", 0)),
+        "server_vram_allocated_mb_max": float(metrics.get("server_vram_allocated_mb_max", 0.0)),
+        "server_vram_reserved_mb_max": float(metrics.get("server_vram_reserved_mb_max", 0.0)),
+        "video_write_time": float(metrics.get("video_write_time", 0.0)),
+        "finish_episode_time": float(metrics.get("finish_episode_time", 0.0)),
+        "episode_result_write_time": float(metrics.get("episode_result_write_time", 0.0)),
+        "write_log_video_time": write_log_video_time,
     }
     profile = {
+        "T_load_model": server_timing_seconds(args, "T_load_model"),
+        "T_server_ready": server_timing_seconds(args, "T_server_ready"),
+        "T_env_reset": timing["env_reset_time"],
+        "T_expert_seed_filter": timing["expert_filter_time"],
+        "T_render_obs": timing["render_obs_time"],
+        "T_send_obs": timing["send_obs_time"],
+        "T_policy_infer": timing["policy_infer_time"],
+        "T_recv_action": timing["recv_action_time"],
+        "T_step_chunk": timing["step_chunk_time"],
+        "T_write_log/video": write_log_video_time,
+        "T_microbatch_wait": timing["microbatch_wait_time"],
+        "avg_microbatch_size": avg_microbatch_size,
+        "max_microbatch_size": timing["max_microbatch_size"],
+        "avg_session_queue_depth": avg_session_queue_depth,
+        "max_session_queue_depth": timing["max_session_queue_depth"],
+        "server_vram_allocated_mb_max": timing["server_vram_allocated_mb_max"],
+        "server_vram_reserved_mb_max": timing["server_vram_reserved_mb_max"],
         "payload_build_time": float(metrics.get("payload_build_time", 0.0)),
         "payload_pack_time": float(metrics.get("payload_pack_time", 0.0)),
         "ws_roundtrip_time": float(metrics.get("ws_roundtrip_time", 0.0)),
         "action_normalize_time": float(metrics.get("action_normalize_time", 0.0)),
         "worker_step_wait_time": float(metrics.get("worker_step_wait_time", 0.0)),
+        "video_write_time": timing["video_write_time"],
+        "finish_episode_time": timing["finish_episode_time"],
+        "episode_result_write_time": timing["episode_result_write_time"],
     }
     return {
         "episode_index": int(state["episode_index"]),
@@ -847,6 +1155,7 @@ def finalize_episode(args: argparse.Namespace, state: dict[str, Any], completed_
         "checkpoint": checkpoint_result(args),
         "video_path": state.get("video_path"),
         "video_frames": int(state.get("video_frames", 0)),
+        "eval_mode": str(args.eval_mode),
         "lingbot_style_eval": True,
         "fast_eval": True,
         "env_reuse_mode": "cold_reset",
@@ -873,23 +1182,36 @@ def reset_worker_for_episode(
     episode_index: int,
     episode_length: int,
     task_dir: Path,
+    seed_start_override: int | None = None,
+    worker_episode_index: int | None = None,
+    episodes_override: int | None = None,
+    cache_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     video_path = task_dir / "videos" / f"episode_{episode_index:06d}.mp4" if args.save_video else None
-    worker.conn.send(
-        {
-            "cmd": "reset",
-            "task_name": task,
-            "episode_index": episode_index,
-            "episode_length": episode_length,
-            "seed_start": args.seed_start,
-            "episodes": args.episodes,
-            "reset_retries": args.reset_retries,
-            "expert_filter": True,
-            "expert_filter_max_candidates": args.expert_filter_max_candidates,
-            "video_path": video_path.as_posix() if video_path is not None else "",
-            "video_fps": args.video_fps,
-        }
-    )
+    payload = {
+        "cmd": "reset",
+        "task_name": task,
+        "episode_index": int(worker_episode_index) if worker_episode_index is not None else episode_index,
+        "episode_length": episode_length,
+        "seed_start": int(seed_start_override) if seed_start_override is not None else args.seed_start,
+        "episodes": int(episodes_override) if episodes_override is not None else args.episodes,
+        "seed_stride": 1 if seed_start_override is not None else args.episodes,
+        "reset_retries": args.reset_retries,
+        "expert_filter": True,
+        "expert_filter_max_candidates": args.expert_filter_max_candidates,
+        "video_path": video_path.as_posix() if video_path is not None else "",
+        "video_fps": args.video_fps,
+    }
+    if cache_entry is not None:
+        payload.update(
+            {
+                "fixed_seed": int(cache_entry["seed"]),
+                "fixed_prompt": str(cache_entry["prompt"]),
+                "episode_info": cache_entry.get("episode_info", {}),
+                "expert_filter": False,
+            }
+        )
+    worker.conn.send(payload)
     return recv_worker(worker, args.worker_timeout)
 
 
@@ -901,24 +1223,37 @@ def send_reset_worker_for_episode(
     episode_index: int,
     episode_length: int,
     task_dir: Path,
+    seed_start_override: int | None = None,
+    worker_episode_index: int | None = None,
+    episodes_override: int | None = None,
+    cache_entry: dict[str, Any] | None = None,
 ) -> float:
     video_path = task_dir / "videos" / f"episode_{episode_index:06d}.mp4" if args.save_video else None
     reset_start = time.perf_counter()
-    worker.conn.send(
-        {
-            "cmd": "reset",
-            "task_name": task,
-            "episode_index": episode_index,
-            "episode_length": episode_length,
-            "seed_start": args.seed_start,
-            "episodes": args.episodes,
-            "reset_retries": args.reset_retries,
-            "expert_filter": True,
-            "expert_filter_max_candidates": args.expert_filter_max_candidates,
-            "video_path": video_path.as_posix() if video_path is not None else "",
-            "video_fps": args.video_fps,
-        }
-    )
+    payload = {
+        "cmd": "reset",
+        "task_name": task,
+        "episode_index": int(worker_episode_index) if worker_episode_index is not None else episode_index,
+        "episode_length": episode_length,
+        "seed_start": int(seed_start_override) if seed_start_override is not None else args.seed_start,
+        "episodes": int(episodes_override) if episodes_override is not None else args.episodes,
+        "seed_stride": 1 if seed_start_override is not None else args.episodes,
+        "reset_retries": args.reset_retries,
+        "expert_filter": True,
+        "expert_filter_max_candidates": args.expert_filter_max_candidates,
+        "video_path": video_path.as_posix() if video_path is not None else "",
+        "video_fps": args.video_fps,
+    }
+    if cache_entry is not None:
+        payload.update(
+            {
+                "fixed_seed": int(cache_entry["seed"]),
+                "fixed_prompt": str(cache_entry["prompt"]),
+                "episode_info": cache_entry.get("episode_info", {}),
+                "expert_filter": False,
+            }
+        )
+    worker.conn.send(payload)
     return reset_start
 
 
@@ -973,23 +1308,7 @@ def make_wave_state(
         "num_envs_requested": int(args.num_envs),
         "wave_batch_size": wave_batch_size,
         "episode_length": episode_length,
-        "metrics": {
-            "reset_time": float(reset_response.get("reset_time", now - reset_start)),
-            "expert_filter_time": float((reset_response.get("expert_filter") or {}).get("total_time", 0.0)),
-            "infer_wait_time": 0.0,
-            "env_step_time": 0.0,
-            "get_obs_time": 0.0,
-            "infer_payload_size_bytes": 0,
-            "payload_build_time": 0.0,
-            "payload_pack_time": 0.0,
-            "ws_roundtrip_time": 0.0,
-            "action_normalize_time": 0.0,
-            "worker_step_wait_time": 0.0,
-            "batch_infer_time": 0.0,
-            "per_env_infer_time": 0.0,
-            "batch_infer_calls": 0,
-            "sync_idle_steps": 0,
-        },
+        "metrics": make_episode_metrics(reset_response, reset_start=reset_start, now=now),
     }
 
 
@@ -1002,6 +1321,8 @@ def run_episode(
     episode_index: int,
     episode_length: int,
     task_dir: Path,
+    wave_id: int | None = None,
+    seed_start_override: int | None = None,
 ) -> dict[str, Any]:
     reset_start = time.perf_counter()
     reset_response = reset_worker_for_episode(
@@ -1011,6 +1332,10 @@ def run_episode(
         episode_index=episode_index,
         episode_length=episode_length,
         task_dir=task_dir,
+        seed_start_override=seed_start_override,
+        worker_episode_index=0 if seed_start_override is not None else None,
+        episodes_override=1 if seed_start_override is not None else None,
+        cache_entry=get_seed_cache_entry(args, task, episode_index),
     )
     now = time.perf_counter()
     prompt = str(reset_response["prompt"])
@@ -1043,19 +1368,11 @@ def run_episode(
         if args.save_video
         else None,
         "video_frames": 0,
-        "metrics": {
-            "reset_time": float(reset_response.get("reset_time", now - reset_start)),
-            "expert_filter_time": float((reset_response.get("expert_filter") or {}).get("total_time", 0.0)),
-            "infer_wait_time": 0.0,
-            "env_step_time": 0.0,
-            "get_obs_time": 0.0,
-            "infer_payload_size_bytes": 0,
-            "payload_build_time": 0.0,
-            "payload_pack_time": 0.0,
-            "ws_roundtrip_time": 0.0,
-            "action_normalize_time": 0.0,
-            "worker_step_wait_time": 0.0,
-        },
+        "wave_id": int(wave_id) if wave_id is not None else episode_index,
+        "batch_index": 0,
+        "num_envs_requested": 1,
+        "wave_batch_size": 1,
+        "metrics": make_episode_metrics(reset_response, reset_start=reset_start, now=now),
     }
     max_infer = args.max_steps if args.max_steps > 0 else max(int(episode_length), 1)
 
@@ -1076,26 +1393,33 @@ def run_episode(
         payload_pack_time = time.perf_counter() - payload_pack_start
         ws_roundtrip_time = 0.0
         action_normalize_time = 0.0
+        client_timing: dict[str, Any] = {}
+        server_timing: dict[str, Any] = {}
 
         if args.dry_run_actions:
             action_chunk = np.zeros((args.open_loop_horizon, ROBOTWIN_ACTION_DIM), dtype=np.float32)
         else:
             assert client is not None
             infer_start = time.perf_counter()
-            raw_action = client.infer(dict(payload))
+            raw_action, client_timing, server_timing = client.infer_timed(dict(payload))
             ws_roundtrip_time = time.perf_counter() - infer_start
             normalize_start = time.perf_counter()
             action_chunk = normalize_action_sequence(raw_action)
             action_normalize_time = time.perf_counter() - normalize_start
 
         infer_time = ws_roundtrip_time + action_normalize_time
+        metrics = state["metrics"]
         state["infer_calls"] += 1
-        state["metrics"]["infer_wait_time"] += infer_time
-        state["metrics"]["infer_payload_size_bytes"] += size_bytes
-        state["metrics"]["payload_build_time"] += payload_build_time
-        state["metrics"]["payload_pack_time"] += payload_pack_time
-        state["metrics"]["ws_roundtrip_time"] += ws_roundtrip_time
-        state["metrics"]["action_normalize_time"] += action_normalize_time
+        metrics["infer_wait_time"] += infer_time
+        metrics["infer_payload_size_bytes"] += size_bytes
+        metrics["payload_build_time"] += payload_build_time
+        metrics["payload_pack_time"] += payload_pack_time
+        metrics["ws_roundtrip_time"] += ws_roundtrip_time
+        metrics["action_normalize_time"] += action_normalize_time
+        metrics["batch_infer_time"] += infer_time
+        metrics["per_env_infer_time"] += infer_time
+        metrics["batch_infer_calls"] += 1
+        add_client_server_timing(metrics, client_timing, server_timing)
         state["action_shapes"].append(list(action_chunk.shape))
         if state["first_action"] is None and action_chunk.size:
             state["first_action"] = action_chunk[0].tolist()
@@ -1114,9 +1438,17 @@ def run_episode(
         worker_wait_time = time.perf_counter() - worker_wait_start
 
         actions_sent = int(step_response.get("actions_sent", 0))
+        get_obs_time = float(step_response.get("get_obs_time", 0.0))
         state["metrics"]["worker_step_wait_time"] += worker_wait_time
         state["metrics"]["env_step_time"] += float(step_response.get("env_step_time", 0.0))
-        state["metrics"]["get_obs_time"] += float(step_response.get("get_obs_time", 0.0))
+        state["metrics"]["get_obs_time"] += get_obs_time
+        state["metrics"]["render_obs_time"] += get_obs_time
+        state["metrics"]["step_chunk_time"] += float(
+            step_response.get(
+                "step_chunk_time",
+                float(step_response.get("env_step_time", 0.0)) + get_obs_time,
+            )
+        )
         state["steps"] += actions_sent
         state["reward_sum"] += float(step_response.get("reward_sum", 0.0))
         state["done"] = bool(step_response.get("done", False))
@@ -1139,6 +1471,9 @@ def run_episode(
             video_response = recv_worker(worker, args.worker_timeout)
             state["video_path"] = video_response.get("video_path") or state.get("video_path")
             state["video_frames"] = int(video_response.get("video_frames", 0))
+            state["metrics"]["video_write_time"] += float(video_response.get("video_write_time", 0.0))
+            state["metrics"]["finish_episode_time"] += float(video_response.get("finish_episode_time", 0.0))
+            state["metrics"]["write_log_video_time"] += float(video_response.get("video_write_time", 0.0))
         except Exception as exc:
             last_info = state.get("last_info", {})
             if not isinstance(last_info, dict):
@@ -1191,6 +1526,7 @@ def run_wave(
                 episode_index=episode_index,
                 episode_length=episode_length,
                 task_dir=task_dir,
+                cache_entry=get_seed_cache_entry(args, task, episode_index),
             )
         except Exception as exc:
             terminate_worker(worker)
@@ -1350,6 +1686,8 @@ def run_wave(
         payload_pack_time = time.perf_counter() - payload_pack_start
         ws_roundtrip_time = 0.0
         action_normalize_time = 0.0
+        client_timing: dict[str, Any] = {}
+        server_timing: dict[str, Any] = {}
 
         if args.dry_run_actions:
             action_batch = np.zeros((batch_size, args.open_loop_horizon, ROBOTWIN_ACTION_DIM), dtype=np.float32)
@@ -1362,7 +1700,7 @@ def run_wave(
                     f"infer {infer_index + 1}/{max_infer} batch={batch_size}"
                 )
             try:
-                raw_action = client.infer(dict(payload))
+                raw_action, client_timing, server_timing = client.infer_timed(dict(payload))
             finally:
                 if progress is not None:
                     progress.clear_status()
@@ -1394,6 +1732,7 @@ def run_wave(
             state["metrics"]["payload_pack_time"] += payload_pack_time
             state["metrics"]["ws_roundtrip_time"] += ws_roundtrip_time
             state["metrics"]["action_normalize_time"] += action_normalize_time
+            add_client_server_timing(state["metrics"], client_timing, server_timing)
             state["action_shapes"].append(list(action_chunk.shape))
             if state["first_action"] is None and action_chunk.size:
                 state["first_action"] = action_chunk[0].tolist()
@@ -1435,9 +1774,17 @@ def run_wave(
             worker_wait_time = time.perf_counter() - worker_wait_start
 
             actions_sent = int(step_response.get("actions_sent", 0))
+            get_obs_time = float(step_response.get("get_obs_time", 0.0))
             state["metrics"]["worker_step_wait_time"] += worker_wait_time
             state["metrics"]["env_step_time"] += float(step_response.get("env_step_time", 0.0))
-            state["metrics"]["get_obs_time"] += float(step_response.get("get_obs_time", 0.0))
+            state["metrics"]["get_obs_time"] += get_obs_time
+            state["metrics"]["render_obs_time"] += get_obs_time
+            state["metrics"]["step_chunk_time"] += float(
+                step_response.get(
+                    "step_chunk_time",
+                    float(step_response.get("env_step_time", 0.0)) + get_obs_time,
+                )
+            )
             state["steps"] += actions_sent
             state["reward_sum"] += float(step_response.get("reward_sum", 0.0))
             state["done"] = bool(step_response.get("done", False))
@@ -1499,6 +1846,9 @@ def run_wave(
                 video_response = recv_worker(state["worker"], args.worker_timeout)
                 state["video_path"] = video_response.get("video_path") or state.get("video_path")
                 state["video_frames"] = int(video_response.get("video_frames", 0))
+                state["metrics"]["video_write_time"] += float(video_response.get("video_write_time", 0.0))
+                state["metrics"]["finish_episode_time"] += float(video_response.get("finish_episode_time", 0.0))
+                state["metrics"]["write_log_video_time"] += float(video_response.get("video_write_time", 0.0))
             except Exception as exc:
                 last_info = state.get("last_info", {})
                 if not isinstance(last_info, dict):
@@ -1513,20 +1863,386 @@ def run_wave(
     return results
 
 
+def run_microbatch_wave(
+    args: argparse.Namespace,
+    *,
+    task: str,
+    task_index: int,
+    workers: list[WorkerHandle],
+    clients: list[WebsocketClientPolicy] | None,
+    episode_indices: list[int],
+    episode_length: int,
+    task_dir: Path,
+    wave_id: int,
+    total_waves: int,
+    progress: ProgressReporter | None,
+) -> list[dict[str, Any]]:
+    planned_batch_size = len(episode_indices)
+    if planned_batch_size <= 0:
+        return []
+    wave_started_at = time.perf_counter()
+    wave_workers = workers[:planned_batch_size]
+    wave_clients = clients[:planned_batch_size] if clients is not None else [None] * planned_batch_size
+    results: list[dict[str, Any]] = []
+    reset_starts: dict[int, float] = {}
+
+    if progress is not None:
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="start",
+            detail=f"episodes={min(episode_indices)}-{max(episode_indices)} sessions={planned_batch_size}",
+        )
+
+    for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
+        try:
+            cache_entry = get_seed_cache_entry(args, task, episode_index)
+            if args.use_seed_cache and cache_entry is None:
+                raise RuntimeError(f"Missing seed cache entry task={task!r} episode_index={episode_index}")
+            reset_starts[batch_index] = send_reset_worker_for_episode(
+                args,
+                task=task,
+                worker=worker,
+                episode_index=episode_index,
+                episode_length=episode_length,
+                task_dir=task_dir,
+                cache_entry=cache_entry,
+            )
+        except Exception as exc:
+            terminate_worker(worker)
+            results.append(
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=episode_index,
+                    worker=worker,
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=planned_batch_size,
+                )
+            )
+
+    states: list[dict[str, Any]] = []
+    for batch_index, (worker, episode_index) in enumerate(zip(wave_workers, episode_indices, strict=True)):
+        if batch_index not in reset_starts:
+            continue
+        if progress is not None:
+            progress.set_status(
+                f"task {task_index}/{progress.total_tasks} {task} microbatch wave {wave_id + 1}/{total_waves} "
+                f"reset worker={worker.worker_id} episode={episode_index}"
+            )
+        try:
+            reset_response = recv_worker(worker, args.worker_timeout)
+            state = make_wave_state(
+                args,
+                task=task,
+                worker=worker,
+                episode_index=episode_index,
+                episode_length=episode_length,
+                task_dir=task_dir,
+                wave_id=wave_id,
+                batch_index=batch_index,
+                wave_batch_size=planned_batch_size,
+                reset_start=reset_starts[batch_index],
+                reset_response=reset_response,
+            )
+            seed = int(state["seed"])
+            state["session_id"] = f"robotwin-microbatch-{task}-{seed}-{uuid.uuid4().hex[:8]}"
+            state["client"] = wave_clients[batch_index]
+            state["num_envs_requested"] = int(args.num_envs)
+            state["wave_batch_size"] = planned_batch_size
+            states.append(state)
+        except Exception as exc:
+            terminate_worker(worker)
+            results.append(
+                error_episode_result(
+                    args,
+                    task=task,
+                    episode_index=episode_index,
+                    worker=worker,
+                    exc=exc,
+                    wave_id=wave_id,
+                    batch_index=batch_index,
+                    wave_batch_size=planned_batch_size,
+                )
+            )
+        finally:
+            if progress is not None:
+                progress.clear_status()
+
+    if not states:
+        return results
+
+    if clients is not None:
+        for state in states:
+            client = state.get("client")
+            if client is None:
+                continue
+            if progress is not None:
+                progress.set_status(
+                    f"task {task_index}/{progress.total_tasks} {task} reset server session={state['session_id']}"
+                )
+            try:
+                client.reset({"session_id": state["session_id"], "prompt": state["prompt"]})
+            except Exception as exc:
+                state["done"] = True
+                state["error"] = f"{exc.__class__.__name__}: {exc}"
+            finally:
+                if progress is not None:
+                    progress.clear_status()
+
+    max_infer = args.max_steps if args.max_steps > 0 else max(int(episode_length), 1)
+    if progress is not None:
+        progress.wave_phase(
+            task_index=task_index,
+            task=task,
+            wave_id=wave_id,
+            total_waves=total_waves,
+            phase="infer",
+            detail=f"sessions={len(states)} max_infer={max_infer}",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(states), 1)) as executor:
+        for infer_index in range(max_infer):
+            active_indices = [idx for idx, state in enumerate(states) if not bool(state["done"])]
+            if not active_indices:
+                break
+
+            request_info: dict[int, dict[str, Any]] = {}
+            action_by_index: dict[int, np.ndarray] = {}
+            infer_elapsed_values: list[float] = []
+            for batch_index in active_indices:
+                state = states[batch_index]
+                payload_build_start = time.perf_counter()
+                payload = robotwin_obs_sequence_to_payload(
+                    state["obs_sequence"],
+                    state["prompt"],
+                    state["session_id"],
+                    image_resolution=args.resolved_client_image_resolution,
+                )
+                payload_build_time = time.perf_counter() - payload_build_start
+                payload_pack_start = time.perf_counter()
+                size_bytes = payload_size_bytes(payload)
+                payload_pack_time = time.perf_counter() - payload_pack_start
+                request_info[batch_index] = {
+                    "payload": payload,
+                    "payload_build_time": payload_build_time,
+                    "payload_pack_time": payload_pack_time,
+                    "size_bytes": size_bytes,
+                }
+
+            if args.dry_run_actions:
+                for batch_index in active_indices:
+                    action_by_index[batch_index] = np.zeros(
+                        (args.open_loop_horizon, ROBOTWIN_ACTION_DIM),
+                        dtype=np.float32,
+                    )
+                    infer_elapsed_values.append(0.0)
+            else:
+                futures: dict[concurrent.futures.Future, int] = {}
+                for batch_index in active_indices:
+                    state = states[batch_index]
+                    client = state.get("client")
+                    if client is None:
+                        state["done"] = True
+                        state["error"] = "missing websocket client"
+                        continue
+                    payload = request_info[batch_index]["payload"]
+
+                    def infer_one(
+                        ws_client: WebsocketClientPolicy,
+                        request_payload: dict[str, Any],
+                    ) -> tuple[np.ndarray, float, float, dict[str, Any], dict[str, Any]]:
+                        infer_start = time.perf_counter()
+                        raw_action, client_timing, server_timing = ws_client.infer_timed(dict(request_payload))
+                        ws_roundtrip_time = time.perf_counter() - infer_start
+                        normalize_start = time.perf_counter()
+                        action_chunk = normalize_action_sequence(raw_action)
+                        action_normalize_time = time.perf_counter() - normalize_start
+                        return action_chunk, ws_roundtrip_time, action_normalize_time, client_timing, server_timing
+
+                    futures[executor.submit(infer_one, client, payload)] = batch_index
+
+                for future in concurrent.futures.as_completed(futures):
+                    batch_index = futures[future]
+                    state = states[batch_index]
+                    try:
+                        action_chunk, ws_roundtrip_time, action_normalize_time, client_timing, server_timing = future.result()
+                    except Exception as exc:
+                        state["done"] = True
+                        state["error"] = f"{exc.__class__.__name__}: {exc}"
+                        terminate_worker(state["worker"])
+                        continue
+                    action_by_index[batch_index] = action_chunk
+                    infer_time = ws_roundtrip_time + action_normalize_time
+                    infer_elapsed_values.append(infer_time)
+                    info = request_info[batch_index]
+                    metrics = state["metrics"]
+                    state["infer_calls"] += 1
+                    metrics["infer_wait_time"] += infer_time
+                    metrics["infer_payload_size_bytes"] += int(info["size_bytes"])
+                    metrics["payload_build_time"] += float(info["payload_build_time"])
+                    metrics["payload_pack_time"] += float(info["payload_pack_time"])
+                    metrics["ws_roundtrip_time"] += ws_roundtrip_time
+                    metrics["action_normalize_time"] += action_normalize_time
+                    metrics["batch_infer_time"] += infer_time
+                    metrics["per_env_infer_time"] += infer_time
+                    metrics["batch_infer_calls"] += 1
+                    add_client_server_timing(metrics, client_timing, server_timing)
+
+            if args.dry_run_actions:
+                for batch_index in active_indices:
+                    state = states[batch_index]
+                    info = request_info[batch_index]
+                    metrics = state["metrics"]
+                    state["infer_calls"] += 1
+                    metrics["infer_payload_size_bytes"] += int(info["size_bytes"])
+                    metrics["payload_build_time"] += float(info["payload_build_time"])
+                    metrics["payload_pack_time"] += float(info["payload_pack_time"])
+                    metrics["batch_infer_calls"] += 1
+
+            for batch_index, action_chunk in action_by_index.items():
+                state = states[batch_index]
+                state["action_shapes"].append(list(action_chunk.shape))
+                if state["first_action"] is None and action_chunk.size:
+                    state["first_action"] = action_chunk[0].tolist()
+                try:
+                    state["worker"].conn.send(
+                        {
+                            "cmd": "step_chunk",
+                            "actions": action_chunk,
+                            "need_obs": True,
+                            "clip_action": bool(args.clip_action),
+                            "max_keyframes": KEYFRAMES_PER_CHUNK,
+                        }
+                    )
+                except Exception as exc:
+                    state["done"] = True
+                    state["error"] = f"{exc.__class__.__name__}: {exc}"
+                    terminate_worker(state["worker"])
+
+            for batch_index in list(action_by_index):
+                state = states[batch_index]
+                if state.get("error"):
+                    continue
+                worker_wait_start = time.perf_counter()
+                if progress is not None:
+                    progress.set_status(
+                        f"task {task_index}/{progress.total_tasks} {task} microbatch wave {wave_id + 1}/{total_waves} "
+                        f"step worker={state['worker'].worker_id} episode={state['episode_index']}"
+                    )
+                try:
+                    step_response = recv_worker(state["worker"], args.worker_timeout)
+                except Exception as exc:
+                    state["done"] = True
+                    state["error"] = f"{exc.__class__.__name__}: {exc}"
+                    terminate_worker(state["worker"])
+                    continue
+                finally:
+                    if progress is not None:
+                        progress.clear_status()
+                worker_wait_time = time.perf_counter() - worker_wait_start
+
+                actions_sent = int(step_response.get("actions_sent", 0))
+                get_obs_time = float(step_response.get("get_obs_time", 0.0))
+                state["metrics"]["worker_step_wait_time"] += worker_wait_time
+                state["metrics"]["env_step_time"] += float(step_response.get("env_step_time", 0.0))
+                state["metrics"]["get_obs_time"] += get_obs_time
+                state["metrics"]["render_obs_time"] += get_obs_time
+                state["metrics"]["step_chunk_time"] += float(
+                    step_response.get(
+                        "step_chunk_time",
+                        float(step_response.get("env_step_time", 0.0)) + get_obs_time,
+                    )
+                )
+                state["steps"] += actions_sent
+                state["reward_sum"] += float(step_response.get("reward_sum", 0.0))
+                state["done"] = bool(step_response.get("done", False))
+                state["last_info"] = step_response.get("info", {})
+                state["success"] = bool(state["last_info"].get("is_success", state["success"]))
+                keyframes = step_response.get("keyframe_obs") or []
+                if keyframes:
+                    state["obs_sequence"] = keyframes[-KEYFRAMES_PER_CHUNK:]
+                    state["keyframe_count"] += len(keyframes)
+                elif step_response.get("obs") is not None:
+                    state["obs_sequence"] = [step_response["obs"]]
+                    state["keyframe_count"] += 1
+                if actions_sent <= 0:
+                    state["done"] = True
+
+            if progress is not None:
+                active_after_step = sum(1 for state in states if not bool(state["done"]))
+                successes = sum(1 for state in states if bool(state["success"]))
+                errors = sum(1 for state in states if state.get("error"))
+                progress.wave_step(
+                    task_index=task_index,
+                    task=task,
+                    wave_id=wave_id,
+                    total_waves=total_waves,
+                    infer_index=infer_index + 1,
+                    max_infer=max_infer,
+                    active=active_after_step,
+                    batch_size=len(states),
+                    successes=successes,
+                    errors=errors,
+                    infer_time=max(infer_elapsed_values) if infer_elapsed_values else 0.0,
+                    wave_elapsed=time.perf_counter() - wave_started_at,
+                    force=infer_index == 0 or active_after_step == 0,
+                )
+
+    completed_at = time.perf_counter()
+    if args.save_video:
+        pending_video_states: list[dict[str, Any]] = []
+        for state in states:
+            try:
+                state["worker"].conn.send({"cmd": "finish_episode"})
+                pending_video_states.append(state)
+            except Exception as exc:
+                last_info = state.get("last_info", {})
+                if not isinstance(last_info, dict):
+                    last_info = {"last_info": last_info}
+                last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
+                state["last_info"] = last_info
+        for state in pending_video_states:
+            try:
+                video_response = recv_worker(state["worker"], args.worker_timeout)
+                state["video_path"] = video_response.get("video_path") or state.get("video_path")
+                state["video_frames"] = int(video_response.get("video_frames", 0))
+                state["metrics"]["video_write_time"] += float(video_response.get("video_write_time", 0.0))
+                state["metrics"]["finish_episode_time"] += float(video_response.get("finish_episode_time", 0.0))
+                state["metrics"]["write_log_video_time"] += float(video_response.get("video_write_time", 0.0))
+            except Exception as exc:
+                last_info = state.get("last_info", {})
+                if not isinstance(last_info, dict):
+                    last_info = {"last_info": last_info}
+                last_info["video_error"] = f"{exc.__class__.__name__}: {exc}"
+                state["last_info"] = last_info
+
+    results.extend(finalize_episode(args, state, completed_at) for state in states)
+    return results
+
+
 def run_task(
     args: argparse.Namespace,
     *,
     task: str,
     task_index: int,
     workers: list[WorkerHandle],
-    client: WebsocketClientPolicy | None,
+    client: WebsocketClientPolicy | list[WebsocketClientPolicy] | None,
     progress: ProgressReporter | None,
 ) -> list[dict[str, Any]]:
     task_dir = args.output_dir / task
     task_dir.mkdir(parents=True, exist_ok=True)
     episode_length = load_task_step_limit(task, args.episode_length)
     results: list[dict[str, Any]] = []
-    total_waves = max((args.episodes + args.num_envs - 1) // args.num_envs, 1)
+    total_waves = (
+        args.episodes
+        if args.eval_mode == "lingbot"
+        else max((args.episodes + args.num_envs - 1) // args.num_envs, 1)
+    )
     task_started_at = time.perf_counter()
     if progress is not None:
         progress.task_start(
@@ -1536,6 +2252,132 @@ def run_task(
             total_waves=total_waves,
         )
 
+    if args.eval_mode == "lingbot":
+        worker = workers[0]
+        single_client = client if isinstance(client, WebsocketClientPolicy) else None
+        seed_cursor = int(args.seed_start)
+        for episode_index in range(args.episodes):
+            wave_started_at = time.perf_counter()
+            try:
+                result = run_episode(
+                    args,
+                    task=task,
+                    worker=worker,
+                    client=single_client,
+                    episode_index=episode_index,
+                    episode_length=episode_length,
+                    task_dir=task_dir,
+                    wave_id=episode_index,
+                    seed_start_override=seed_cursor,
+                )
+                seed_cursor = int(result.get("seed", seed_cursor)) + 1
+                episode_results = [result]
+            except Exception as exc:
+                episode_results = [
+                    error_episode_result(
+                        args,
+                        task=task,
+                        episode_index=episode_index,
+                        worker=worker,
+                        exc=exc,
+                        wave_id=episode_index,
+                        batch_index=0,
+                        wave_batch_size=1,
+                    )
+                ]
+                seed_cursor += max(int(args.expert_filter_max_candidates), int(args.reset_retries) + 1, 1)
+
+            for result in episode_results:
+                write_episode_result(task_dir, result)
+                results.append(result)
+            if progress is not None:
+                progress.wave_done(
+                    task_index=task_index,
+                    task=task,
+                    wave_id=episode_index,
+                    total_waves=total_waves,
+                    results=episode_results,
+                    task_completed=len(results),
+                    wave_elapsed=time.perf_counter() - wave_started_at,
+                )
+
+        if single_client is not None:
+            with contextlib.suppress(Exception):
+                single_client.reset({"session_id": f"robotwin-lingbot-{task}-final-flush"})
+        write_task_summary(task_dir, task, results)
+        if progress is not None:
+            progress.task_done(
+                task_index=task_index,
+                task=task,
+                results=results,
+                elapsed=time.perf_counter() - task_started_at,
+        )
+        return results
+
+    if args.eval_mode == "microbatch":
+        microbatch_clients = client if isinstance(client, list) else None
+        wave_id = 0
+        for episode_start in range(0, args.episodes, args.num_envs):
+            episode_indices = list(range(episode_start, min(episode_start + args.num_envs, args.episodes)))
+            wave_started_at = time.perf_counter()
+            try:
+                wave_results = run_microbatch_wave(
+                    args,
+                    task=task,
+                    task_index=task_index,
+                    workers=workers,
+                    clients=microbatch_clients,
+                    episode_indices=episode_indices,
+                    episode_length=episode_length,
+                    task_dir=task_dir,
+                    wave_id=wave_id,
+                    total_waves=total_waves,
+                    progress=progress,
+                )
+            except Exception as exc:
+                wave_results = [
+                    error_episode_result(
+                        args,
+                        task=task,
+                        episode_index=episode_index,
+                        worker=workers[batch_index % len(workers)],
+                        exc=exc,
+                        wave_id=wave_id,
+                        batch_index=batch_index,
+                        wave_batch_size=len(episode_indices),
+                    )
+                    for batch_index, episode_index in enumerate(episode_indices)
+                ]
+            for result in sorted(wave_results, key=lambda item: int(item.get("episode_index", 0))):
+                write_episode_result(task_dir, result)
+                results.append(result)
+            if progress is not None:
+                progress.wave_done(
+                    task_index=task_index,
+                    task=task,
+                    wave_id=wave_id,
+                    total_waves=total_waves,
+                    results=wave_results,
+                    task_completed=len(results),
+                    wave_elapsed=time.perf_counter() - wave_started_at,
+                )
+            wave_id += 1
+
+        if microbatch_clients is not None:
+            for item in microbatch_clients:
+                with contextlib.suppress(Exception):
+                    item.reset({"reset_all": True})
+        write_task_summary(task_dir, task, results)
+        if progress is not None:
+            progress.task_done(
+                task_index=task_index,
+                task=task,
+                results=results,
+                elapsed=time.perf_counter() - task_started_at,
+            )
+        return results
+
+    single_client = client if isinstance(client, WebsocketClientPolicy) else None
     wave_id = 0
     for episode_start in range(0, args.episodes, args.num_envs):
         episode_indices = list(range(episode_start, min(episode_start + args.num_envs, args.episodes)))
@@ -1546,7 +2388,7 @@ def run_task(
                 task=task,
                 task_index=task_index,
                 workers=workers,
-                client=client,
+                client=single_client,
                 episode_indices=episode_indices,
                 episode_length=episode_length,
                 task_dir=task_dir,
@@ -1583,9 +2425,9 @@ def run_task(
             )
         wave_id += 1
 
-    if client is not None:
+    if single_client is not None:
         with contextlib.suppress(Exception):
-            client.reset({"session_id": f"robotwin-lingbot-{task}-final-flush"})
+            single_client.reset({"session_id": f"robotwin-lingbot-{task}-final-flush"})
     write_task_summary(task_dir, task, results)
     if progress is not None:
         progress.task_done(
@@ -1638,16 +2480,25 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         infer_times: list[float] = []
         batch_call_counts: list[int] = []
         per_env_batch_times: list[float] = []
+        microbatch_calls_list: list[int] = []
+        avg_microbatch_sizes: list[float] = []
+        max_microbatch_sizes: list[int] = []
+        avg_session_queue_depths: list[float] = []
+        max_session_queue_depths: list[int] = []
+        server_vram_allocated_values: list[float] = []
+        server_vram_reserved_values: list[float] = []
         sync_idle_counts: list[int] = []
         env_times: list[float] = []
         obs_times: list[float] = []
         wall_times: list[float] = []
         payload_sizes: list[int] = []
+        profile_timer_values: dict[str, list[float]] = {field: [] for field in PROFILE_TIMER_FIELDS}
         task_gpu_summary: dict[str, dict[str, Any]] = {}
         for path in episode_paths:
             data = json.loads(path.read_text(encoding="utf-8"))
             episode_results.append(data)
             timing = data.get("timing", {})
+            profile = data.get("profile") or {}
             worker_gpu = str(data.get("worker_cuda_visible_devices", "unknown") or "unknown")
             successes += int(bool(data.get("success")))
             rewards.append(float(data.get("reward_sum", 0.0)))
@@ -1666,11 +2517,20 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
             infer_times.append(float(timing.get("infer_wait_time", 0.0)))
             batch_call_counts.append(int(data.get("batch_infer_calls", data.get("infer_calls", 0))))
             per_env_batch_times.append(float(timing.get("per_env_infer_time", 0.0)))
+            microbatch_calls_list.append(int(timing.get("microbatch_calls", 0)))
+            avg_microbatch_sizes.append(float(timing.get("avg_microbatch_size", 0.0)))
+            max_microbatch_sizes.append(int(timing.get("max_microbatch_size", 0)))
+            avg_session_queue_depths.append(float(timing.get("avg_session_queue_depth", 0.0)))
+            max_session_queue_depths.append(int(timing.get("max_session_queue_depth", 0)))
+            server_vram_allocated_values.append(float(timing.get("server_vram_allocated_mb_max", 0.0)))
+            server_vram_reserved_values.append(float(timing.get("server_vram_reserved_mb_max", 0.0)))
             sync_idle_counts.append(int(data.get("sync_idle_steps", 0)))
             env_times.append(float(timing.get("env_step_time", 0.0)))
             obs_times.append(float(timing.get("get_obs_time", 0.0)))
             wall_times.append(float(timing.get("episode_wall_time", 0.0)))
             payload_sizes.append(int(timing.get("infer_payload_size_bytes", 0)))
+            for field in PROFILE_TIMER_FIELDS:
+                profile_timer_values[field].append(float(profile.get(field, 0.0) or 0.0))
             for summary in (task_gpu_summary, global_gpu_summary):
                 item = summary.setdefault(
                     worker_gpu,
@@ -1696,40 +2556,62 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         wave_batch_stats = aggregate_wave_batch_stats(episode_results)
         total_batch_calls = int(wave_batch_stats["batch_infer_calls"])
         per_env_batch_call_count = sum(batch_call_counts)
-        wave_batch_sizes = list(wave_batch_sizes_by_id.values())
-        rows.append(
-            {
-                "task": task_dir.name,
-                "episodes": count,
-                "successes": successes,
-                "success_rate": successes / count if count else 0.0,
-                "avg_reward": sum(rewards) / count if count else 0.0,
-                "avg_steps": sum(steps) / count if count else 0.0,
-                "avg_infer_calls": sum(infer_calls) / count if count else 0.0,
-                "avg_keyframes": sum(keyframes) / count if count else 0.0,
-                "waves": len(wave_ids),
-                "avg_wave_batch_size": sum(wave_batch_sizes) / count if count else 0.0,
-                "episode_length_std": float(np.std(steps)) if steps else 0.0,
-                "avg_reset_time": sum(reset_times) / count if count else 0.0,
-                "avg_expert_filter_time": sum(expert_times) / count if count else 0.0,
-                "avg_infer_wait_time": sum(infer_times) / count if count else 0.0,
-                "batch_infer_calls": total_batch_calls,
-                "avg_batch_infer_time": float(wave_batch_stats["avg_batch_infer_time"]),
-                "avg_per_env_infer_time": sum(per_env_batch_times) / per_env_batch_call_count
-                if per_env_batch_call_count
-                else 0.0,
-                "sync_idle_steps": sum(sync_idle_counts),
-                "avg_env_step_time": sum(env_times) / count if count else 0.0,
-                "avg_get_obs_time": sum(obs_times) / count if count else 0.0,
-                "avg_episode_wall_time": sum(wall_times) / count if count else 0.0,
-                "avg_infer_payload_size_bytes": sum(payload_sizes) / count if count else 0.0,
-                "env_gpu_summary": json.dumps(finalize_gpu_summary(task_gpu_summary), ensure_ascii=False, sort_keys=True),
-                "complete": complete,
-            }
+        total_microbatch_calls = sum(microbatch_calls_list)
+        weighted_microbatch_size = sum(
+            size * calls for size, calls in zip(avg_microbatch_sizes, microbatch_calls_list, strict=True)
         )
+        weighted_queue_depth = sum(
+            depth * calls for depth, calls in zip(avg_session_queue_depths, microbatch_calls_list, strict=True)
+        )
+        wave_batch_sizes = list(wave_batch_sizes_by_id.values())
+        row = {
+            "task": task_dir.name,
+            "episodes": count,
+            "successes": successes,
+            "success_rate": successes / count if count else 0.0,
+            "avg_reward": sum(rewards) / count if count else 0.0,
+            "avg_steps": sum(steps) / count if count else 0.0,
+            "avg_infer_calls": sum(infer_calls) / count if count else 0.0,
+            "avg_keyframes": sum(keyframes) / count if count else 0.0,
+            "waves": len(wave_ids),
+            "avg_wave_batch_size": sum(wave_batch_sizes) / count if count else 0.0,
+            "episode_length_std": float(np.std(steps)) if steps else 0.0,
+            "avg_reset_time": sum(reset_times) / count if count else 0.0,
+            "avg_expert_filter_time": sum(expert_times) / count if count else 0.0,
+            "avg_infer_wait_time": sum(infer_times) / count if count else 0.0,
+            "batch_infer_calls": total_batch_calls,
+            "avg_batch_infer_time": float(wave_batch_stats["avg_batch_infer_time"]),
+            "avg_per_env_infer_time": sum(per_env_batch_times) / per_env_batch_call_count
+            if per_env_batch_call_count
+            else 0.0,
+            "microbatch_calls": total_microbatch_calls,
+            "avg_microbatch_size": weighted_microbatch_size / total_microbatch_calls
+            if total_microbatch_calls
+            else 0.0,
+            "max_microbatch_size": max(max_microbatch_sizes) if max_microbatch_sizes else 0,
+            "avg_session_queue_depth": weighted_queue_depth / total_microbatch_calls
+            if total_microbatch_calls
+            else 0.0,
+            "max_session_queue_depth": max(max_session_queue_depths) if max_session_queue_depths else 0,
+            "server_vram_allocated_mb_max": max(server_vram_allocated_values) if server_vram_allocated_values else 0.0,
+            "server_vram_reserved_mb_max": max(server_vram_reserved_values) if server_vram_reserved_values else 0.0,
+            "sync_idle_steps": sum(sync_idle_counts),
+            "avg_env_step_time": sum(env_times) / count if count else 0.0,
+            "avg_get_obs_time": sum(obs_times) / count if count else 0.0,
+            "avg_episode_wall_time": sum(wall_times) / count if count else 0.0,
+            "avg_infer_payload_size_bytes": sum(payload_sizes) / count if count else 0.0,
+            "env_gpu_summary": json.dumps(finalize_gpu_summary(task_gpu_summary), ensure_ascii=False, sort_keys=True),
+            "complete": complete,
+        }
+        for field, values in profile_timer_values.items():
+            row[f"avg_{field}"] = sum(values) / len(values) if values else 0.0
+        rows.append(row)
 
+    report_mode = "lingbot_style_robotwin"
+    if rows and any(int(row.get("microbatch_calls", 0) or 0) > 0 for row in rows):
+        report_mode = "robotwin_microbatch_eval"
     summary = {
-        "mode": "lingbot_style_robotwin",
+        "mode": report_mode,
         "output_root": output_root.as_posix(),
         "tasks_finished": len(rows),
         "tasks_complete": complete_tasks,
@@ -1739,6 +2621,21 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         "success_rate": total_success / total_episodes if total_episodes else 0.0,
         "waves": sum(int(row.get("waves", 0)) for row in rows),
         "batch_infer_calls": sum(int(row.get("batch_infer_calls", 0)) for row in rows),
+        "microbatch_calls": sum(int(row.get("microbatch_calls", 0)) for row in rows),
+        "avg_microbatch_size": (
+            sum(float(row.get("avg_microbatch_size", 0.0)) * int(row.get("microbatch_calls", 0)) for row in rows)
+            / sum(int(row.get("microbatch_calls", 0)) for row in rows)
+            if sum(int(row.get("microbatch_calls", 0)) for row in rows)
+            else 0.0
+        ),
+        "server_vram_allocated_mb_max": max(
+            (float(row.get("server_vram_allocated_mb_max", 0.0)) for row in rows),
+            default=0.0,
+        ),
+        "server_vram_reserved_mb_max": max(
+            (float(row.get("server_vram_reserved_mb_max", 0.0)) for row in rows),
+            default=0.0,
+        ),
         "sync_idle_steps": sum(int(row.get("sync_idle_steps", 0)) for row in rows),
         "env_gpu_summary": finalize_gpu_summary(global_gpu_summary),
         "rows": rows,
@@ -1762,11 +2659,19 @@ def write_report(output_root: Path, expected_episodes: int) -> None:
         "batch_infer_calls",
         "avg_batch_infer_time",
         "avg_per_env_infer_time",
+        "microbatch_calls",
+        "avg_microbatch_size",
+        "max_microbatch_size",
+        "avg_session_queue_depth",
+        "max_session_queue_depth",
+        "server_vram_allocated_mb_max",
+        "server_vram_reserved_mb_max",
         "sync_idle_steps",
         "avg_env_step_time",
         "avg_get_obs_time",
         "avg_episode_wall_time",
         "avg_infer_payload_size_bytes",
+        *[f"avg_{field}" for field in PROFILE_TIMER_FIELDS],
         "env_gpu_summary",
         "complete",
     ]
@@ -1782,6 +2687,11 @@ def main() -> None:
         raise ValueError("--episodes must be positive")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.eval_mode == "lingbot" and args.num_envs != 1:
+        raise ValueError(
+            "Lingbot-style eval is single-trajectory only: use --num-envs 1, "
+            "or pass --eval-mode batch for the legacy synchronized-wave evaluator."
+        )
     if args.open_loop_horizon <= 0:
         raise ValueError("--open-loop-horizon must be positive for dry-run chunks")
     if args.save_video and args.video_fps <= 0:
@@ -1791,9 +2701,19 @@ def main() -> None:
 
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.seed_cache_root = resolve_seed_cache_root(args)
+    if args.eval_mode == "microbatch":
+        args.use_seed_cache = True
     args.resolved_client_image_resolution = None
+    args.server_timing = {}
     log_dir = args.output_dir / "logs"
     tasks = parse_tasks(args.tasks)
+    args.seed_cache_by_task = {}
+    if args.use_seed_cache:
+        args.seed_cache_by_task = {
+            task: load_seed_cache_for_task(args, task)
+            for task in tasks
+        }
     progress = ProgressReporter(
         mode=args.progress,
         total_tasks=len(tasks),
@@ -1802,7 +2722,7 @@ def main() -> None:
         interval=args.progress_interval,
     )
     workers: list[WorkerHandle] = []
-    client: WebsocketClientPolicy | None = None
+    client: WebsocketClientPolicy | list[WebsocketClientPolicy] | None = None
     server_metadata: dict[str, Any] | None = None
     all_results: list[dict[str, Any]] = []
     try:
@@ -1811,8 +2731,19 @@ def main() -> None:
             progress.log(f"connecting policy server ws://{args.remote_host}:{args.remote_port}")
             progress.set_status(f"policy server connect ws://{args.remote_host}:{args.remote_port}")
             try:
-                client = WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
-                server_metadata = client.get_server_metadata()
+                if args.eval_mode == "microbatch":
+                    clients = [
+                        WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
+                        for _ in workers
+                    ]
+                    client = clients
+                    server_metadata = clients[0].get_server_metadata() if clients else {}
+                else:
+                    single_client = WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
+                    client = single_client
+                    server_metadata = single_client.get_server_metadata()
+                raw_server_timing = server_metadata.get("server_timing", {}) if server_metadata else {}
+                args.server_timing = raw_server_timing if isinstance(raw_server_timing, dict) else {}
                 progress.log(f"policy server ready metadata={server_metadata}")
             finally:
                 progress.clear_status()
@@ -1836,14 +2767,18 @@ def main() -> None:
             all_results.extend(task_results)
         write_report(args.output_dir, args.episodes)
     finally:
-        if client is not None:
+        if isinstance(client, list):
+            for item in client:
+                with contextlib.suppress(Exception):
+                    item.close()
+        elif client is not None:
             client.close()
         if workers:
             stop_workers(workers)
         progress.close()
 
     done = {
-        "mode": "lingbot_style_robotwin",
+        "mode": "robotwin_microbatch_eval" if args.eval_mode == "microbatch" else "lingbot_style_robotwin",
         "tasks": tasks,
         "episodes": len(all_results),
         "output_dir": args.output_dir.as_posix(),

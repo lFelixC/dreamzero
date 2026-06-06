@@ -1,15 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# ALOHA X5lite bimanual Wan2.2 training entrypoint.
-# Switch architectures with ARCH=joint or ARCH=mot.
-# Select data explicitly with ALOHA_DATA_ROOT=/path/to/lerobot_dataset.
+# Ego video-only Wan2.2 joint pretraining entrypoint.
+# This path intentionally does not load an existing DreamZero robot checkpoint:
+# Wan2.2 TI2V/video/text/image/vae assets are used as the base.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ARCH="${ARCH:-joint}"
-if [[ "${ARCH}" != "joint" && "${ARCH}" != "mot" ]]; then
-  echo "ERROR: ARCH must be joint or mot, got '${ARCH}'"
+if [[ "${ARCH}" != "joint" ]]; then
+  echo "ERROR: ego video-only pretrain supports ARCH=joint only, got '${ARCH}'"
   exit 1
 fi
 
@@ -22,24 +22,18 @@ export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/data/checkpoints/dreamzero}"
 export PYTHONPATH="${DREAMZERO_ROOT}:${PYTHONPATH:-}"
 
 EXPERIMENT_PY="${EXPERIMENT_PY:-${DREAMZERO_ROOT}/groot/vla/experiment/experiment.py}"
-ALOHA_DATA_ROOT="${ALOHA_DATA_ROOT:-}"
-if [[ -z "${ALOHA_DATA_ROOT}" ]]; then
-  echo "ERROR: ALOHA_DATA_ROOT must be set to the dataset root you want to train."
-  echo "Example: ALOHA_DATA_ROOT=/path/to/aloha_dataset_160x320 bash $0"
-  exit 1
-fi
-ALOHA_DATA_NAME="${ALOHA_DATA_NAME:-$(basename "${ALOHA_DATA_ROOT%/}")}"
-ALOHA_DATA_NAME="${ALOHA_DATA_NAME//[^[:alnum:]_.-]/_}"
+EGO_DATA_ROOT="${EGO_DATA_ROOT:-${DATASET_ROOT}/basic_pick_place_ego_160x320}"
+EGO_DATA_NAME="${EGO_DATA_NAME:-$(basename "${EGO_DATA_ROOT%/}")}"
+EGO_DATA_NAME="${EGO_DATA_NAME//[^[:alnum:]_.-]/_}"
 WAN22_CKPT_DIR="${WAN22_CKPT_DIR:-${CHECKPOINT_ROOT}/Wan2.2-TI2V-5B}"
 IMAGE_ENCODER_DIR="${IMAGE_ENCODER_DIR:-${WAN22_CKPT_DIR}}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${WAN22_CKPT_DIR}/google/umt5-xxl}"
-PRETRAINED_MODEL_PATH="${PRETRAINED_MODEL_PATH:-}"
 OUTPUT_DIR_WAS_SET="${OUTPUT_DIR+x}"
-OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_wan22_${ALOHA_DATA_NAME}_${ARCH}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/basic_pick_place_ego_video_only_joint_wan22_10k}"
 
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-dreamzero}"
-PER_DEVICE_BS="${PER_DEVICE_BS:-32}"
-MAX_STEPS="${MAX_STEPS:-50000}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-64}"
+MAX_STEPS="${MAX_STEPS:-10000}"
 SAVE_STEPS="${SAVE_STEPS:-5000}"
 SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
@@ -47,9 +41,9 @@ DEEPSPEED_CFG="${DEEPSPEED_CFG:-zero2}"
 NUM_FRAMES="${NUM_FRAMES:-33}"
 IMAGE_RESOLUTION_WIDTH="${IMAGE_RESOLUTION_WIDTH:-320}"
 IMAGE_RESOLUTION_HEIGHT="${IMAGE_RESOLUTION_HEIGHT:-160}"
-TARGET_VIDEO_HEIGHT="${TARGET_VIDEO_HEIGHT:-${TARGET_HEIGHT:-${MODEL_TARGET_HEIGHT:-160}}}"
-TARGET_VIDEO_WIDTH="${TARGET_VIDEO_WIDTH:-${TARGET_WIDTH:-${MODEL_TARGET_WIDTH:-320}}}"
-FRAME_SEQLEN="${FRAME_SEQLEN:-${MODEL_FRAME_SEQLEN:-${FRAMESEQ:-50}}}"
+TARGET_VIDEO_HEIGHT="${TARGET_VIDEO_HEIGHT:-160}"
+TARGET_VIDEO_WIDTH="${TARGET_VIDEO_WIDTH:-320}"
+FRAME_SEQLEN="${FRAME_SEQLEN:-50}"
 ACTION_HORIZON="${ACTION_HORIZON:-24}"
 MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-4}"
 NUM_FRAME_PER_BLOCK="${NUM_FRAME_PER_BLOCK:-2}"
@@ -61,16 +55,15 @@ DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-true}"
 DATASET_SHARD_SAMPLING_RATE="${DATASET_SHARD_SAMPLING_RATE:-0.1}"
 DATASET_SHARD_SAMPLING_STRATEGY="${DATASET_SHARD_SAMPLING_STRATEGY:-random}"
 DATASET_SHARD_SAMPLING_BLOCK_SIZE="${DATASET_SHARD_SAMPLING_BLOCK_SIZE:-64}"
-LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
 ACTIVATION_CHECKPOINTING_POLICY="${ACTIVATION_CHECKPOINTING_POLICY:-off}"
 EPISODE_FILTER_PATH="${EPISODE_FILTER_PATH:-null}"
-MOT_ACTION_VIDEO_ATTENTION="${MOT_ACTION_VIDEO_ATTENTION:-full_video}"
 
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29432}"
+MASTER_PORT="${MASTER_PORT:-29436}"
 
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   NNODES=1
@@ -80,15 +73,8 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     GPU_IDS="${SMOKE_GPU_IDS}"
   elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     GPU_IDS="${CUDA_VISIBLE_DEVICES}"
-  elif [[ -n "${GPU_IDS:-}" ]]; then
-    GPU_IDS="${GPU_IDS}"
   else
-    GPU_IDS="$("${PYTHON_BIN}" - <<'PY'
-import torch
-count = torch.cuda.device_count()
-print(",".join(str(i) for i in range(count)) if count else "0")
-PY
-)"
+    GPU_IDS="${GPU_IDS:-4,5,6,7}"
   fi
   if [[ "${SMOKE_FORCE_SINGLE_GPU:-false}" == "true" && "${GPU_IDS}" == *,* ]]; then
     GPU_IDS="${GPU_IDS%%,*}"
@@ -105,25 +91,23 @@ PY
   DATASET_SHARD_SAMPLING_STRATEGY="${SMOKE_DATASET_SHARD_SAMPLING_STRATEGY:-${DATASET_SHARD_SAMPLING_STRATEGY}}"
   DATASET_SHARD_SAMPLING_BLOCK_SIZE="${SMOKE_DATASET_SHARD_SAMPLING_BLOCK_SIZE:-${DATASET_SHARD_SAMPLING_BLOCK_SIZE}}"
   if [[ -z "${OUTPUT_DIR_WAS_SET}" ]]; then
-    OUTPUT_DIR="${CHECKPOINT_ROOT}/dreamzero_aloha_x5lite_bimanual_wan22_${ALOHA_DATA_NAME}_${ARCH}_smoke"
+    OUTPUT_DIR="${CHECKPOINT_ROOT}/basic_pick_place_ego_video_only_joint_wan22_smoke"
   fi
-  if [[ "${EPISODE_FILTER_PATH}" == "null" && -f "${ALOHA_DATA_ROOT}/meta/smoke_episode_filter.json" ]]; then
-    EPISODE_FILTER_PATH="${ALOHA_DATA_ROOT}/meta/smoke_episode_filter.json"
+  if [[ "${EPISODE_FILTER_PATH}" == "null" && -f "${EGO_DATA_ROOT}/meta/smoke_episode_filter.json" ]]; then
+    EPISODE_FILTER_PATH="${EGO_DATA_ROOT}/meta/smoke_episode_filter.json"
   fi
   export DREAMZERO_SKIP_FINAL_SAVE="${DREAMZERO_SKIP_FINAL_SAVE:-1}"
 fi
 
-if [[ "${SMOKE_TEST:-0}" == "1" && -n "${GPU_IDS:-}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   GPU_IDS="${CUDA_VISIBLE_DEVICES}"
 else
-  GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+  GPU_IDS="${GPU_IDS:-4,5,6,7}"
   export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 fi
 
 export HYDRA_FULL_ERROR=1
-export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-1}"
+export SWANLAB_SYNC_WANDB="${SWANLAB_SYNC_WANDB:-0}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT_NAME}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -150,28 +134,13 @@ if [[ ! -f "${EXPERIMENT_PY}" ]]; then
   echo "ERROR: experiment.py not found at ${EXPERIMENT_PY}"
   exit 1
 fi
-if [[ ! -f "${ALOHA_DATA_ROOT}/meta/modality.json" ]]; then
-  echo "ERROR: ALOHA metadata missing at ${ALOHA_DATA_ROOT}/meta/modality.json"
-  echo "Prepare the dataset and DreamZero metadata first."
-  exit 1
-fi
-if [[ -n "${PRETRAINED_MODEL_PATH}" && ! -d "${PRETRAINED_MODEL_PATH}" ]]; then
-  echo "ERROR: PRETRAINED_MODEL_PATH not found at ${PRETRAINED_MODEL_PATH}"
+if [[ ! -f "${EGO_DATA_ROOT}/meta/modality.json" ]]; then
+  echo "ERROR: ego metadata missing at ${EGO_DATA_ROOT}/meta/modality.json"
   exit 1
 fi
 
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
-  LOCAL_NUM_GPUS="${#_GPU_ID_ARRAY[@]}"
-elif [[ -n "${NUM_GPUS:-}" ]]; then
-  LOCAL_NUM_GPUS="${NUM_GPUS}"
-else
-  LOCAL_NUM_GPUS="$("${PYTHON_BIN}" - <<'PY'
-import torch
-print(torch.cuda.device_count())
-PY
-)"
-fi
+IFS=',' read -r -a _GPU_ID_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+LOCAL_NUM_GPUS="${NUM_GPUS:-${#_GPU_ID_ARRAY[@]}}"
 if [[ -z "${LOCAL_NUM_GPUS}" ]] || [[ "${LOCAL_NUM_GPUS}" -lt 1 ]]; then
   echo "ERROR: No visible GPU found"
   exit 1
@@ -240,16 +209,10 @@ if [[ "${PREPARE_ASSETS:-true}" == "true" ]]; then
   fi
 fi
 
-if [[ "${ARCH}" == "mot" ]]; then
-  ACTION_HEAD_CONFIG="wan_flow_matching_action_tf_wan22_mot"
-else
-  ACTION_HEAD_CONFIG="wan_flow_matching_action_tf_wan22"
-fi
-
 mkdir -p "${OUTPUT_DIR}"
 cd "${DREAMZERO_ROOT}"
 
-echo "========== ALOHA X5lite Wan2.2 launch config =========="
+echo "========== Ego video-only Wan2.2 joint launch config =========="
 echo "ARCH=${ARCH}"
 echo "DREAMZERO_ROOT=${DREAMZERO_ROOT}"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
@@ -258,11 +221,9 @@ echo "NNODES=${NNODES}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
-echo "DATASET_ROOT=${DATASET_ROOT}"
-echo "ALOHA_DATA_ROOT=${ALOHA_DATA_ROOT}"
-echo "ALOHA_DATA_NAME=${ALOHA_DATA_NAME}"
+echo "EGO_DATA_ROOT=${EGO_DATA_ROOT}"
+echo "EGO_DATA_NAME=${EGO_DATA_NAME}"
 echo "WAN22_CKPT_DIR=${WAN22_CKPT_DIR}"
-echo "PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-<unset>}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "NUM_GPUS(local)=${NUM_GPUS}"
@@ -293,24 +254,23 @@ echo "DATASET_SHARD_SAMPLING_STRATEGY=${DATASET_SHARD_SAMPLING_STRATEGY}"
 echo "DATASET_SHARD_SAMPLING_BLOCK_SIZE=${DATASET_SHARD_SAMPLING_BLOCK_SIZE}"
 echo "USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING}"
 echo "ACTIVATION_CHECKPOINTING_POLICY=${ACTIVATION_CHECKPOINTING_POLICY}"
-echo "MOT_ACTION_VIDEO_ATTENTION=${MOT_ACTION_VIDEO_ATTENTION}"
 echo "SMOKE_TEST=${SMOKE_TEST:-0}"
-echo "SMOKE_FORCE_SINGLE_GPU=${SMOKE_FORCE_SINGLE_GPU:-false}"
 echo "DREAMZERO_SKIP_FINAL_SAVE=${DREAMZERO_SKIP_FINAL_SAVE:-<unset>}"
 echo "EPISODE_FILTER_PATH=${EPISODE_FILTER_PATH}"
-echo "========================================================"
+echo "==============================================================="
 
 TRAIN_OVERRIDES=(
   "report_to=wandb"
-  "data=dreamzero/aloha_x5lite_bimanual_relative_wan22"
+  "data=dreamzero/basic_pick_place_ego_video_only_wan22"
   "wandb_project=${WANDB_PROJECT_NAME}"
   "train_architecture=full"
   "architecture=${ARCH}"
+  "video_only=true"
   "num_frames=${NUM_FRAMES}"
   "action_horizon=${ACTION_HORIZON}"
-  "num_views=3"
+  "num_views=1"
   "model=dreamzero/vla"
-  "model/dreamzero/action_head=${ACTION_HEAD_CONFIG}"
+  "model/dreamzero/action_head=wan_flow_matching_action_tf_wan22"
   "action_head_cfg.config.use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING}"
   "action_head_cfg.config.activation_checkpointing_policy=${ACTIVATION_CHECKPOINTING_POLICY}"
   "frame_seqlen=${FRAME_SEQLEN}"
@@ -349,7 +309,7 @@ TRAIN_OVERRIDES=(
   "save_lora_only=false"
   "max_chunk_size=${MAX_CHUNK_SIZE}"
   "save_strategy=${SAVE_STRATEGY}"
-  "aloha_data_root=${ALOHA_DATA_ROOT}"
+  "ego_data_root=${EGO_DATA_ROOT}"
   "episode_filter_path=${EPISODE_FILTER_PATH}"
   "dit_version=${WAN22_CKPT_DIR}"
   "text_encoder_pretrained_path=${WAN22_CKPT_DIR}/models_t5_umt5-xxl-enc-bf16.pth"
@@ -361,29 +321,6 @@ TRAIN_OVERRIDES=(
   "dataset_shard_sampling_block_size=${DATASET_SHARD_SAMPLING_BLOCK_SIZE}"
   "+training_args.dataloader_prefetch_factor=${DATALOADER_PREFETCH_FACTOR}"
 )
-
-if [[ -n "${PRETRAINED_MODEL_PATH}" ]]; then
-  TRAIN_OVERRIDES+=(
-    "pretrained_model_path=${PRETRAINED_MODEL_PATH}"
-  )
-fi
-
-if [[ "${ARCH}" == "mot" ]]; then
-  TRAIN_OVERRIDES+=(
-    "mot_action_hidden_dim=${MOT_ACTION_HIDDEN_DIM:-1024}"
-    "mot_action_ffn_dim=${MOT_ACTION_FFN_DIM:-4096}"
-    "mot_action_num_layers=${MOT_ACTION_NUM_LAYERS:-null}"
-    "mot_action_num_heads=${MOT_ACTION_NUM_HEADS:-8}"
-    "mot_action_video_attention=${MOT_ACTION_VIDEO_ATTENTION}"
-    "mot_action_video_ki=${MOT_ACTION_VIDEO_KI:-false}"
-    "mot_inference_video_mode=${MOT_INFERENCE_VIDEO_MODE:-auto}"
-    "mot_decouple_video_action_noise=${MOT_DECOUPLE_VIDEO_ACTION_NOISE:-false}"
-    "mot_video_noise_beta_alpha=${MOT_VIDEO_NOISE_BETA_ALPHA:-3.0}"
-    "mot_video_noise_beta_beta=${MOT_VIDEO_NOISE_BETA_BETA:-1.0}"
-    "mot_decoupled_inference_video_final_noise=${MOT_DECOUPLED_INFERENCE_VIDEO_FINAL_NOISE:-0.8}"
-    "mot_decoupled_inference_video_refresh_steps=${MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS:-8}"
-  )
-fi
 
 exec "${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \

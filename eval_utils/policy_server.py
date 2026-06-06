@@ -8,6 +8,7 @@ Adapted from https://github.com/robo-arena/roboarena/
 import asyncio
 import dataclasses
 import logging
+import time
 import traceback
 
 from eval_utils.base_policy import BasePolicy
@@ -73,12 +74,14 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         open_timeout: float | None = 0.0,
+        metadata: dict | None = None,
     ) -> None:
         self._policy = policy
         self._server_config = server_config
         self._host = host
         self._port = port
         self._open_timeout = _normalize_timeout(open_timeout)
+        self._metadata = dict(metadata or {})
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -101,7 +104,9 @@ class WebsocketPolicyServer:
         packer = msgpack_numpy.Packer()
 
         # Send server config to client to configure what gets sent to server.
-        await websocket.send(packer.pack(dataclasses.asdict(self._server_config)))
+        metadata = dataclasses.asdict(self._server_config)
+        metadata.update(self._metadata)
+        await websocket.send(packer.pack(metadata))
 
         while True:
             try:
@@ -113,9 +118,17 @@ class WebsocketPolicyServer:
                     self._policy.reset(obs)
                     to_return = "reset successful"
                 else:
+                    infer_start = time.perf_counter()
                     action = self._policy.infer(obs)
+                    policy_infer_time = time.perf_counter() - infer_start
                     if not isinstance(action, dict):
                         action = {"actions": action}
+                    else:
+                        action = dict(action)
+                    action["server_timing"] = {
+                        "policy_infer_time": policy_infer_time,
+                        "T_policy_infer": policy_infer_time,
+                    }
                     to_return = packer.pack(action)
                 await websocket.send(to_return)
             except websockets.ConnectionClosed:

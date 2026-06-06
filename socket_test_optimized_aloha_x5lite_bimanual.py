@@ -847,6 +847,7 @@ def _build_output_dir(output_root: str | None, model_path: str, index: int) -> s
 
 
 def main(args: Args) -> None:
+    process_started_at = time.perf_counter()
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
     os.environ.setdefault("ATTENTION_BACKEND", "TE")
 
@@ -867,6 +868,7 @@ def main(args: Args) -> None:
 
     embodiment_tag = EmbodimentTag.ALOHA_X5LITE_BIMANUAL
     logger.info("Loading DreamZero checkpoint from %s with embodiment=%s", args.model_path, embodiment_tag.value)
+    model_load_start = time.perf_counter()
     policy = GrootSimPolicy(
         embodiment_tag=embodiment_tag,
         model_path=args.model_path,
@@ -874,6 +876,8 @@ def main(args: Args) -> None:
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
     )
+    load_model_time = time.perf_counter() - model_load_start
+    logger.info("Loaded DreamZero checkpoint in %.3fs", load_model_time)
 
     if args.image_height is not None and args.image_width is not None:
         image_height, image_width = int(args.image_height), int(args.image_width)
@@ -915,13 +919,28 @@ def main(args: Args) -> None:
     )
 
     if rank == 0:
-        logger.info("Serving ALOHA bimanual DreamZero websocket server on ws://%s:%d", args.host, args.port)
+        server_ready_time = time.perf_counter() - process_started_at
+        server_timing = {
+            "load_model_time": load_model_time,
+            "server_ready_time": server_ready_time,
+            "T_load_model": load_model_time,
+            "T_server_ready": server_ready_time,
+        }
+        logger.info(
+            "Serving ALOHA bimanual DreamZero websocket server on ws://%s:%d "
+            "(T_load_model=%.3fs T_server_ready=%.3fs)",
+            args.host,
+            args.port,
+            load_model_time,
+            server_ready_time,
+        )
         server = WebsocketPolicyServer(
             policy=wrapper_policy,
             server_config=server_config,
             host=args.host,
             port=args.port,
             open_timeout=args.handshake_timeout_seconds,
+            metadata={"server_timing": server_timing},
         )
         try:
             server.serve_forever()

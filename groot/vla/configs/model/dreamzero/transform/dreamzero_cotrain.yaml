@@ -36,6 +36,7 @@ max_state_dim: 44
 max_action_dim: 32
 language_dropout_prob: 0.0
 droid_random_drop_exterior_view_prob: 0.0
+video_only: false
 
 
 model_specific_transform:
@@ -51,3 +52,4 @@ model_specific_transform:
   embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
   tokenizer_path: ${tokenizer_path}
   droid_random_drop_exterior_view_prob: ${droid_random_drop_exterior_view_prob}
+  video_only: ${video_only}

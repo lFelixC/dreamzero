@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified RoboTwin LingBot-VA style synchronized-wave eval launcher.
+# Unified RoboTwin LingBot-VA style single-session eval launcher.
 #
 # Recommended:
 #   SERVER_GPU=6,7 CLIENT_GPU=7 TASK=beat_block_hammer \
@@ -37,7 +37,7 @@ GPU selection:
   CLIENT_GPU=7    RoboTwin env worker GPU list. Multiple values are assigned round-robin.
 
 Common knobs:
-  EPISODES=8 SAVE_VIDEO=0 PORT=8100
+  EPISODES=100 SEED_START=10000 SAVE_VIDEO=0 PORT=8100
   PROGRESS=plain ROBOTWIN_PROGRESS_INTERVAL=30
   ROBOTWIN_TASK_CONFIG=demo_clean
   EXPERT_FILTER_MAX_CANDIDATES=1000
@@ -185,8 +185,8 @@ csv_count() {
 
 resolve_ckpt() {
   local ckpt="$1"
-  if [[ -d "${ckpt}/checkpoint-10000" && ! -f "${ckpt}/config.json" ]]; then
-    ckpt="${ckpt}/checkpoint-10000"
+  if [[ -d "${ckpt}/checkpoint-30000" && ! -f "${ckpt}/config.json" ]]; then
+    ckpt="${ckpt}/checkpoint-30000"
   fi
   printf '%s\n' "${ckpt}"
 }
@@ -279,21 +279,26 @@ if [[ "${LIST_TASKS:-0}" == "1" ]]; then
   exit 0
 fi
 
+EVAL_MODE="${EVAL_MODE:-lingbot}"
 NUM_ENVS="${NUM_ENVS:-1}"
+DRY_RUN_ACTIONS="${DRY_RUN_ACTIONS:-0}"
 
 SERVER_GPU_VALUE="${SERVER_GPU:-${SERVER_CUDA:-}}"
 CLIENT_GPU_VALUE="${CLIENT_GPU:-${ENV_GPU:-${ENV_CUDA:-${CLIENT_CUDA:-}}}}"
 
-if [[ -z "${SERVER_GPU_VALUE}" || -z "${CLIENT_GPU_VALUE}" ]]; then
+if [[ "${DRY_RUN_ACTIONS}" == "1" && -z "${CLIENT_GPU_VALUE}" ]]; then
+  CLIENT_GPU_VALUE="${CUDA_VISIBLE_DEVICES:-0}"
+fi
+if [[ "${DRY_RUN_ACTIONS}" != "1" && ( -z "${SERVER_GPU_VALUE}" || -z "${CLIENT_GPU_VALUE}" ) ]]; then
   echo "SERVER_GPU and CLIENT_GPU must be set to avoid accidentally occupying the wrong GPUs." >&2
   usage
   exit 2
 fi
 
-CKPT_RESOLVED="$(resolve_ckpt "${CKPT:-/data/checkpoints/dreamzero/dreamzero_robotwin}")"
+CKPT_RESOLVED="$(resolve_ckpt "${CKPT:-/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000}")"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/lingbot_style_eval}"
-EPISODES="${EPISODES:-8}"
-SEED_START="${SEED_START:-0}"
+EPISODES="${EPISODES:-100}"
+SEED_START="${SEED_START:-10000}"
 OPEN_LOOP_HORIZON="${OPEN_LOOP_HORIZON:-24}"
 MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-24}"
 EPISODE_LENGTH="${EPISODE_LENGTH:-0}"
@@ -303,7 +308,6 @@ EXPERT_FILTER="${EXPERT_FILTER:-1}"
 EXPERT_FILTER_MAX_CANDIDATES="${EXPERT_FILTER_MAX_CANDIDATES:-1000}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 VIDEO_FPS="${VIDEO_FPS:-10}"
-DRY_RUN_ACTIONS="${DRY_RUN_ACTIONS:-0}"
 PROFILE="${PROFILE:-0}"
 CLIENT_IMAGE_RESOLUTION="${CLIENT_IMAGE_RESOLUTION:-none}"
 PROGRESS="${PROGRESS:-${ROBOTWIN_PROGRESS:-plain}}"
@@ -317,12 +321,16 @@ MASTER_PORT="${MASTER_PORT:-29610}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 
-if [[ "${SERVER_NPROC}" -le 0 ]]; then
+if [[ "${DRY_RUN_ACTIONS}" != "1" && "${SERVER_NPROC}" -le 0 ]]; then
   echo "SERVER_GPU must contain at least one GPU index" >&2
   exit 1
 fi
 if [[ "${NUM_ENVS}" -le 0 ]]; then
   echo "NUM_ENVS must be positive" >&2
+  exit 1
+fi
+if [[ "${EVAL_MODE}" == "lingbot" && "${NUM_ENVS}" -ne 1 ]]; then
+  echo "LingBot-style eval is single-trajectory only. Use NUM_ENVS=1, or set EVAL_MODE=batch for the legacy synchronized-wave evaluator." >&2
   exit 1
 fi
 if [[ "${DRY_RUN_ACTIONS}" != "1" && ! -d "${CKPT_RESOLVED}" ]]; then
@@ -356,7 +364,7 @@ trap cleanup_server EXIT
 start_server() {
   local server_log="${OUTPUT_ROOT}/logs/server_${PORT}.log"
   require_port_free "${HOST}" "${PORT}"
-  echo "[server] start port=${PORT} server_gpu=${SERVER_GPU_VALUE} nproc=${SERVER_NPROC} master_port=${MASTER_PORT}"
+  echo "[server] start single-session policy server port=${PORT} server_gpu=${SERVER_GPU_VALUE} nproc=${SERVER_NPROC} master_port=${MASTER_PORT}"
   setsid env CUDA_VISIBLE_DEVICES="${SERVER_GPU_VALUE}" \
     "${DREAMZERO_TORCHRUN}" \
       --nnodes 1 \
@@ -397,7 +405,7 @@ run_controller() {
     echo "[controller] EXPERT_FILTER=0 ignored; LingBot-style eval always filters expert-success seeds"
   fi
 
-  echo "[controller] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} client_gpu=${CLIENT_GPU_VALUE} expert_filter=${EXPERT_FILTER}"
+  echo "[controller] mode=${EVAL_MODE} tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} client_gpu=${CLIENT_GPU_VALUE} expert_filter=${EXPERT_FILTER}"
   CONTROLLER_STARTED_AT="$(now_seconds)"
   PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/lerobot/src:${PYTHONPATH:-}" \
     "${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
@@ -406,6 +414,7 @@ run_controller() {
       --tasks "${TASKS_RAW}" \
       --episodes "${EPISODES}" \
       --num-envs "${NUM_ENVS}" \
+      --eval-mode "${EVAL_MODE}" \
       --env-cuda "${CLIENT_GPU_VALUE}" \
       --worker-python "${ROBOTWIN_PYTHON}" \
       --output-dir "${OUTPUT_ROOT}" \
@@ -431,7 +440,7 @@ run_controller() {
 echo "[eval] ckpt=${CKPT_RESOLVED}"
 echo "[eval] output_root=${OUTPUT_ROOT}"
 echo "[eval] server_gpu=${SERVER_GPU_VALUE} server_nproc=${SERVER_NPROC} client_gpu=${CLIENT_GPU_VALUE} port=${PORT}"
-echo "[eval] tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} seed_start=${SEED_START} open_loop_horizon=${OPEN_LOOP_HORIZON} expert_filter=${EXPERT_FILTER}"
+echo "[eval] mode=${EVAL_MODE} tasks=${TASKS_RAW} episodes=${EPISODES} num_envs=${NUM_ENVS} seed_start=${SEED_START} open_loop_horizon=${OPEN_LOOP_HORIZON} expert_filter=${EXPERT_FILTER}"
 echo "[eval] save_video=${SAVE_VIDEO} video_fps=${VIDEO_FPS} profile=${PROFILE} client_image_resolution=${CLIENT_IMAGE_RESOLUTION} progress=${PROGRESS} task_config=${ROBOTWIN_TASK_CONFIG}"
 
 if [[ "${DRY_RUN_ACTIONS}" == "1" ]]; then

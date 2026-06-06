@@ -39,8 +39,8 @@ This repo has been patched to work with `Transformer Engine 2.13.0` on the H200 
 Install it into the DreamZero venv:
 
 ```bash
-cd /data/dreamzero
-source .venv/bin/activate
+cd /data/dreamzero_mot
+source /data/dreamzero/.venv/bin/activate
 
 export CUDA_HOME=/usr/local/cuda-12.9
 export NVTE_CUDA_INCLUDE_PATH=$CUDA_HOME/include
@@ -57,8 +57,8 @@ export LD_LIBRARY_PATH=/data/dreamzero/.venv/lib/python3.11/site-packages/nvidia
 Quick sanity check:
 
 ```bash
-cd /data/dreamzero
-source .venv/bin/activate
+cd /data/dreamzero_mot
+source /data/dreamzero/.venv/bin/activate
 
 python - <<'PY'
 import transformer_engine
@@ -73,7 +73,7 @@ All examples below use two GPUs. Replace `0,1` and `--nproc_per_node 2` as neede
 ### 3.1 FA2 without `torch.compile`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \
@@ -88,7 +88,7 @@ torchrun --standalone --nproc_per_node 2 \
 ### 3.2 TE without `torch.compile`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=TE \
@@ -104,7 +104,7 @@ torchrun --standalone --nproc_per_node 2 \
 ### 3.3 Compile enabled with `cudagraphs`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \
@@ -130,7 +130,7 @@ The same backend flags apply to the ALOHA bimanual server.
 ### 4.1 FA2 without `torch.compile`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \
@@ -145,7 +145,7 @@ torchrun --standalone --nproc_per_node 2 \
 ### 4.2 TE without `torch.compile`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=TE \
@@ -161,7 +161,7 @@ torchrun --standalone --nproc_per_node 2 \
 ### 4.3 Compile enabled with `cudagraphs`
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \

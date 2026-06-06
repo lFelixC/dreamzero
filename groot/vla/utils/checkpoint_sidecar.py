@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from omegaconf import DictConfig, open_dict
 from safetensors import safe_open
 
 
@@ -45,6 +46,10 @@ def _get(container: Any, key: str, default: Any = None) -> Any:
 
 
 def _set(container: Any, key: str, value: Any) -> None:
+    if isinstance(container, DictConfig):
+        with open_dict(container):
+            container[key] = value
+        return
     if _mapping_like(container):
         container[key] = value
     else:

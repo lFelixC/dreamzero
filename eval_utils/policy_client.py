@@ -6,7 +6,7 @@ Adapted from https://github.com/robo-arena/roboarena/
 
 import logging
 import time
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import websockets.sync.client
 from typing_extensions import override
@@ -50,6 +50,8 @@ class WebsocketClientPolicy(BasePolicy):
         self._log_wait = log_wait
         self._open_timeout = _normalize_timeout(open_timeout)
         self._ws, self._server_metadata = self._wait_for_server()
+        self.last_timing: dict[str, float] = {}
+        self.last_server_timing: dict[str, Any] = {}
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
@@ -89,29 +91,77 @@ class WebsocketClientPolicy(BasePolicy):
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        # Notify server that we're calling the infer endpoint (as opposed to the reset endpoint)
-        obs["endpoint"] = "infer"
+        actions, _, _ = self.infer_timed(obs)
+        return actions
 
-        data = self._packer.pack(obs)
+    def infer_timed(self, obs: Dict) -> tuple[Any, dict[str, float], dict[str, Any]]:  # noqa: UP006
+        # Notify server that we're calling the infer endpoint (as opposed to the reset endpoint)
+        request = dict(obs)
+        request["endpoint"] = "infer"
+
+        request_start = time.perf_counter()
+        pack_start = time.perf_counter()
+        data = self._packer.pack(request)
+        pack_obs_time = time.perf_counter() - pack_start
+        send_start = time.perf_counter()
         self._ws.send(data)
+        send_time = time.perf_counter() - send_start
+        recv_start = time.perf_counter()
         response = self._ws.recv()
+        recv_time = time.perf_counter() - recv_start
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
+        unpack_start = time.perf_counter()
         unpacked = msgpack_numpy.unpackb(response)
+        unpack_time = time.perf_counter() - unpack_start
+        total_time = time.perf_counter() - request_start
+
+        timing = {
+            "pack_obs_time": pack_obs_time,
+            "websocket_send_time": send_time,
+            "websocket_recv_time": recv_time,
+            "unpack_action_time": unpack_time,
+            "request_total_time": total_time,
+            "T_send_obs": pack_obs_time + send_time,
+            "T_recv_action": recv_time + unpack_time,
+        }
+        server_timing: dict[str, Any] = {}
         if isinstance(unpacked, dict) and "actions" in unpacked:
-            return unpacked["actions"]
-        return unpacked
+            raw_server_timing = unpacked.get("server_timing", {})
+            if isinstance(raw_server_timing, dict):
+                server_timing = raw_server_timing
+            self.last_timing = timing
+            self.last_server_timing = server_timing
+            return unpacked["actions"], timing, server_timing
+        self.last_timing = timing
+        self.last_server_timing = server_timing
+        return unpacked, timing, server_timing
 
     @override
     def reset(self, reset_info: Dict) -> None:
-        # Notify server that we're calling the reset endpoint (as opposed to the infer endpoint)
-        reset_info["endpoint"] = "reset"
-
-        data = self._packer.pack(reset_info)
-        self._ws.send(data)
-        response = self._ws.recv()
+        response, _ = self.reset_timed(reset_info)
         return response
+
+    def reset_timed(self, reset_info: Dict) -> tuple[Any, dict[str, float]]:  # noqa: UP006
+        # Notify server that we're calling the reset endpoint (as opposed to the infer endpoint)
+        request = dict(reset_info)
+        request["endpoint"] = "reset"
+
+        request_start = time.perf_counter()
+        data = self._packer.pack(request)
+        send_start = time.perf_counter()
+        self._ws.send(data)
+        send_time = time.perf_counter() - send_start
+        recv_start = time.perf_counter()
+        response = self._ws.recv()
+        recv_time = time.perf_counter() - recv_start
+        timing = {
+            "websocket_send_time": send_time,
+            "websocket_recv_time": recv_time,
+            "request_total_time": time.perf_counter() - request_start,
+        }
+        return response, timing
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

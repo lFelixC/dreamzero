@@ -400,6 +400,8 @@ def load_robotwin_setup_kwargs(task_name: str, task_config: str | None = None) -
     args["head_camera_h"] = camera_config[head_cam]["h"]
     args["head_camera_w"] = camera_config[head_cam]["w"]
     args["render_freq"] = 0
+    args["eval_mode"] = True
+    args["save_data"] = False
     args["task_name"] = task_name
     args["task_config"] = task_config
     return args
@@ -449,6 +451,7 @@ class RoboTwinCompatEnv(gym.Env):
         self._env: Any | None = None
         self._step_count = 0
         self._black_frame = np.zeros((self.observation_height, self.observation_width, 3), dtype=np.uint8)
+        self._last_reset_profile: dict[str, float] = {}
         self.observation_space = spaces.Dict(
             {
                 "pixels": spaces.Dict(
@@ -516,11 +519,23 @@ class RoboTwinCompatEnv(gym.Env):
         actual_seed = self.episode_index if seed is None else seed
         setup_kwargs = load_robotwin_setup_kwargs(self.task_name)
         setup_kwargs.update(seed=actual_seed, is_test=True)
+        reset_started_at = time.perf_counter()
+        setup_start = time.perf_counter()
         with torch.enable_grad():
             self._env.setup_demo(**setup_kwargs)
+        setup_demo_time = time.perf_counter() - setup_start
         self.episode_index += 1
         self._step_count = 0
-        return self._get_obs(), {"is_success": False, "task": self.task_name}
+        obs_start = time.perf_counter()
+        obs = self._get_obs()
+        get_obs_time = time.perf_counter() - obs_start
+        self._last_reset_profile = {
+            "setup_demo_time": setup_demo_time,
+            "get_obs_time": get_obs_time,
+            "env_reset_time": setup_demo_time,
+            "total_time": time.perf_counter() - reset_started_at,
+        }
+        return obs, {"is_success": False, "task": self.task_name}
 
     def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         obs, reward, terminated, truncated, info = robotwin_fast_step(self, action, need_obs=True)
@@ -539,8 +554,20 @@ class RoboTwinCompatEnv(gym.Env):
         self._env = None
 
 
-def make_robotwin_env(task_name: str, episode_index: int, episode_length: int) -> gym.Env:
+def make_robotwin_env(
+    task_name: str,
+    episode_index: int,
+    episode_length: int,
+    *,
+    prefer_compat: bool = True,
+) -> gym.Env:
     ensure_robotwin_workdir()
+    if prefer_compat:
+        return RoboTwinCompatEnv(
+            task_name=task_name,
+            episode_index=episode_index,
+            episode_length=episode_length,
+        )
     try:
         from lerobot.envs.robotwin import RoboTwinEnv
 
@@ -619,6 +646,23 @@ def generate_seen_instruction(task_name: str, episode_info: dict[str, Any], max_
     return str(np.random.choice(results[0]["seen"]))
 
 
+def generate_seen_instruction_deterministic(
+    task_name: str,
+    episode_info: dict[str, Any],
+    *,
+    max_descriptions: int = 100,
+    selection_index: int = 0,
+) -> str:
+    ensure_robotwin_workdir()
+    from description.utils.generate_episode_instructions import generate_episode_descriptions
+
+    results = generate_episode_descriptions(task_name, [episode_info], max_descriptions)
+    if not results or not results[0].get("seen"):
+        raise RuntimeError(f"No RoboTwin seen instructions generated for task={task_name!r}")
+    seen = [str(item) for item in results[0]["seen"]]
+    return seen[int(selection_index) % len(seen)]
+
+
 def set_robotwin_instruction(env: gym.Env, instruction: str) -> None:
     candidates = [env, getattr(env, "unwrapped", None), getattr(env, "_env", None)]
     for candidate in candidates:
@@ -683,12 +727,13 @@ def reset_robotwin_env_with_retries(
     episodes: int,
     episode_length: int,
     reset_retries: int,
+    seed_stride: int | None = None,
     expert_filter: bool = True,
     expert_filter_max_candidates: int = 1000,
 ) -> tuple[gym.Env, int, int, dict[str, Any], dict[str, Any], float, dict[str, Any]]:
     retries = max(int(reset_retries), 0)
     base_seed = seed_start + episode_offset
-    stride = max(int(episodes), 1)
+    stride = max(int(seed_stride if seed_stride is not None else episodes), 1)
     expert_filter_enabled = bool(expert_filter)
     max_candidates = (
         max(int(expert_filter_max_candidates), 1) if expert_filter_enabled else retries + 1
@@ -725,11 +770,24 @@ def reset_robotwin_env_with_retries(
             set_robotwin_eval_step_limit(env, episode_length)
             assert_robotwin_fast_interface(env, strict=True)
             reset_time = time.perf_counter() - reset_start
+            raw_reset_profile = getattr(env, "_last_reset_profile", {}) or {}
+            reset_get_obs_time = float(raw_reset_profile.get("get_obs_time", 0.0))
+            reset_profile = {
+                "total_time": float(raw_reset_profile.get("total_time", reset_time)),
+                "setup_demo_time": float(raw_reset_profile.get("setup_demo_time", 0.0)),
+                "get_obs_time": reset_get_obs_time,
+                "env_reset_time": float(
+                    raw_reset_profile.get("env_reset_time", max(reset_time - reset_get_obs_time, 0.0))
+                ),
+            }
             expert_result.update(
                 {
                     "candidate_index": attempt,
                     "rejected_candidates": expert_rejections,
+                    "base_seed": base_seed,
+                    "seed_stride": stride,
                     "total_time": expert_total_time,
+                    "reset_profile": reset_profile,
                 }
             )
             return env, seed, attempt, obs, info, reset_time, expert_result
@@ -749,6 +807,52 @@ def reset_robotwin_env_with_retries(
             warnings.warn(
                 f"RoboTwin reset for task={task_name!r} seed={seed} was unstable; "
                 f"retrying with a later seed ({attempt + 1}/{retries}).",
+                RuntimeWarning,
+            )
+
+    assert last_error is not None
+    raise last_error
+
+
+def reset_robotwin_env_fixed_seed(
+    *,
+    task_name: str,
+    seed: int,
+    episode_length: int,
+    reset_retries: int,
+) -> tuple[gym.Env, int, dict[str, Any], dict[str, Any], float, dict[str, float]]:
+    retries = max(int(reset_retries), 0)
+    last_error: BaseException | None = None
+
+    for attempt in range(retries + 1):
+        env = make_robotwin_env(task_name, int(seed), episode_length)
+        reset_start = time.perf_counter()
+        try:
+            obs, info = env.reset(seed=int(seed))
+            initialize_robotwin_eval_state(env)
+            set_robotwin_eval_step_limit(env, episode_length)
+            assert_robotwin_fast_interface(env, strict=True)
+            reset_time = time.perf_counter() - reset_start
+            raw_reset_profile = getattr(env, "_last_reset_profile", {}) or {}
+            reset_get_obs_time = float(raw_reset_profile.get("get_obs_time", 0.0))
+            reset_profile = {
+                "total_time": float(raw_reset_profile.get("total_time", reset_time)),
+                "setup_demo_time": float(raw_reset_profile.get("setup_demo_time", 0.0)),
+                "get_obs_time": reset_get_obs_time,
+                "env_reset_time": float(
+                    raw_reset_profile.get("env_reset_time", max(reset_time - reset_get_obs_time, 0.0))
+                ),
+            }
+            return env, attempt, obs, info, reset_time, reset_profile
+        except Exception as exc:
+            last_error = exc
+            with contextlib.suppress(Exception):
+                env.close()
+            if not is_unstable_reset_error(exc) or attempt >= retries:
+                raise
+            warnings.warn(
+                f"RoboTwin fixed-seed reset for task={task_name!r} seed={seed} was unstable; "
+                f"retrying same seed ({attempt + 1}/{retries}).",
                 RuntimeWarning,
             )
 
@@ -849,6 +953,7 @@ class DreamZeroRoboTwinEnv:
         seed_start: int,
         episodes: int,
         reset_retries: int,
+        seed_stride: int | None = None,
         expert_filter: bool = True,
         expert_filter_max_candidates: int = 1000,
     ) -> None:
@@ -856,6 +961,7 @@ class DreamZeroRoboTwinEnv:
         self.episode_length = int(episode_length)
         self.seed_start = int(seed_start)
         self.episodes = int(episodes)
+        self.seed_stride = int(seed_stride) if seed_stride is not None else max(self.episodes, 1)
         self.reset_retries = int(reset_retries)
         self.expert_filter = bool(expert_filter)
         self.expert_filter_max_candidates = int(expert_filter_max_candidates)
@@ -908,6 +1014,7 @@ class DreamZeroRoboTwinEnv:
             episode_offset=int(episode_index),
             seed_start=self.seed_start,
             episodes=self.episodes,
+            seed_stride=self.seed_stride,
             episode_length=self.episode_length,
             reset_retries=self.reset_retries,
             expert_filter=self.expert_filter,
@@ -935,8 +1042,58 @@ class DreamZeroRoboTwinEnv:
             "seed": seed,
             "reset_attempts": reset_attempts,
             "reset_time": reset_time,
+            "reset_profile": expert_filter_info.get("reset_profile", {}),
             "expert_filter": expert_filter_info,
             "prompt": prompt,
+        }
+
+    def reset_fixed_seed(
+        self,
+        *,
+        seed: int,
+        prompt: str,
+        episode_info: dict[str, Any] | None = None,
+        video_path: str | None = None,
+        video_fps: float = 10.0,
+    ) -> dict[str, Any]:
+        self.close()
+        self.video_path = Path(video_path).expanduser().resolve() if video_path else None
+        self.video_fps = float(video_fps or 10.0)
+        self.video_frames = []
+        env, reset_attempts, obs, info, reset_time, reset_profile = reset_robotwin_env_fixed_seed(
+            task_name=self.task_name,
+            seed=int(seed),
+            episode_length=self.episode_length,
+            reset_retries=self.reset_retries,
+        )
+        set_robotwin_instruction(env, prompt)
+
+        self.env = env
+        self.seed = int(seed)
+        self.reset_attempts = int(reset_attempts)
+        self.obs = obs
+        self.info = info
+        self.prompt = str(prompt)
+        self.done = False
+        self._append_video_frame(obs)
+        expert_filter_info = {
+            "enabled": False,
+            "cache_hit": True,
+            "accepted": True,
+            "seed": int(seed),
+            "episode_info": episode_info if isinstance(episode_info, dict) else {},
+            "total_time": 0.0,
+            "reset_profile": reset_profile,
+        }
+        return {
+            "obs": obs,
+            "info": info,
+            "seed": int(seed),
+            "reset_attempts": int(reset_attempts),
+            "reset_time": reset_time,
+            "reset_profile": reset_profile,
+            "expert_filter": expert_filter_info,
+            "prompt": self.prompt,
         }
 
     def set_prompt(self, prompt: str) -> dict[str, Any]:
@@ -954,6 +1111,7 @@ class DreamZeroRoboTwinEnv:
         clip_action: bool = True,
         max_keyframes: int = 9,
     ) -> dict[str, Any]:
+        chunk_start = time.perf_counter()
         if self.env is None:
             raise RuntimeError("step_chunk called before reset")
         if self.done:
@@ -966,6 +1124,7 @@ class DreamZeroRoboTwinEnv:
                 "actions_sent": 0,
                 "env_step_time": 0.0,
                 "get_obs_time": 0.0,
+                "step_chunk_time": time.perf_counter() - chunk_start,
                 "info": self.info,
                 "keyframe_obs": [],
             }
@@ -1037,19 +1196,26 @@ class DreamZeroRoboTwinEnv:
             "actions_sent": actions_sent,
             "env_step_time": env_step_time,
             "get_obs_time": get_obs_time,
+            "step_chunk_time": time.perf_counter() - chunk_start,
             "info": self.info,
             "keyframe_obs": keyframe_obs,
         }
 
     def finish_episode(self) -> dict[str, Any]:
+        finish_start = time.perf_counter()
         frame_count = len(self.video_frames)
         video_path = None
+        video_write_time = 0.0
         if self.video_path is not None and frame_count > 0:
             self.video_path.parent.mkdir(parents=True, exist_ok=True)
+            write_start = time.perf_counter()
             imageio.mimsave(self.video_path.as_posix(), self.video_frames, fps=self.video_fps)
+            video_write_time = time.perf_counter() - write_start
             video_path = self.video_path.as_posix()
         self.video_frames = []
         return {
             "video_path": video_path,
             "video_frames": frame_count,
+            "video_write_time": video_write_time,
+            "finish_episode_time": time.perf_counter() - finish_start,
         }

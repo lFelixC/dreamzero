@@ -79,15 +79,25 @@ def main() -> None:
                     episode_length=int(cmd["episode_length"]),
                     seed_start=int(cmd.get("seed_start", 0)),
                     episodes=int(cmd.get("episodes", 1)),
+                    seed_stride=int(cmd["seed_stride"]) if cmd.get("seed_stride") is not None else None,
                     reset_retries=int(cmd.get("reset_retries", 0)),
                     expert_filter=bool(cmd.get("expert_filter", True)),
                     expert_filter_max_candidates=int(cmd.get("expert_filter_max_candidates", 1000)),
                 )
-                result = runner.reset(
-                    int(cmd["episode_index"]),
-                    video_path=cmd.get("video_path") or None,
-                    video_fps=float(cmd.get("video_fps", 10.0)),
-                )
+                if "fixed_seed" in cmd and "fixed_prompt" in cmd:
+                    result = runner.reset_fixed_seed(
+                        seed=int(cmd["fixed_seed"]),
+                        prompt=str(cmd["fixed_prompt"]),
+                        episode_info=cmd.get("episode_info") if isinstance(cmd.get("episode_info"), dict) else None,
+                        video_path=cmd.get("video_path") or None,
+                        video_fps=float(cmd.get("video_fps", 10.0)),
+                    )
+                else:
+                    result = runner.reset(
+                        int(cmd["episode_index"]),
+                        video_path=cmd.get("video_path") or None,
+                        video_fps=float(cmd.get("video_fps", 10.0)),
+                    )
                 conn.send(ok(type="reset", worker_id=args.worker_id, **result))
                 continue
 

@@ -1,36 +1,45 @@
 # RoboTwin Eval On DreamZero
 
-This directory contains the current RoboTwin evaluation path for DreamZero:
-a DreamZero websocket policy server plus synchronized RoboTwin subprocess
-workers. The recommended local entrypoint is:
+This directory contains the RoboTwin evaluation path for DreamZero. The current
+default is Lingbot-style eval:
+
+- one RoboTwin task is evaluated one episode at a time;
+- every episode has its own expert-filter result, prompt, policy reset,
+  `session_id`, and observation history;
+- `NUM_ENVS=1` is required in Lingbot mode;
+- multi-GPU speedup is task-level parallelism: one task owns one policy server,
+  one port, one master port, one output directory, and one GPU slot.
+
+The recommended local entrypoint is:
 
 ```bash
+cd /data/dreamzero_mot
 bash example/robotwin/run_robotwin_eval.sh
 ```
 
-The launcher starts the policy server, waits for it to become ready, runs the
-RoboTwin controller/workers, writes reports, and stops the server when the run
-finishes.
+The launcher starts the DreamZero websocket policy server, waits for it to
+become ready, runs the RoboTwin controller/worker, writes reports, and stops
+the server when the run finishes.
 
 Assumed local paths:
 
 ```text
-/data/dreamzero                 DreamZero repo
-/data/dreamzero/.venv               DreamZero server Python environment
-/data/envs/robotwin310              RoboTwin client Python environment
-/data/checkpoints/dreamzero         DreamZero checkpoints and eval outputs
+/data/dreamzero_mot                                 DreamZero repo
+/data/dreamzero/.venv                               DreamZero server Python environment
+/data/envs/robotwin310                              RoboTwin client Python environment
+/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000
+                                                    default eval checkpoint
+/data/checkpoints/dreamzero/robotwin_eval_runs      default eval output parent
 ```
 
 ## 1. Install Local Eval Environment
 
-Run this once on the machine that will execute RoboTwin simulation. On a local
-single-machine eval setup, this is the same machine that hosts the DreamZero
-server.
+Run this once on the machine that executes RoboTwin simulation.
 
 ```bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/data/dreamzero}"
+REPO_ROOT="${REPO_ROOT:-/data/dreamzero_mot}"
 ROBOTWIN_ENV="${ROBOTWIN_ENV:-/data/envs/robotwin310}"
 THIRD_PARTY="${REPO_ROOT}/third_party"
 
@@ -73,55 +82,6 @@ python -m pip install \
   "opencv-python-headless==4.11.0.86" "warp-lang==1.0.2"
 ```
 
-If `bash script/_install.sh` fails while installing curobo with
-`CUDA_HOME environment variable is not set`, the container can see the GPU
-driver but does not have the CUDA Toolkit or `nvcc`. Install the matching CUDA
-Toolkit with apt, then resume from curobo only:
-
-```bash
-conda activate /data/envs/robotwin310
-
-python - <<'PY'
-import torch
-
-print("torch:", torch.__version__)
-print("torch cuda:", torch.version.cuda)
-PY
-```
-
-Use the matching toolkit package. For example, if `torch.version.cuda` prints
-`12.1`, install CUDA 12.1:
-
-```bash
-apt-get update
-apt-get install -y wget gnupg ca-certificates build-essential ninja-build
-
-source /etc/os-release
-distro="${ID}${VERSION_ID/./}"
-
-wget "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
-dpkg -i cuda-keyring_1.1-1_all.deb
-
-apt-get update
-apt-get install -y cuda-toolkit-12-1
-
-export CUDA_HOME=/usr/local/cuda-12.1
-export PATH="${CUDA_HOME}/bin:${PATH}"
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-
-which nvcc
-nvcc --version
-```
-
-If `torch.version.cuda` prints `12.4`, use `cuda-toolkit-12-4` and
-`/usr/local/cuda-12.4` instead. After `nvcc` is available, do not rerun the
-whole RoboTwin install script; just finish the curobo editable install:
-
-```bash
-cd /data/dreamzero/third_party/RoboTwin/envs/curobo
-python -m pip install -e . --no-build-isolation
-```
-
 Pinned third-party revisions:
 
 ```text
@@ -129,18 +89,36 @@ LeRobot:  0e6114ac36e23038fafbbcaed89c2917aeb00fc5
 RoboTwin: 0aeea2d669c0f8516f4d5785f0aa33ba812c14b4
 ```
 
-The source clones skip Git LFS smudge because eval only needs code here.
-RoboTwin assets are downloaded explicitly in section 2.
+If `bash script/_install.sh` fails with `CUDA_HOME environment variable is not
+set`, install the CUDA Toolkit matching `torch.version.cuda`, then finish only
+the curobo editable install:
 
-## 2. Download Assets And Check The Client
+```bash
+conda activate /data/envs/robotwin310
+python - <<'PY'
+import torch
+print(torch.version.cuda)
+PY
 
-Download RoboTwin assets on the simulation/client machine. Full assets are
-recommended for normal eval:
+export CUDA_HOME=/usr/local/cuda-12.1
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+
+cd /data/dreamzero_mot/third_party/RoboTwin/envs/curobo
+python -m pip install -e . --no-build-isolation
+```
+
+Use `/usr/local/cuda-12.4` or the matching toolkit if your PyTorch CUDA version
+is not 12.1.
+
+## 2. Download Assets And Check RoboTwin
+
+Download RoboTwin assets on the simulation/client machine:
 
 ```bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/data/dreamzero}"
+REPO_ROOT="${REPO_ROOT:-/data/dreamzero_mot}"
 ROBOTWIN_ROOT="${REPO_ROOT}/third_party/RoboTwin"
 
 cd "${ROBOTWIN_ROOT}"
@@ -159,7 +137,7 @@ Run a client-side import and reset check:
 ```bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/data/dreamzero}"
+REPO_ROOT="${REPO_ROOT:-/data/dreamzero_mot}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
 ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
 
@@ -170,21 +148,13 @@ CUDA_VISIBLE_DEVICES="${CLIENT_GPU:-0}" \
 from example.robotwin.robotwin_fast_env import make_robotwin_env
 
 env = make_robotwin_env("beat_block_hammer", 0, 8)
-obs, info = env.reset(seed=0)
+obs, info = env.reset(seed=10000)
 print(type(env).__name__, sorted(obs["pixels"]), obs["agent_pos"].shape, info)
 env.close()
 PY
 ```
 
-The expected cameras are:
-
-```text
-head_camera
-left_camera
-right_camera
-```
-
-DreamZero maps them as:
+Camera mapping:
 
 ```text
 head_camera  -> video.cam_high
@@ -192,13 +162,9 @@ left_camera  -> video.cam_left
 right_camera -> video.cam_right
 ```
 
-## 3. Run Local Parallel Eval
+## 3. Local Lingbot-Style Eval
 
-Set the checkpoint and GPU layout explicitly. `SERVER_GPU` is used by the
-DreamZero policy server. `CLIENT_GPU` is used by RoboTwin env workers and can
-be a comma-separated list; workers are assigned round-robin.
-
-Verify the DreamZero server environment before a real eval:
+Check the DreamZero server environment:
 
 ```bash
 test -x /data/dreamzero/.venv/bin/python
@@ -206,71 +172,97 @@ test -x /data/dreamzero/.venv/bin/torchrun
 /data/dreamzero/.venv/bin/python - <<'PY'
 import torch
 import websockets
-
 print("dreamzero server env ok", torch.__version__, websockets.__version__)
 PY
 ```
 
-If your server environment lives elsewhere, override `DREAMZERO_PYTHON` and
-`DREAMZERO_TORCHRUN` when launching `run_robotwin_eval.sh`.
-
-List available RoboTwin eval tasks:
+List RoboTwin eval tasks:
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 TASKS=all LIST_TASKS=1 bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Dry-run the env-worker path without launching the policy server:
+Dry-run the env-worker path without launching the policy server. This still
+runs RoboTwin expert filtering and env setup, but sends zero actions:
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
-SERVER_GPU=6,7 CLIENT_GPU=7 \
-TASK=beat_block_hammer NUM_ENVS=1 \
-DRY_RUN_ACTIONS=1 EPISODES=1 EPISODE_LENGTH=8 MAX_STEPS=1 \
+DRY_RUN_ACTIONS=1 \
+TASK=beat_block_hammer \
+EPISODES=2 \
+NUM_ENVS=1 \
+SEED_START=10000 \
+MAX_STEPS=1 \
+EXPERT_FILTER_MAX_CANDIDATES=20 \
+OUTPUT_ROOT=/tmp/dreamzero_robotwin_lingbot_dryrun \
 bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Run a small real local eval:
+Run the checkpoint-30000 smoke used for validating this eval path:
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
-CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin \
-SERVER_GPU=6,7 CLIENT_GPU=7 \
-TASK=beat_block_hammer NUM_ENVS=4 EPISODES=4 \
-SAVE_VIDEO=0 PORT=8100 \
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000 \
+SERVER_GPU=4 \
+CLIENT_GPU=5 \
+SERVER_NPROC=1 \
+TASK=beat_block_hammer \
+EPISODES=2 \
+NUM_ENVS=1 \
+SEED_START=10000 \
+MAX_STEPS=1 \
+MAX_CHUNK_SIZE=8 \
+EXPERT_FILTER_MAX_CANDIDATES=50 \
+SAVE_VIDEO=0 \
+PORT=8100 \
+MASTER_PORT=29610 \
+OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/lingbot_style_ckpt30000_smoke \
 bash example/robotwin/run_robotwin_eval.sh
 ```
 
-Run all RoboTwin eval tasks:
+`MAX_STEPS=1` is only a fast link test. A 0/2 success rate in this smoke is not
+a model-quality signal.
+
+Run one full task with Lingbot semantics:
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
-CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin \
-OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/full_local_eval \
-SERVER_GPU=6,7 CLIENT_GPU=7 \
-TASKS=all NUM_ENVS=8 EPISODES=50 \
-SAVE_VIDEO=0 PORT=8100 \
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000 \
+SERVER_GPU=4 \
+CLIENT_GPU=5 \
+SERVER_NPROC=1 \
+TASK=beat_block_hammer \
+EPISODES=100 \
+NUM_ENVS=1 \
+SEED_START=10000 \
+MAX_STEPS=0 \
+MAX_CHUNK_SIZE=24 \
+SAVE_VIDEO=0 \
+PORT=8100 \
+MASTER_PORT=29610 \
+OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/beat_block_hammer_ckpt30000_lingbot \
 bash example/robotwin/run_robotwin_eval.sh
 ```
 
 Useful launcher variables:
 
 ```text
-CKPT                         checkpoint dir; if it contains checkpoint-10000, that subdir is used
+CKPT                         checkpoint dir; default checkpoint-30000
 OUTPUT_ROOT                  eval output root
 SERVER_GPU                   DreamZero server CUDA_VISIBLE_DEVICES
 SERVER_NPROC                 server process count; defaults to number of SERVER_GPU entries
-CLIENT_GPU                   RoboTwin worker CUDA_VISIBLE_DEVICES list
-NUM_ENVS                     synchronized env worker count
+CLIENT_GPU                   RoboTwin worker CUDA_VISIBLE_DEVICES
+NUM_ENVS                     must be 1 in Lingbot mode
+EVAL_MODE                    lingbot by default; batch keeps the legacy wave evaluator
 TASK                         one RoboTwin task
 TASKS                        comma-separated tasks, or all
-EPISODES                     episodes per task
-SEED_START                   first candidate seed
+EPISODES                     episodes per task; default 100
+SEED_START                   first candidate seed; default 10000
 EPISODE_LENGTH               override task step limit; 0 reads RoboTwin limits
 MAX_STEPS                    max policy requests per episode; 0 derives from episode length
 RESET_RETRIES                RoboTwin reset retry count
@@ -290,128 +282,82 @@ SERVER_TIMEOUT               seconds to wait for server startup
 KEEP_SERVER                  leave the server running when nonzero
 PROFILE                      include detailed controller profile fields when 1
 PROGRESS                     plain, tqdm, or none
-ROBOTWIN_PROGRESS_INTERVAL   seconds between in-wave progress heartbeats
+ROBOTWIN_PROGRESS_INTERVAL   seconds between progress heartbeats
 DREAMZERO_PYTHON             DreamZero Python executable
 DREAMZERO_TORCHRUN           DreamZero torchrun executable
 ROBOTWIN_ENV                 RoboTwin conda env path
 ROBOTWIN_PYTHON              RoboTwin Python executable
 ```
 
-For real policy eval, action chunk length is controlled by `MAX_CHUNK_SIZE`.
-`OPEN_LOOP_HORIZON` only affects zero-action dry runs.
-`ROBOTWIN_TASK_CONFIG=demo_clean` evaluates the clean/easy RoboTwin setting.
-Use `ROBOTWIN_TASK_CONFIG=demo_randomized` for the randomized/hard setting.
+## 4. Task-Level Multi-GPU Eval
 
-Outputs:
+Use task-level parallelism for all-task eval. Each task gets an independent
+`run_robotwin_eval.sh` process and an independent websocket server. Do not
+share one server across multiple concurrent tasks.
 
-```text
-${OUTPUT_ROOT}/run_config.json
-${OUTPUT_ROOT}/timings.json
-${OUTPUT_ROOT}/report.json
-${OUTPUT_ROOT}/report.csv
-${OUTPUT_ROOT}/logs/server_${PORT}.log
-${OUTPUT_ROOT}/logs/env_worker_${WORKER_ID}.log
-${OUTPUT_ROOT}/${TASK}/summary.json
-${OUTPUT_ROOT}/${TASK}/episode_000000.json
+One GPU per server slot:
+
+```bash
+cd /data/dreamzero_mot
+
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000 \
+TASKS=all \
+EPISODES=100 \
+SEED_START=10000 \
+SERVER_GPUS=4,5,6,7 \
+CLIENT_GPUS=4,5,6,7 \
+START_PORT=8200 \
+START_MASTER_PORT=29700 \
+OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/all_tasks_ckpt30000_lingbot \
+bash example/robotwin/run_robotwin_eval_multigpu.sh
 ```
 
-Worker logs are written for `WORKER_ID=0..NUM_ENVS-1`.
-Server-side generated video saving is disabled by default to avoid accumulating
-predicted-video latents on the H200 during long eval runs. Use
-`socket_test_optimized_aloha_x5lite_bimanual.py --save-server-video
---output-root ...` only for small server debugging runs.
+Two GPUs per server slot:
 
-Each episode JSON records reset time, expert-filter time, inference wait time,
-env step time, observation render time, episode wall time, action shapes, seed,
-prompt, success, and error state. Task and global reports include success rate,
-batch infer time, per-env infer time, episode length statistics, sync idle
-steps, and per-client-GPU summaries.
+```bash
+cd /data/dreamzero_mot
 
-Current V1 constraints:
-
-```text
-Tasks run sequentially.
-Within one task, episodes run in fixed-size synchronized waves.
-All entries in one policy batch share the same task and prompt.
-Completed envs stay inactive until the wave ends to preserve temporal-cache batch shape.
-RTC batch, Ray, pipeline overlap, and per-env virtual websocket sessions are out of scope.
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000 \
+TASKS=all \
+EPISODES=100 \
+SEED_START=10000 \
+SERVER_GPU_GROUPS='0,1;2,3' \
+CLIENT_GPU_GROUPS='4;5' \
+START_PORT=8200 \
+START_MASTER_PORT=29700 \
+OUTPUT_ROOT=/data/checkpoints/dreamzero/robotwin_eval_runs/all_tasks_ckpt30000_lingbot_2gpu_server \
+bash example/robotwin/run_robotwin_eval_multigpu.sh
 ```
 
-One wave is one synchronized batch of RoboTwin envs. With `EPISODES=40` and
-`NUM_ENVS=40`, each task has one wave. With `EPISODES=100` and `NUM_ENVS=40`,
-each task has three waves: 40, 40, and 20 episodes. Inside a wave, all active
-envs send one batched policy request per inference step.
-
-Progress logs are written to stderr. `PROGRESS=plain` prints robust SSH-friendly
-lines and periodic "still waiting" heartbeats during long worker reset, expert
-filter, server inference, env step, and video-save phases. `PROGRESS=tqdm`
-uses live bars when `tqdm` is installed and falls back to plain logs otherwise.
-
-Troubleshooting:
+The task-level launcher writes:
 
 ```text
-Docker must expose graphics capabilities for SAPIEN:
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
-
-Check Vulkan:
-  vulkaninfo --summary
-
-If the server does not become ready:
-  tail -120 ${OUTPUT_ROOT}/logs/server_${PORT}.log
-
-If an env worker exits during reset:
-  tail -120 ${OUTPUT_ROOT}/logs/env_worker_${WORKER_ID}.log
-
-If the client reset check prints "Falling back to local RoboTwinEnv
-compatibility wrapper" with a LeRobot Python syntax error:
-  /data/envs/robotwin310/bin/python /data/dreamzero/example/robotwin/patch_lerobot_py310.py \
-    --lerobot-root /data/dreamzero/third_party/lerobot
-
-If a port is already serving an old model:
-  choose a new PORT or stop the old torchrun process.
+${OUTPUT_ROOT}/task_parallel_report.json
+${OUTPUT_ROOT}/logs/pids_*.txt
+${OUTPUT_ROOT}/logs/status_*.txt
+${OUTPUT_ROOT}/000_${TASK}/report.json
+${OUTPUT_ROOT}/000_${TASK}/${TASK}/episode_000000.json
 ```
 
-## 4. Run Remote H200 Server And 4090 Client
+## 5. Direct Remote Server And Client
 
-Use this layout when you want H200 GPUs to serve DreamZero inference and a
-separate 4090 machine to run RoboTwin simulation. Install sections 1 and 2 on
-the 4090 client machine. The H200 machine needs the DreamZero repo,
-`/data/dreamzero/.venv`, and the checkpoint; it does not need the RoboTwin
-simulation environment for serving.
+The local launcher is preferred. Use this only when the policy server and
+RoboTwin simulation run on different machines.
 
-Network requirements:
-
-```text
-The 4090 client must reach the H200 server IP and websocket PORT.
-Use 10GbE or faster if possible; 1GbE works for smoke tests but can bottleneck large batches.
-Keep CLIENT_IMAGE_RESOLUTION=none unless you explicitly want client-side resizing.
-```
-
-Start the policy server on the H200 machine:
+Start one single-session policy server on the inference machine:
 
 ```bash
 set -euo pipefail
 
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
-CKPT="${CKPT:-/data/checkpoints/dreamzero/dreamzero_robotwin}"
-SERVER_GPU="${SERVER_GPU:-0,1}"
-if [[ -z "${SERVER_NPROC:-}" ]]; then
-  SERVER_NPROC="$(python - <<'PY' "${SERVER_GPU}"
-import sys
-
-print(sum(1 for item in sys.argv[1].split(",") if item.strip()))
-PY
-)"
-fi
+CKPT="${CKPT:-/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000}"
+SERVER_GPU="${SERVER_GPU:-0}"
+SERVER_NPROC="${SERVER_NPROC:-1}"
 PORT="${PORT:-8100}"
 MASTER_PORT="${MASTER_PORT:-29610}"
 MAX_CHUNK_SIZE="${MAX_CHUNK_SIZE:-24}"
 SERVER_OUTPUT_ROOT="${SERVER_OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_server_outputs}"
-
-if [[ -d "${CKPT}/checkpoint-10000" && ! -f "${CKPT}/config.json" ]]; then
-  CKPT="${CKPT}/checkpoint-10000"
-fi
 
 CUDA_VISIBLE_DEVICES="${SERVER_GPU}" \
 /data/dreamzero/.venv/bin/torchrun \
@@ -427,109 +373,97 @@ CUDA_VISIBLE_DEVICES="${SERVER_GPU}" \
   --output-root "${SERVER_OUTPUT_ROOT}"
 ```
 
-Do not add `--save-server-video` for normal remote eval. It keeps generated
-video latents on rank 0 until reset and can make H200 memory grow during long
-tasks.
-
-Check from the 4090 machine that the H200 port is reachable:
-
-```bash
-H200_HOST="<H200_IP_OR_HOSTNAME>"
-PORT="${PORT:-8100}"
-
-/data/envs/robotwin310/bin/python - <<'PY' "${H200_HOST}" "${PORT}"
-import socket
-import sys
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-with socket.create_connection((host, port), timeout=10):
-    print(f"reachable: {host}:{port}")
-PY
-```
-
-Run the RoboTwin client/controller on the 4090 machine:
+Run one task from the RoboTwin simulation machine:
 
 ```bash
 set -euo pipefail
 
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 H200_HOST="<H200_IP_OR_HOSTNAME>"
 PORT="${PORT:-8100}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_4090_client}"
-CLIENT_GPU="${CLIENT_GPU:-0,1,2,3,4,5,6,7}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_beat_block_hammer_ckpt30000}"
+CLIENT_GPU="${CLIENT_GPU:-0}"
 ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
 
-PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero/third_party/lerobot/src:/data/dreamzero/third_party/lerobot:${PYTHONPATH:-}" \
+PYTHONPATH="/data/dreamzero_mot:/data/dreamzero_mot/third_party/RoboTwin:/data/dreamzero_mot/third_party/lerobot/src:/data/dreamzero_mot/third_party/lerobot:${PYTHONPATH:-}" \
 "${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
   --remote-host "${H200_HOST}" \
   --remote-port "${PORT}" \
   --tasks "${TASKS:-beat_block_hammer}" \
-  --episodes "${EPISODES:-8}" \
-  --num-envs "${NUM_ENVS:-8}" \
+  --episodes "${EPISODES:-100}" \
+  --num-envs 1 \
+  --eval-mode lingbot \
   --env-cuda "${CLIENT_GPU}" \
   --worker-python "${ROBOTWIN_PYTHON}" \
   --output-dir "${OUTPUT_ROOT}" \
   --task-config "${ROBOTWIN_TASK_CONFIG}" \
   --episode-length "${EPISODE_LENGTH:-0}" \
   --max-steps "${MAX_STEPS:-0}" \
-  --seed-start "${SEED_START:-0}" \
-  --open-loop-horizon "${OPEN_LOOP_HORIZON:-8}" \
+  --seed-start "${SEED_START:-10000}" \
+  --open-loop-horizon "${OPEN_LOOP_HORIZON:-24}" \
   --reset-retries "${RESET_RETRIES:-5}" \
   --expert-filter-max-candidates "${EXPERT_FILTER_MAX_CANDIDATES:-1000}" \
-  --checkpoint-label "dreamzero_robotwin_h200_server" \
+  --checkpoint-label "dreamzero_robotwin_remote_lingbot" \
   --client-image-resolution "${CLIENT_IMAGE_RESOLUTION:-none}" \
   --progress "${PROGRESS:-plain}" \
   --progress-interval "${ROBOTWIN_PROGRESS_INTERVAL:-30}"
 ```
 
-For the full task set from the 4090 client, use the same direct controller
-entrypoint with larger `TASKS`, `EPISODES`, and `NUM_ENVS`:
+For concurrent remote all-task eval, start one server per task slot and use the
+task-level launcher pattern from section 4 on the machine that can start those
+servers. One shared server must not receive interleaved requests from multiple
+RoboTwin tasks.
 
-```bash
-set -euo pipefail
+## 6. Outputs And Troubleshooting
 
-cd /data/dreamzero
-
-H200_HOST="<H200_IP_OR_HOSTNAME>"
-PORT="${PORT:-8100}"
-ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/data/envs/robotwin310/bin/python}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data/checkpoints/dreamzero/robotwin_eval_runs/remote_full_eval}"
-CLIENT_GPU="${CLIENT_GPU:-0,1,2,3,4,5,6,7}"
-ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-demo_clean}"
-
-PYTHONPATH="/data/dreamzero:/data/dreamzero/third_party/RoboTwin:/data/dreamzero/third_party/lerobot/src:/data/dreamzero/third_party/lerobot:${PYTHONPATH:-}" \
-"${ROBOTWIN_PYTHON}" example/robotwin/parallel_eval.py \
-  --remote-host "${H200_HOST}" \
-  --remote-port "${PORT}" \
-  --tasks all \
-  --episodes "${EPISODES:-50}" \
-  --num-envs "${NUM_ENVS:-16}" \
-  --env-cuda "${CLIENT_GPU}" \
-  --worker-python "${ROBOTWIN_PYTHON}" \
-  --output-dir "${OUTPUT_ROOT}" \
-  --task-config "${ROBOTWIN_TASK_CONFIG}" \
-  --episode-length "${EPISODE_LENGTH:-0}" \
-  --max-steps "${MAX_STEPS:-0}" \
-  --seed-start "${SEED_START:-0}" \
-  --open-loop-horizon "${OPEN_LOOP_HORIZON:-8}" \
-  --reset-retries "${RESET_RETRIES:-5}" \
-  --expert-filter-max-candidates "${EXPERT_FILTER_MAX_CANDIDATES:-1000}" \
-  --checkpoint-label "dreamzero_robotwin_h200_server" \
-  --client-image-resolution "${CLIENT_IMAGE_RESOLUTION:-none}" \
-  --progress "${PROGRESS:-plain}" \
-  --progress-interval "${ROBOTWIN_PROGRESS_INTERVAL:-30}"
-```
-
-Remote tuning notes:
+Outputs:
 
 ```text
-Start with NUM_ENVS=8, then try 16/24/32 while watching H200 utilization and network throughput.
-Use CLIENT_GPU=0,1,2,3,4,5,6,7 on an 8-card 4090 node.
-Use PROGRESS=plain for robust SSH logs, or PROGRESS=tqdm if tqdm is installed and you want live bars.
-Add --save-video only for small debugging runs; video writing can dominate client-side time.
-If the H200 server throws an internal websocket error, keep the server log open and restart the server before rerunning.
-If the 4090 client disconnects after a long infer call, check network stability and websocket reachability first.
+${OUTPUT_ROOT}/run_config.json
+${OUTPUT_ROOT}/timings.json
+${OUTPUT_ROOT}/report.json
+${OUTPUT_ROOT}/report.csv
+${OUTPUT_ROOT}/logs/server_${PORT}.log
+${OUTPUT_ROOT}/logs/env_worker_0.log
+${OUTPUT_ROOT}/${TASK}/summary.json
+${OUTPUT_ROOT}/${TASK}/episode_000000.json
+```
+
+Each episode JSON records seed, prompt, session id, action shapes, success,
+expert-filter time, inference wait time, env step time, observation render
+time, and episode wall time. In Lingbot mode, `avg_wave_batch_size` should be
+`1.0`.
+
+Troubleshooting:
+
+```text
+Docker must expose graphics capabilities for SAPIEN:
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+Check Vulkan:
+  vulkaninfo --summary
+
+If the server does not become ready:
+  tail -120 ${OUTPUT_ROOT}/logs/server_${PORT}.log
+
+If an env worker exits during reset:
+  tail -120 ${OUTPUT_ROOT}/logs/env_worker_0.log
+
+If NUM_ENVS>1 fails:
+  This is expected in Lingbot mode. Use task-level parallelism instead.
+
+If a port is already serving an old model:
+  choose a new PORT or stop the old torchrun process.
+```
+
+Current Lingbot-style constraints:
+
+```text
+One task process owns one active policy server session.
+Episodes are serial within each task.
+NUM_ENVS must be 1.
+Task-level parallelism requires independent ports and output directories.
+Legacy synchronized-wave batch eval is still available only with EVAL_MODE=batch.
 ```

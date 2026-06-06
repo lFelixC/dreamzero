@@ -238,6 +238,7 @@ def collate(
                     key in {"action", "action_mask", "lapa_action", "lapa_action_mask"}
                     and max_chunk_size is not None
                     and num_action_per_block is not None
+                    and not all(value.shape[0] == 0 for value in values)
                 ):
                     target_shape = (max_chunk_size * num_action_per_block, *values[0].shape[1:])
                 elif (
@@ -338,6 +339,10 @@ class DreamTransform(InvertibleModalityTransform):
     state_horizon: int
     action_horizon: int
     num_views: int = 3
+    video_only: bool = Field(
+        default=False,
+        description="If True, keep action tensors empty so only video dynamics loss is trained.",
+    )
     droid_random_drop_exterior_view_prob: float = Field(
         default=0.0,
         ge=0.0,
@@ -636,6 +641,11 @@ class DreamTransform(InvertibleModalityTransform):
 
         return actions, actions_mask, n_action_tokens
 
+    def _prepare_empty_action(self):
+        actions = np.zeros((0, self.max_action_dim), dtype=np.float32)
+        actions_mask = np.zeros((0, self.max_action_dim), dtype=bool)
+        return actions, actions_mask, 0
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
@@ -651,7 +661,16 @@ class DreamTransform(InvertibleModalityTransform):
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
 
-        has_action_supervision = self.training or "action" in data
+        has_action_supervision = (not self.video_only) and (self.training or "action" in data)
+        if self.video_only:
+            transformed_data["segmentation_target"] = np.zeros((2,))
+            transformed_data["segmentation_target_mask"] = np.zeros((1,))
+            transformed_data["has_real_action"] = np.zeros((), dtype=bool)
+            actions, actions_mask, _ = self._prepare_empty_action()
+            transformed_data["action"] = actions
+            transformed_data["action_mask"] = actions_mask
+            transformed_data["lapa_action"] = np.zeros_like(transformed_data["action"])
+            transformed_data["lapa_action_mask"] = np.zeros_like(transformed_data["action_mask"])
         if has_action_supervision:
             # 3) Prepare actions. Validation loss uses the same supervised
             # video/action denoising path as training, so eval samples with
@@ -693,7 +712,7 @@ class DreamTransform(InvertibleModalityTransform):
         else:
             transformed_data["is_cotrain_instance"] = np.zeros((), dtype=bool)
 
-        if is_dream_instance:
+        if (not self.video_only) and is_dream_instance:
             assert "dream_actions" in data
             transformed_data["embodiment_id"] = self.embodiment_tag_mapping["dream"]
             transformed_data["state"] = np.zeros_like(transformed_data["state"])
@@ -709,7 +728,7 @@ class DreamTransform(InvertibleModalityTransform):
             ), f"dream_actions size {dream_actions.size} does not match action shape {actions_shape}"
             transformed_data["action"] = dream_actions.reshape(actions_shape)
 
-        if is_lapa_instance:
+        if (not self.video_only) and is_lapa_instance:
             assert "lapa_action" in data
             transformed_data["has_real_action"] = np.ones((), dtype=bool)
             transformed_data["has_lapa_action"] = np.zeros((), dtype=bool)
@@ -730,7 +749,7 @@ class DreamTransform(InvertibleModalityTransform):
             transformed_data["action"] = reshaped_lapa_actions
             transformed_data["action_mask"] = np.ones(actions_shape, dtype=bool)
 
-        if has_action_supervision:
+        if has_action_supervision or self.video_only:
             action_and_mask_keys = ["action", "action_mask", "lapa_action", "lapa_action_mask"]
             assert all(
                 transformed_data[key].shape == transformed_data["action"].shape

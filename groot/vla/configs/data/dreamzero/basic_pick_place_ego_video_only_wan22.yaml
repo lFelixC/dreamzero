@@ -1,0 +1,123 @@
+# @package _global_
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_
+
+# Ego-only human video pretraining data. The converted dataset contains:
+#   video.ego
+#   annotation.task
+# and intentionally has no state/action supervision.
+
+image_resolution_width: 320
+image_resolution_height: 160
+num_views: 1
+video_only: true
+num_frames: 33
+action_horizon: 24
+state_horizon: 1
+num_frame_per_block: 2
+num_action_per_block: 24
+num_state_per_block: 1
+frame_seqlen: 50
+
+max_state_dim: 64
+use_global_metadata: false
+relative_action: false
+relative_action_per_horizon: false
+relative_action_keys: null
+max_chunk_size: 4
+dataset_shard_sampling_rate: 0.1
+dataset_shard_sampling_strategy: block
+dataset_shard_sampling_block_size: 64
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+ego_data_root: ???
+episode_filter_path: null
+
+modality_config_mecka_hands:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.ego
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_mecka_hands:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    - _target_: groot.vla.data.transform.VideoToTensor
+      apply_to: ${modality_config_mecka_hands.video.modality_keys}
+    - _target_: groot.vla.data.transform.VideoResize
+      apply_to: ${modality_config_mecka_hands.video.modality_keys}
+      height: ${image_resolution_height}
+      width: ${image_resolution_width}
+      interpolation: linear
+    - _target_: groot.vla.data.transform.VideoColorJitter
+      apply_to: ${modality_config_mecka_hands.video.modality_keys}
+      brightness: 0.3
+      contrast: 0.4
+      saturation: 0.5
+      hue: 0.08
+    - _target_: groot.vla.data.transform.VideoToNumpy
+      apply_to: ${modality_config_mecka_hands.video.modality_keys}
+
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_mecka_hands.video.modality_keys}
+
+    - ${model_specific_transform}
+
+modality_configs:
+  mecka_hands: ${modality_config_mecka_hands}
+
+transforms:
+  mecka_hands: ${transform_mecka_hands}
+
+metadata_versions:
+  mecka_hands: '0221'
+
+fps:
+  mecka_hands: 30
+
+data_collator:
+  num_frames: ${num_frames}
+  max_chunk_size: ${max_chunk_size}
+  num_action_per_block: ${num_action_per_block}
+  num_state_per_block: ${num_state_per_block}
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        mecka_hands:
+          - ${ego_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+    episode_filter_path: ${episode_filter_path}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}
+    shard_sampling_strategy: ${dataset_shard_sampling_strategy}
+    shard_sampling_block_size: ${dataset_shard_sampling_block_size}

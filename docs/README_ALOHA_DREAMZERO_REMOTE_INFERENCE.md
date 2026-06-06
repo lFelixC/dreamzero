@@ -2,24 +2,24 @@
 
 这份说明对应 ALOHA 机械臂侧的 DreamZero client/server 入口：
 
-- server: `/data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py`
+- server: `/data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py`
 
 - shell: `/data/aloha_agilex_arx5/tools/inference_dreamzero_aloha_sync.sh`
 - python: `/data/aloha_agilex_arx5/python/examples/X5lite_old/inference_dreamzero_aloha_sync.py`
 
 后端切换和 `torch.compile` 启动 recipe 见：
 
-- `/data/dreamzero/docs/README_INFERENCE_BACKENDS.md`
+- `/data/dreamzero_mot/docs/README_INFERENCE_BACKENDS.md`
 
 ## 0. 先起 DreamZero server
 
 单卡最简单的启动方式：
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 torchrun --standalone --nproc_per_node 1 \
-  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  /data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000
 ```
@@ -27,10 +27,10 @@ torchrun --standalone --nproc_per_node 1 \
 如果需要多卡挂模型，把 `--nproc_per_node 1` 改成实际卡数即可，例如：
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 torchrun --standalone --nproc_per_node 8 \
-  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  /data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000
 ```
@@ -40,13 +40,13 @@ torchrun --standalone --nproc_per_node 8 \
 `FA2 + 不使用 torch.compile`：
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \
 DISABLE_TORCH_COMPILE=true \
 torchrun --standalone --nproc_per_node 2 \
-  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  /data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000 \
   --enable-dit-cache
@@ -55,14 +55,14 @@ torchrun --standalone --nproc_per_node 2 \
 `TE + 不使用 torch.compile`：
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=TE \
 DISABLE_TORCH_COMPILE=true \
 LD_LIBRARY_PATH=/data/dreamzero/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-} \
 torchrun --standalone --nproc_per_node 2 \
-  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  /data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000 \
   --enable-dit-cache
@@ -71,14 +71,14 @@ torchrun --standalone --nproc_per_node 2 \
 `开启 torch.compile`：
 
 ```bash
-cd /data/dreamzero
+cd /data/dreamzero_mot
 
 CUDA_VISIBLE_DEVICES=0,1 \
 ATTENTION_BACKEND=FA2 \
 DISABLE_TORCH_COMPILE=false \
 TORCH_COMPILE_BACKEND=cudagraphs \
 torchrun --standalone --nproc_per_node 2 \
-  /data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py \
+  /data/dreamzero_mot/socket_test_optimized_aloha_x5lite_bimanual.py \
   --model_path /path/to/your/checkpoint_dir \
   --port 8000 \
   --enable-dit-cache
@@ -97,7 +97,7 @@ torchrun --standalone --nproc_per_node 2 \
 - 接收双臂状态：`state.left_* / state.right_*`
 - 输出和 ALOHA client 对齐的 `14D absolute action`
 - 默认把生成视频保存到 `{model_path}` 同级目录下的 `real_world_eval_gen_{YYYYMMDD}_{index}/{checkpoint_name}/`
-- 如果想改保存根目录，可额外传 `--output_root /path/to/save_root`；如果想区分多次运行，可传 `--index N`
+- 如果想改保存根目录，可额外传 `--output-root /path/to/save_root`；如果想区分多次运行，可传 `--index N`
 
 ## 1. 再做 SSH 端口转发
 

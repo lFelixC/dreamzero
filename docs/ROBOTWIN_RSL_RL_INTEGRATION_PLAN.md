@@ -386,9 +386,15 @@ RoboTwin env dry-run：
 ```bash
 cd /data/dreamzero_mot
 
-DRY_RUN_ACTIONS=1 TASKS=beat_block_hammer EPISODES=1 NUM_ENVS=1 \
-ENV_CUDA=0 SAVE_VIDEO=0 \
-bash example/robotwin/run_parallel_eval.sh
+DRY_RUN_ACTIONS=1 \
+TASK=beat_block_hammer \
+EPISODES=1 \
+NUM_ENVS=1 \
+SEED_START=10000 \
+MAX_STEPS=1 \
+CLIENT_GPU=0 \
+SAVE_VIDEO=0 \
+bash example/robotwin/run_robotwin_eval.sh
 ```
 
 Frozen SFT baseline eval：
@@ -396,10 +402,19 @@ Frozen SFT baseline eval：
 ```bash
 cd /data/dreamzero_mot
 
-TASKS=beat_block_hammer EPISODES=4 NUM_ENVS=2 \
-SERVER_CUDA=6,7 SERVER_NPROC=2 ENV_CUDA=0,1 \
-OPEN_LOOP_HORIZON=8 SAVE_VIDEO=0 PORT=8100 \
-bash example/robotwin/run_parallel_eval.sh
+CKPT=/data/checkpoints/dreamzero/dreamzero_robotwin/checkpoint-30000 \
+TASK=beat_block_hammer \
+EPISODES=4 \
+NUM_ENVS=1 \
+SEED_START=10000 \
+SERVER_GPU=6,7 \
+SERVER_NPROC=2 \
+CLIENT_GPU=0 \
+MAX_STEPS=0 \
+MAX_CHUNK_SIZE=24 \
+SAVE_VIDEO=0 \
+PORT=8100 \
+bash example/robotwin/run_robotwin_eval.sh
 ```
 
 RL one-iteration smoke command should be added after `robotwin_rsl_train.py` lands.
