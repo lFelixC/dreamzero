@@ -105,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-start", type=int, default=env_int("SEED_START", 10000))
     parser.add_argument("--max-candidates", type=int, default=env_int("CACHE_MAX_CANDIDATES", 200000))
     parser.add_argument("--max-descriptions", type=int, default=env_int("CACHE_MAX_DESCRIPTIONS", 100))
+    parser.add_argument("--task-workers", type=int, default=env_int("CACHE_TASK_WORKERS", 1))
     parser.add_argument("--num-workers", type=int, default=env_int("CACHE_NUM_WORKERS", 1))
     parser.add_argument("--prefetch-window", type=int, default=env_int("CACHE_PREFETCH_WINDOW", 0))
     parser.add_argument("--worker-gpus", default=os.environ.get("CACHE_WORKER_GPUS", ""))
@@ -157,6 +158,23 @@ def parse_worker_gpus(raw: str) -> list[str]:
         return []
     separator = ";" if ";" in value else ","
     return [item.strip() for item in value.split(separator) if item.strip()]
+
+
+def format_worker_gpus(values: list[str]) -> str:
+    if not values:
+        return ""
+    separator = ";" if any("," in value for value in values) else ","
+    return separator.join(values)
+
+
+def task_gpu_assignments(worker_gpus: list[str], task_count: int, task_workers: int) -> list[list[str]]:
+    if not worker_gpus:
+        return [[] for _ in range(task_count)]
+    active_task_workers = max(min(int(task_workers), int(task_count)), 1)
+    buckets = [[] for _ in range(active_task_workers)]
+    for index, gpu in enumerate(worker_gpus):
+        buckets[index % active_task_workers].append(gpu)
+    return [buckets[index % active_task_workers] for index in range(task_count)]
 
 
 def make_cache_row(
@@ -530,18 +548,66 @@ def build_task_cache(args: argparse.Namespace, *, task: str) -> dict[str, Any]:
     return {"task": task, "path": cache_path.as_posix(), "rows": len(rows), "generated": generated}
 
 
+def build_task_cache_for_parallel(payload: dict[str, Any]) -> dict[str, Any]:
+    args = argparse.Namespace(**payload["args"])
+    status_jsonl = args.status_jsonl
+    if status_jsonl:
+        args.status_jsonl = Path(status_jsonl)
+    args.cache_root = Path(args.cache_root)
+    os.environ[ROBOTWIN_TASK_CONFIG_ENV] = str(args.task_config)
+    return build_task_cache(args, task=str(payload["task"]))
+
+
 def main() -> None:
     args = parse_args()
     if args.episodes_per_task <= 0:
         raise ValueError("--episodes-per-task must be positive")
     if args.max_candidates <= 0:
         raise ValueError("--max-candidates must be positive")
+    if args.task_workers <= 0:
+        raise ValueError("--task-workers must be positive")
+    if args.num_workers <= 0:
+        raise ValueError("--num-workers must be positive")
     os.environ[ROBOTWIN_TASK_CONFIG_ENV] = str(args.task_config)
     args.cache_root = args.cache_root.expanduser().resolve()
     if args.status_jsonl is not None:
         args.status_jsonl = args.status_jsonl.expanduser().resolve()
     tasks = parse_tasks(args.tasks)
-    summaries = [build_task_cache(args, task=task) for task in tasks]
+    task_workers = min(max(int(args.task_workers), 1), len(tasks))
+    if task_workers <= 1:
+        summaries = [build_task_cache(args, task=task) for task in tasks]
+    else:
+        worker_gpus = parse_worker_gpus(args.worker_gpus)
+        assignments = task_gpu_assignments(worker_gpus, len(tasks), task_workers)
+        args_payload_base = {
+            key: (value.as_posix() if isinstance(value, Path) else value)
+            for key, value in vars(args).items()
+        }
+        append_status(
+            args.status_jsonl,
+            "task_parallel_start",
+            tasks=len(tasks),
+            task_workers=task_workers,
+            seed_workers_per_task=args.num_workers,
+            worker_gpus=worker_gpus,
+        )
+        mp_context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=task_workers, mp_context=mp_context) as executor:
+            futures: dict[concurrent.futures.Future, int] = {}
+            for index, task in enumerate(tasks):
+                payload_args = dict(args_payload_base)
+                payload_args["worker_gpus"] = format_worker_gpus(assignments[index])
+                if args.status_jsonl is not None:
+                    payload_args["status_jsonl"] = (
+                        args.status_jsonl.parent / f"{args.status_jsonl.stem}.{index:03d}_{task}{args.status_jsonl.suffix}"
+                    ).as_posix()
+                payload = {"task": task, "args": payload_args}
+                futures[executor.submit(build_task_cache_for_parallel, payload)] = index
+            summaries_by_index: dict[int, dict[str, Any]] = {}
+            for future in concurrent.futures.as_completed(futures):
+                index = futures[future]
+                summaries_by_index[index] = future.result()
+            summaries = [summaries_by_index[index] for index in range(len(tasks))]
     done = {
         "mode": "robotwin_expert_seed_cache",
         "task_config": args.task_config,
