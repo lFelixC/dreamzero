@@ -446,6 +446,7 @@ class BaseSampler(Sampler):
 
 
 class BaseTrainer(transformers.Trainer):
+    BACKBONE_GRAD_CLIP_NORM = 1.0
 
     def __init__(self, **kwargs):
         # Increase the cache size limit for torch._dynamo to
@@ -497,6 +498,10 @@ class BaseTrainer(transformers.Trainer):
                 os.environ["DREAMZERO_LOSS_GRAD_LOGGING_STEPS"],
                 default=self.loss_grad_logging_steps,
             )
+        self.action_expert_weight_decay = self._coerce_optional_nonnegative_float(
+            kwargs.pop("action_expert_weight_decay", None),
+            name="action_expert_weight_decay",
+        )
         self.dataloader_in_order = self._coerce_bool(
             kwargs.pop("dataloader_in_order", True)
         )
@@ -542,11 +547,13 @@ class BaseTrainer(transformers.Trainer):
 
         super().__init__(**kwargs)
         self._install_backward_nvtx_wrapper()
+        self._install_backbone_grad_clip_wrapper()
 
         self.loss_queues = {}
         self.loss_queue_size = 10
         self._eval_loss_sums = {}
         self._eval_loss_count = 0
+        self._backbone_grad_clip_logged = False
 
     @staticmethod
     def _loss_aliases(outputs) -> dict[str, float]:
@@ -592,12 +599,30 @@ class BaseTrainer(transformers.Trainer):
         return max(value, 1)
 
     @staticmethod
+    def _coerce_optional_nonnegative_float(value, *, name: str) -> float | None:
+        if value is None or value == "null":
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a non-negative float or null, got {value!r}") from exc
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {value}")
+        return value
+
+    @staticmethod
     def _is_mot_action_branch_param(name: str) -> bool:
         return name.startswith("action_expert.") or ".action_expert." in name
 
     @staticmethod
     def _is_action_head_diffusion_param(name: str) -> bool:
         return name.startswith("action_head.model.") or ".action_head.model." in name
+
+    def _is_backbone_grad_clip_param(self, name: str) -> bool:
+        # In DreamZero MoT, the trainable "backbone" is the video diffusion branch.
+        if self._is_action_head_diffusion_param(name):
+            return not self._is_mot_action_branch_param(name)
+        return name.startswith("backbone.") or ".backbone." in name
 
     @staticmethod
     def _grad_norm_sq(grads, *, device: torch.device) -> torch.Tensor:
@@ -887,6 +912,47 @@ class BaseTrainer(transformers.Trainer):
         wrapped_backward._dreamzero_nvtx_wrapped = True
         self.accelerator.backward = wrapped_backward
 
+    def _backbone_grad_clip_parameters(self) -> list[torch.nn.Parameter]:
+        model = getattr(self, "model_wrapped", None) or self.model
+        root_model = self._grad_metric_root_model(model)
+        return [
+            param
+            for name, param in root_model.named_parameters()
+            if (
+                param.requires_grad
+                and param.grad is not None
+                and self._is_backbone_grad_clip_param(name)
+            )
+        ]
+
+    def _clip_backbone_grad_norm(self) -> None:
+        params = self._backbone_grad_clip_parameters()
+        if not params:
+            return
+        if self.global_rank == 0 and not self._backbone_grad_clip_logged:
+            print(
+                "Clipping DreamZero backbone gradients with "
+                f"max_norm={self.BACKBONE_GRAD_CLIP_NORM}"
+            )
+            self._backbone_grad_clip_logged = True
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=self.BACKBONE_GRAD_CLIP_NORM,
+            norm_type=2,
+        )
+
+    def _install_backbone_grad_clip_wrapper(self) -> None:
+        original_on_pre_optimizer_step = self.callback_handler.on_pre_optimizer_step
+        if getattr(original_on_pre_optimizer_step, "_dreamzero_backbone_clip_wrapped", False):
+            return
+
+        def wrapped_on_pre_optimizer_step(args, state, control, **kwargs):
+            self._clip_backbone_grad_norm()
+            return original_on_pre_optimizer_step(args, state, control, **kwargs)
+
+        wrapped_on_pre_optimizer_step._dreamzero_backbone_clip_wrapped = True
+        self.callback_handler.on_pre_optimizer_step = wrapped_on_pre_optimizer_step
+
     def _timing_sync(self) -> None:
         if self.timing_debug and self.timing_sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1148,23 +1214,66 @@ class BaseTrainer(transformers.Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            action_expert_weight_decay = self.action_expert_weight_decay
+            named_parameters = [
+                (name, param)
+                for name, param in opt_model.named_parameters()
+                if param.requires_grad
+            ]
+            if action_expert_weight_decay is None:
+                optimizer_grouped_parameters = [
+                    {
+                        "params": [
+                            p
+                            for n, p in named_parameters
+                            if n in decay_parameters
+                        ],
+                        "weight_decay": self.args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in named_parameters
+                            if n not in decay_parameters
+                        ],
+                        "weight_decay": 0.0,
+                    },
+                ]
+            else:
+                optimizer_grouped_parameters = [
+                    {
+                        "params": [
+                            p
+                            for n, p in named_parameters
+                            if n in decay_parameters and not self._is_mot_action_branch_param(n)
+                        ],
+                        "weight_decay": self.args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in named_parameters
+                            if n in decay_parameters and self._is_mot_action_branch_param(n)
+                        ],
+                        "weight_decay": action_expert_weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in named_parameters
+                            if n not in decay_parameters
+                        ],
+                        "weight_decay": 0.0,
+                    },
+                ]
+                if self.global_rank == 0:
+                    print(
+                        "Using action_expert_weight_decay="
+                        f"{action_expert_weight_decay:g}; other decay parameters keep "
+                        f"weight_decay={self.args.weight_decay:g}"
+                    )
             optimizer_grouped_parameters = [
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
+                group for group in optimizer_grouped_parameters if group["params"]
             ]
 
             optimizer_cls, optimizer_kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(

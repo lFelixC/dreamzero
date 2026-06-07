@@ -26,6 +26,7 @@ trainer:
   dataloader_in_order: true                   # keep PyTorch DataLoader FIFO ordering; false avoids slow-worker head-of-line stalls
   track_loss_grad: false                      # log rank-local per-loss grad norms/cosines for joint and MoT WAMs
   loss_grad_logging_steps: 10                 # interval for the extra autograd.grad probes
+  action_expert_weight_decay: null            # optional AdamW weight decay for MoT action_expert decay parameters only
   # Legacy per-step profiling (profiles every N steps)
   enable_profiling: false                     # (legacy) enable per-step profiling in training_step
   profiling_steps: 5                          # (legacy) profile every N steps
