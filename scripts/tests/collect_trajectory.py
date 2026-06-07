@@ -4,7 +4,7 @@ from droid.trajectory_utils.misc import collect_trajectory
 
 # Make the robot env
 env = RobotEnv()
-controller = VRPolicy()
+# controller = VRPolicy()
 
 print("Ready")
-collect_trajectory(env, controller=controller)
+# collect_trajectory(env, controller=controller)

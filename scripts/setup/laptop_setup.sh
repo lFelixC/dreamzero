@@ -174,15 +174,15 @@ select interface_name in $interfaces; do
     fi
 done
 
-echo "You've selected: $interface_name"
+# echo "You've selected: $interface_name"
 
-# Add and configure the static IP connection
-nmcli connection delete "laptop_static"
-nmcli connection add con-name "laptop_static" ifname "$interface_name" type ethernet
-nmcli connection modify "laptop_static" ipv4.method manual ipv4.address $LAPTOP_IP/24
-nmcli connection up "laptop_static"
+# # Add and configure the static IP connection
+# nmcli connection delete "laptop_static"
+# nmcli connection add con-name "laptop_static" ifname "$interface_name" type ethernet
+# nmcli connection modify "laptop_static" ipv4.method manual ipv4.address $LAPTOP_IP/24
+# nmcli connection up "laptop_static"
 
-echo "Static IP configuration complete for interface $interface_name."
+# echo "Static IP configuration complete for interface $interface_name."
 
 # run docker container
 read -p "Please plug in and out each camera connected via usb and press enter once done?: " _

@@ -827,7 +827,8 @@ def main(args: Args) -> None:
 
     while True:
         # instruction = input("Enter instruction: ")
-        instruction = "pick blue cube into cup."
+        # instruction = "pick blue cube onto green cube"
+        instruction = "pick blue cube into red box."
         # instruction = "press the black button."
         # instruction = "Erase the whiteboard with a whiteboard eraser."
         episode_session_id = policy_client.session_id

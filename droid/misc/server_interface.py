@@ -27,7 +27,7 @@ class ServerInterface:
 
         if launch:
             func_list = [self.launch_controller, self.launch_robot]
-            attempt_n_times(func_list, max_attempts=2)
+            attempt_n_times(func_list, max_attempts=3)
 
     def establish_connection(self):
         self.server = zerorpc.Client(heartbeat=20)
