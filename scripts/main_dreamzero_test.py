@@ -249,8 +249,17 @@ class DreamZeroRealPolicyClient:
                 f"{self._control_frequency}Hz differs from DROID training fps "
                 f"{DROID_TRAINING_FPS}Hz; temporal duration will not match training."
             )
-        self._use_rtc = use_rtc
-        self._enable_async_prefetch = bool(enable_async_prefetch)
+        cache_order_sensitive = bool(getattr(self._server_config, "cache_order_sensitive", False))
+        if cache_order_sensitive and use_rtc:
+            print(
+                "Warning: server reports cache-order-sensitive DreamZero inference; disabling RTC for this client."
+            )
+        if cache_order_sensitive and enable_async_prefetch:
+            print(
+                "Warning: server reports cache-order-sensitive DreamZero inference; disabling async prefetch for this client."
+            )
+        self._use_rtc = bool(use_rtc) and not cache_order_sensitive
+        self._enable_async_prefetch = bool(enable_async_prefetch) and not cache_order_sensitive
         self._rtc_inference_delay_steps = max(int(rtc_inference_delay_steps), 0)
         self._rtc_use_measured_delay = rtc_use_measured_delay
         self._rtc_handoff_joint_blend = float(np.clip(rtc_handoff_joint_blend, 0.0, 1.0))
