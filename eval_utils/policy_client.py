@@ -14,14 +14,13 @@ from typing_extensions import override
 from eval_utils.base_policy import BasePolicy
 from eval_utils import msgpack_numpy
 
-# The websockets library by default sends a ping every 20 seconds and
-# expects a pong response within 20 seconds. However, the sever may not
-# send a pong response immediately if it is busy processing a request.
-# Increase the ping interval and timeout so that the client can wait
-# for a longer time before closing the connection.
+# The policy server handles inference synchronously, so it may be unable to
+# respond to keepalive pings during a long first forward / compile. Disable
+# client pings by default; the blocking recv is the liveness signal we care
+# about for eval.
 OPEN_TIMEOUT_SECS = 0
-PING_INTERVAL_SECS = 60
-PING_TIMEOUT_SECS = 600
+PING_INTERVAL_SECS = None
+PING_TIMEOUT_SECS = None
 
 
 def _normalize_timeout(timeout_seconds: float | None) -> float | None:
