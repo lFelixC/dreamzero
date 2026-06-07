@@ -4,7 +4,7 @@
 
 ## 架构概览
 
-DreamZero MoT 是一个 video/action 双 expert 架构：
+DreamZero MoT（Mixture of Transformers）是一个 video/action 双 expert 架构：
 
 - `architecture=joint` 保留原始共享 `CausalWanModel` baseline。
 - `architecture=mot` 使用 `MoTCausalWanModel`，保留 Wan video expert，并新增独立 action expert。
