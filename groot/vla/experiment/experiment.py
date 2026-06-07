@@ -127,7 +127,7 @@ def main(cfg):
     # Automatically update action dim and action horizon keys if specified in the config
     cfg = apply_action_overrides(cfg)
 
-    experiment = VLAExperiment(cfg)
+    experiment = VLAExperiment(cfg)  #构建模型和数据集
     experiment.train()
 
 

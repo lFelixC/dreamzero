@@ -123,7 +123,8 @@ action_head_cfg:
 
     action_dim: ${max_action_dim}
     action_horizon: ${action_horizon}
-    num_inference_timesteps: 4  # not used during training
+    num_inference_timesteps: 4  # legacy field; not used by DreamZero causal inference
+    num_inference_steps: 4
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
     noise_s: 0.999

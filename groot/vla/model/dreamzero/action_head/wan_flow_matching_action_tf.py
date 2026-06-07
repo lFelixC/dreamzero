@@ -147,6 +147,10 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=None,
         metadata={"help": "Number of inference steps for noise diffusion."},
     )
+    num_inference_steps: int = field(
+        default=4,
+        metadata={"help": "Number of causal inference denoising steps."},
+    )
     max_num_embodiments: int = field(default=32, metadata={"help": "Number of embodiments."})
     tune_projector: bool = field(default=True, metadata={"help": "Whether to tune the projector."})
     tune_diffusion_model: bool = field(
@@ -340,7 +344,13 @@ class WANPolicyHead(ActionHead):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16
+        env_num_inference_steps = os.getenv("NUM_INFERENCE_STEPS")
+        if env_num_inference_steps is not None:
+            self.num_inference_steps = int(env_num_inference_steps)
+        else:
+            self.num_inference_steps = int(getattr(config, "num_inference_steps", 4))
+        if self.num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {self.num_inference_steps}.")
         self.seed = 1140
         self.cfg_scale = 5.0
         self.denoising_strength = 1.0
@@ -2406,7 +2416,8 @@ class WANPolicyHead(ActionHead):
                 "[MoT] inference_video_mode="
                 f"{inference_video_mode} "
                 f"(configured={os.getenv('MOT_INFERENCE_VIDEO_MODE', getattr(self.config, 'mot_inference_video_mode', 'auto'))}, "
-                f"action_video_attention={getattr(self.model, 'mot_action_video_attention', 'n/a')})"
+                f"action_video_attention={getattr(self.model, 'mot_action_video_attention', 'n/a')}, "
+                f"num_inference_steps={self.num_inference_steps})"
             )
             self._mot_inference_video_mode_logged = True
 
@@ -2418,6 +2429,7 @@ class WANPolicyHead(ActionHead):
         rtc_guidance_max_steps = max(int(rtc_guidance_max_steps), 0)
         rtc_guidance_step_stride = max(int(rtc_guidance_step_stride), 1)
         condition_latent_frames = 0
+        video_refresh_step_mask: list[bool] | None = None
         if inference_video_mode == "cache_only":
             for index, action_timestep in enumerate(sample_scheduler_action.timesteps):
                 start_diffusion_events[index].record()
@@ -2463,6 +2475,7 @@ class WANPolicyHead(ActionHead):
                     device=noise_obs.device,
                     shift=self.sigma_shift,
                 )
+                video_refresh_step_mask = [True] + [False] * max(len(sample_scheduler_action.timesteps) - 1, 0)
                 video_final_noise = self._rescale_video_scheduler_final_noise(video_scheduler)
                 if self.ip_rank == 0:
                     print(
@@ -2544,6 +2557,7 @@ class WANPolicyHead(ActionHead):
                     video_refresh_steps,
                     total_steps=len(sample_scheduler.timesteps),
                 )
+                video_refresh_step_mask = video_refresh_mask
                 if self.ip_rank == 0:
                     print(
                         "[MoT] decoupled_denoise: "
@@ -2733,6 +2747,19 @@ class WANPolicyHead(ActionHead):
         diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]
         diffusion_time = sum(diffusion_times) / 1000
         scheduler_time = total_time - kv_creation_time - diffusion_time - text_encoder_time - image_encoder_time - vae_time
+        video_refresh_time = None
+        action_only_time = None
+        if video_refresh_step_mask is not None:
+            video_refresh_time = sum(
+                step_time
+                for step_time, is_video_refresh in zip(diffusion_times, video_refresh_step_mask)
+                if is_video_refresh
+            ) / 1000
+            action_only_time = sum(
+                step_time
+                for step_time, is_video_refresh in zip(diffusion_times, video_refresh_step_mask)
+                if not is_video_refresh
+            ) / 1000
 
         if self.ip_rank == 0:
             print(f"Time taken: Total {total_time:.2f} seconds, "
@@ -2743,6 +2770,13 @@ class WANPolicyHead(ActionHead):
                   f"Diffusion {diffusion_time:.2f} seconds, "
                   f"DIT Compute Steps {dit_compute_steps} steps, "
                   f"Scheduler {scheduler_time:.2f} seconds")
+            if video_refresh_time is not None and action_only_time is not None:
+                print(
+                    "[MoT] diffusion split: "
+                    f"video_refresh_step={video_refresh_time:.2f} seconds "
+                    "(includes the first action prediction), "
+                    f"action_only_steps={action_only_time:.2f} seconds"
+                )
 
         return BatchFeature(data={"action_pred": latents_action, "video_pred": output.transpose(1, 2)})
 

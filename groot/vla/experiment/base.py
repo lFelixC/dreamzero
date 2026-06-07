@@ -1487,7 +1487,7 @@ class BaseExperiment(ABC):
             resume_from_checkpoint = False
 
         # Instantiate the model.
-        model = self.create_model(cfg, training_args)
+        model = self.create_model(cfg, training_args) #构建模型
 
         if hasattr(model.action_head, "max_steps"):
             model.action_head.max_steps = cfg.max_steps
@@ -1497,7 +1497,7 @@ class BaseExperiment(ABC):
 
         # Create the train dataset.
         # Dump the metadata; necessary for policy to normalize the input and unnormalize the output
-        train_dataset = self.create_train_dataset(cfg, model)
+        train_dataset = self.create_train_dataset(cfg, model) #构建数据
         print("Using dataset:")
         print(train_dataset)
         assert (
