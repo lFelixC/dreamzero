@@ -255,3 +255,6 @@ video_pred_output*/
 example/libero/
 example/remote_infer/rtc_trace.jsonl
 /tests
+
+/tests/*
+

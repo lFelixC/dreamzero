@@ -650,6 +650,174 @@ class MoTCausalWanModel(CausalWanModel):
         self.state_context_norm = WanLayerNorm(self.dim, self.eps)
 
     @staticmethod
+    def _resize_1d_weight(source: torch.Tensor, target_length: int) -> torch.Tensor:
+        source_f = source.detach().float().reshape(1, 1, -1)
+        if source_f.shape[-1] == target_length:
+            return source_f.reshape(target_length)
+        return F.interpolate(
+            source_f,
+            size=target_length,
+            mode="linear",
+            align_corners=False,
+        ).reshape(target_length)
+
+    @staticmethod
+    def _resize_2d_weight(source: torch.Tensor, target_shape: torch.Size | tuple[int, int]) -> torch.Tensor:
+        target_shape = tuple(int(dim) for dim in target_shape)
+        source_f = source.detach().float().unsqueeze(0).unsqueeze(0)
+        if tuple(source_f.shape[-2:]) == target_shape:
+            return source_f.squeeze(0).squeeze(0)
+        return F.interpolate(
+            source_f,
+            size=target_shape,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
+    @classmethod
+    def _copy_resized_parameter(
+        cls,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        *,
+        scale: float = 1.0,
+    ) -> None:
+        if target.ndim == 1:
+            resized = cls._resize_1d_weight(source, target.shape[0])
+        elif target.ndim == 2:
+            resized = cls._resize_2d_weight(source, target.shape)
+        else:
+            raise ValueError(
+                "MoT video initialization only supports 1D/2D parameters, "
+                f"got source={tuple(source.shape)}, target={tuple(target.shape)}."
+            )
+        target.copy_((resized * float(scale)).to(device=target.device, dtype=target.dtype))
+
+    @classmethod
+    def _copy_resized_linear(
+        cls,
+        target: nn.Linear,
+        source: nn.Linear,
+        *,
+        alpha: float,
+    ) -> None:
+        cls._copy_resized_parameter(target.weight, source.weight, scale=alpha)
+        if target.bias is not None and source.bias is not None:
+            cls._copy_resized_parameter(target.bias, source.bias)
+
+    @classmethod
+    def _copy_resized_norm(cls, target: nn.Module, source: nn.Module) -> None:
+        for name in ("weight", "bias"):
+            target_param = getattr(target, name, None)
+            source_param = getattr(source, name, None)
+            if target_param is not None and source_param is not None:
+                cls._copy_resized_parameter(target_param, source_param)
+
+    @classmethod
+    def _copy_resized_adaln_modulation(
+        cls,
+        target: torch.Tensor,
+        source: torch.Tensor,
+    ) -> None:
+        if target.ndim != 3 or source.ndim != 3 or target.shape[1] != 6 or source.shape[1] != 6:
+            raise ValueError(
+                "AdaLN modulation tensors must have shape [*, 6, dim], "
+                f"got source={tuple(source.shape)}, target={tuple(target.shape)}."
+            )
+        if target.shape[0] != source.shape[0]:
+            raise ValueError(
+                "AdaLN modulation batch dimensions must match, "
+                f"got source={tuple(source.shape)}, target={tuple(target.shape)}."
+            )
+        resized = torch.empty(
+            target.shape,
+            device=target.device,
+            dtype=target.dtype,
+        )
+        for batch_idx in range(target.shape[0]):
+            for slice_idx in range(6):
+                resized[batch_idx, slice_idx] = cls._resize_1d_weight(
+                    source[batch_idx, slice_idx],
+                    target.shape[-1],
+                ).to(device=target.device, dtype=target.dtype)
+        target.copy_(resized)
+
+    @classmethod
+    def _copy_resized_adaln_linear(
+        cls,
+        target: nn.Linear,
+        source: nn.Linear,
+        *,
+        alpha: float,
+    ) -> None:
+        if target.weight.shape[0] % 6 != 0 or source.weight.shape[0] % 6 != 0:
+            raise ValueError(
+                "AdaLN projection output dimensions must be divisible by 6, "
+                f"got source={tuple(source.weight.shape)}, target={tuple(target.weight.shape)}."
+            )
+        target_out_per_slice = target.weight.shape[0] // 6
+        source_chunks = source.weight.detach().chunk(6, dim=0)
+        resized_chunks = [
+            cls._resize_2d_weight(chunk, (target_out_per_slice, target.weight.shape[1]))
+            for chunk in source_chunks
+        ]
+        resized_weight = torch.cat(resized_chunks, dim=0) * float(alpha)
+        target.weight.copy_(resized_weight.to(device=target.weight.device, dtype=target.weight.dtype))
+
+        if target.bias is not None and source.bias is not None:
+            target_bias_per_slice = target.bias.shape[0] // 6
+            source_bias_chunks = source.bias.detach().chunk(6, dim=0)
+            resized_bias_chunks = [
+                cls._resize_1d_weight(chunk, target_bias_per_slice)
+                for chunk in source_bias_chunks
+            ]
+            resized_bias = torch.cat(resized_bias_chunks, dim=0)
+            target.bias.copy_(resized_bias.to(device=target.bias.device, dtype=target.bias.dtype))
+
+    def initialize_action_expert_from_video(self) -> float:
+        """Initialize MoT action expert weights from the pretrained video DiT."""
+        if len(self.action_expert.blocks) != len(self.blocks):
+            raise ValueError(
+                "MoT action initialization requires action/video depths to match: "
+                f"action_layers={len(self.action_expert.blocks)}, video_layers={len(self.blocks)}."
+            )
+
+        alpha = (float(self.dim) / float(self.action_expert.hidden_dim)) ** 0.5
+        with torch.no_grad():
+            for video_block, action_block in zip(self.blocks, self.action_expert.blocks):
+                video_attn = video_block.self_attn
+                self._copy_resized_linear(action_block.q, video_attn.q, alpha=alpha)
+                self._copy_resized_linear(action_block.k, video_attn.k, alpha=alpha)
+                self._copy_resized_linear(action_block.v, video_attn.v, alpha=alpha)
+                self._copy_resized_linear(action_block.o, video_attn.o, alpha=alpha)
+                self._copy_resized_norm(action_block.norm_q, video_attn.norm_q)
+                self._copy_resized_norm(action_block.norm_k, video_attn.norm_k)
+
+                self._copy_resized_norm(action_block.norm1, video_block.norm1)
+                self._copy_resized_norm(action_block.norm2, video_block.norm2)
+                self._copy_resized_norm(action_block.norm3, video_block.norm3)
+                self._copy_resized_linear(action_block.ffn[0], video_block.ffn[0], alpha=alpha)
+                self._copy_resized_linear(action_block.ffn[2], video_block.ffn[2], alpha=alpha)
+                self._copy_resized_adaln_modulation(action_block.modulation, video_block.modulation)
+
+            self._copy_resized_linear(
+                self.action_expert.time_embedding[0],
+                self.time_embedding[0],
+                alpha=alpha,
+            )
+            self._copy_resized_linear(
+                self.action_expert.time_embedding[2],
+                self.time_embedding[2],
+                alpha=alpha,
+            )
+            self._copy_resized_adaln_linear(
+                self.action_expert.time_projection[1],
+                self.time_projection[1],
+                alpha=alpha,
+            )
+        return alpha
+
+    @staticmethod
     def _format_sac_arg_shapes(args) -> str:
         shapes = []
         for arg in args[:3]:

@@ -81,6 +81,10 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=False,
         metadata={"help": "If true, keep video/action experts independent by detaching action-visible video K/V for action loss."},
     )
+    mot_action_init_from_video: bool = field(
+        default=False,
+        metadata={"help": "Initialize the MoT action expert by interpolating pretrained Wan video weights."},
+    )
     mot_inference_video_mode: str = field(
         default="auto",
         metadata={"help": "MoT inference video path: auto, denoise, cache_only, or decoupled_denoise. Use denoise when video reads action."},
@@ -472,6 +476,10 @@ class WANPolicyHead(ActionHead):
                     print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
 
                 print("Successfully loaded pretrained weights")
+                self._maybe_initialize_mot_action_from_video(
+                    config,
+                    component_loading_performed=True,
+                )
         else:
             print("Skipping external component loading (expecting checkpoint state_dict to provide full weights)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
@@ -560,6 +568,25 @@ class WANPolicyHead(ActionHead):
             f"action_video_ki={config.mot_action_video_ki}, "
             f"activation_checkpointing_policy={config.activation_checkpointing_policy})"
         )
+
+    def _maybe_initialize_mot_action_from_video(
+        self,
+        config: WANPolicyHeadConfig,
+        *,
+        component_loading_performed: bool,
+    ) -> float | None:
+        if not component_loading_performed:
+            return None
+        if not self._coerce_bool(getattr(config, "mot_action_init_from_video", False)):
+            return None
+        if not getattr(self.model, "is_mot_wam", False):
+            return None
+        alpha = self.model.initialize_action_expert_from_video()
+        print(
+            "[DreamZero] Initialized MoT action expert from interpolated "
+            f"video weights (alpha={alpha:.6g})."
+        )
+        return alpha
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector

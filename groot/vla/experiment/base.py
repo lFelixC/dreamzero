@@ -955,6 +955,30 @@ class BaseTrainer(transformers.Trainer):
 
 
 class BaseExperiment(ABC):
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @classmethod
+    def _disable_mot_action_init_for_resume(cls, cfg: DictConfig, resume_path: Path | str) -> bool:
+        action_head_cfg = OmegaConf.select(cfg, "model.config.action_head_cfg.config")
+        if action_head_cfg is None:
+            return False
+        current = OmegaConf.select(action_head_cfg, "mot_action_init_from_video")
+        if current is None or not cls._coerce_bool(current):
+            return False
+        with open_dict(action_head_cfg):
+            action_head_cfg.mot_action_init_from_video = False
+        print(
+            "[DreamZero] Disabling mot_action_init_from_video because training "
+            f"is resuming from {resume_path}."
+        )
+        return True
+
     def __init__(self, cfg: DictConfig):
         # assert cfg.save_steps == 500, "save_steps must be 500 for standarized evaluation"
         assert cfg.max_steps > 0, "max_steps must be > 0 for standarized evaluation"
@@ -1023,6 +1047,8 @@ class BaseExperiment(ABC):
         if resume_path:
             print(f"Resuming training from {resume_path}")
             resume_from_checkpoint = True
+            if self._disable_mot_action_init_for_resume(cfg, resume_path):
+                OmegaConf.save(cfg, exp_cfg_dir / "conf.yaml", resolve=True)
         else:
             # First time training.
             resume_from_checkpoint = False

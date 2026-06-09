@@ -66,6 +66,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl git wget unzip rsync \
   build-essential cmake ninja-build pkg-config \
+  python3.10-dev \
   ffmpeg \
   libgl1 libglvnd0 libegl1 libegl-dev libgles2 \
   libglib2.0-0 libx11-6 libxext6 libxrender1 libsm6 \
@@ -159,7 +160,7 @@ uv venv --python 3.10 "$VIRTUAL_ENV"
 source "$VIRTUAL_ENV/bin/activate"
 
 cd /2023133163/liuf/dreamzero
-uv pip install --upgrade pip setuptools wheel ninja packaging
+uv pip install --upgrade pip "setuptools<81" wheel ninja packaging
 uv pip install torch torchvision torchaudio
 uv pip install -r docs/requirements_droid_wan22_uv.txt
 uv pip install -e . --no-deps
@@ -200,25 +201,137 @@ git checkout 0aeea2d669c0f8516f4d5785f0aa33ba812c14b4
 cd /2023133163/liuf/dreamzero/third_party/RoboTwin
 source /opt/venvs/robotwin310/bin/activate
 
-uv pip install --upgrade pip setuptools wheel ninja packaging
+uv pip install --upgrade pip "setuptools<81" wheel ninja packaging
 pip install -r script/requirements.txt
 ```
 
-官方脚本还会安装 `pytorch3d`、`curobo` 并 patch `sapien/mplib`。新环境建议直接跑：
+RoboTwin 官方脚本 `bash script/_install.sh` 会做四件事：
+
+```text
+1. pip install -r script/requirements.txt
+2. 从 GitHub 编译安装 pytorch3d
+3. patch sapien / mplib
+4. 从 GitHub clone 并安装 curobo
+```
+
+在 A800/H800 这类集群 Docker 里，不建议直接一把梭跑 `bash script/_install.sh`，因为：
+
+- `pytorch3d` 经常因为 CUDA / torch / gcc / arch 不匹配编译失败。
+- `curobo` 需要访问 GitHub，容器 DNS 或外网不通时会失败。
+- 当前 DreamZero websocket eval 路径不依赖 `pytorch3d`，日志里出现 `missing pytorch3d` 一般可以忽略。
+
+更推荐按下面的稳健流程手动做。
+
+### 7.1 安装基础依赖
 
 ```bash
 cd /2023133163/liuf/dreamzero/third_party/RoboTwin
 source /opt/venvs/robotwin310/bin/activate
 
-bash script/_install.sh
+uv pip install --upgrade pip "setuptools<81" wheel ninja packaging
+pip install -r script/requirements.txt
 ```
 
-说明：
+### 7.2 patch sapien / mplib
 
-- `_install.sh` 会 clone `envs/curobo`，如果之前已经 clone 过，可以先删除 `third_party/RoboTwin/envs/curobo` 再跑。
-- `pytorch3d` 编译失败时，当前 DreamZero eval path 通常仍能跑，但最好在镜像制作阶段修好，避免后续官方工具报 warning。
+官方 `_install.sh` 里有两个 patch，保留即可：
 
-## 8. 下载 RoboTwin assets
+```bash
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin
+source /opt/venvs/robotwin310/bin/activate
+
+SAPIEN_LOCATION=$(pip show sapien | grep 'Location' | awk '{print $2}')/sapien
+URDF_LOADER=$SAPIEN_LOCATION/wrapper/urdf_loader.py
+sed -i -E 's/("r")(\))( as)/\1, encoding="utf-8") as/g' "$URDF_LOADER"
+
+MPLIB_LOCATION=$(pip show mplib | grep 'Location' | awk '{print $2}')/mplib
+PLANNER=$MPLIB_LOCATION/planner.py
+sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' "$PLANNER"
+```
+
+### 7.3 安装 curobo
+
+如果容器能访问 GitHub：
+
+```bash
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin/envs
+rm -rf curobo
+git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git
+
+cd curobo
+source /opt/venvs/robotwin310/bin/activate
+
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export TORCH_CUDA_ARCH_LIST="8.0"
+export MAX_JOBS=2
+
+pip install -e . --no-build-isolation
+```
+
+如果容器不能访问 GitHub，先修 DNS：
+
+```bash
+cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) 2>/dev/null || true
+cat > /etc/resolv.conf <<'EOF'
+nameserver 223.5.5.5
+nameserver 114.114.114.114
+nameserver 8.8.8.8
+options timeout:2 attempts:3 rotate
+EOF
+
+getent hosts github.com
+```
+
+如果平台本身没有外网出口，就从已有机器同步 curobo：
+
+```bash
+rsync -a --info=progress2 \
+  /data/dreamzero_mot/third_party/RoboTwin/envs/curobo/ \
+  <user>@<a800_node>:/2023133163/liuf/dreamzero/third_party/RoboTwin/envs/curobo/
+
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin/envs/curobo
+source /opt/venvs/robotwin310/bin/activate
+
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export TORCH_CUDA_ARCH_LIST="8.0"
+export MAX_JOBS=2
+
+pip install -e . --no-build-isolation
+```
+
+### 7.4 pytorch3d 可选
+
+当前 DreamZero eval 日志里如果只有：
+
+```text
+missing pytorch3d
+```
+
+通常可以忽略。不要因为 `pytorch3d` 编译失败阻塞 eval 环境安装。
+
+如果你确实想安装 pytorch3d，A800 上建议显式指定架构并降低并行编译：
+
+```bash
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin
+source /opt/venvs/robotwin310/bin/activate
+
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export FORCE_CUDA=1
+export TORCH_CUDA_ARCH_LIST="8.0"
+export MAX_JOBS=2
+
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
+```
+
+如果还是失败，先跳过；DreamZero websocket eval 不需要它。
+
+## 8. 下载或同步 RoboTwin assets
 
 RoboTwin live env 必须有 assets：
 
@@ -229,23 +342,84 @@ source /opt/venvs/robotwin310/bin/activate
 bash script/_download_assets.sh
 ```
 
-如果资产已经在另一台机器上下载好，也可以直接同步：
+如果服务器访问 `huggingface.co` 慢或者超时，先把 HuggingFace endpoint 换成国内镜像：
 
 ```bash
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin
+source /opt/venvs/robotwin310/bin/activate
+
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_ENABLE_HF_TRANSFER=0
+
+# 可选：先确认镜像站能访问
+python - <<'PY'
+import os
+from huggingface_hub import HfApi
+
+endpoint = os.environ.get("HF_ENDPOINT")
+info = HfApi(endpoint=endpoint).dataset_info(
+    repo_id="TianxingChen/RoboTwin2.0",
+)
+print("HF endpoint:", endpoint)
+print("dataset:", info.id)
+PY
+
+bash script/_download_assets.sh
+```
+
+如果你希望之后每次进入容器都默认使用 hf mirror，可以写入固定环境：
+
+```bash
+cat >> /etc/profile.d/dreamzero-robotwin-eval.sh <<'EOF'
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_ENABLE_HF_TRANSFER=0
+EOF
+```
+
+`script/_download_assets.sh` 会访问 HuggingFace。如果日志里出现：
+
+```text
+Connection to huggingface.co timed out
+unzip: cannot find or open background_texture.zip
+unzip: cannot find or open embodiments.zip
+unzip: cannot find or open objects.zip
+Warning: ./assets/embodiments directory not found
+```
+
+说明 assets 没有下载下来，后面的 unzip 和 path config 都是连锁失败。此时不要继续反复跑 `update_embodiment_config_path.py`，先解决 HuggingFace 网络，或者从已有机器同步 assets。
+
+如果资产已经在另一台机器上下载好，推荐直接同步：
+
+```bash
+# 在已有 assets 的机器上执行，把 assets 推到 A800 节点
 rsync -a --info=progress2 \
   /data/dreamzero_mot/third_party/RoboTwin/assets/ \
   <user>@<a800_node>:/2023133163/liuf/dreamzero/third_party/RoboTwin/assets/
 
 cd /2023133163/liuf/dreamzero/third_party/RoboTwin
 source /opt/venvs/robotwin310/bin/activate
+test -d assets/embodiments
+test -d assets/objects
+test -d assets/background_texture
 python ./script/update_embodiment_config_path.py
 ```
 
-检查关键目录：
+也可以在 A800 节点上从已有机器拉取：
 
 ```bash
-ls third_party/RoboTwin/assets/embodiments
-ls third_party/RoboTwin/assets/objects
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin
+rsync -a --info=progress2 \
+  <user>@<source_host>:/data/dreamzero_mot/third_party/RoboTwin/assets/ \
+  ./assets/
+```
+
+检查关键目录时，确认当前目录是 RoboTwin 仓库根目录：
+
+```bash
+cd /2023133163/liuf/dreamzero/third_party/RoboTwin
+ls assets/embodiments
+ls assets/objects
+ls assets/background_texture
 ```
 
 ## 9. 写入固定环境变量
@@ -295,6 +469,13 @@ RoboTwin client 环境：
 ```bash
 cd /2023133163/liuf/dreamzero
 source /opt/venvs/robotwin310/bin/activate
+
+# sapien 会 import pkg_resources；pkg_resources 在新版 setuptools 里可能不可用。
+# 如果报 ModuleNotFoundError: No module named 'pkg_resources'，把 setuptools 降到 <81。
+python -m pip install -U "setuptools<81" wheel packaging
+
+# 如果前面已经装成 setuptools 82.x，建议强制回退一次。
+python -m pip install --force-reinstall "setuptools==80.9.0"
 
 python - <<'PY'
 import sapien
@@ -511,4 +692,3 @@ timeout
 ```
 
 用它可以判断慢在 model infer，还是慢在 SAPIEN env step/get_obs。
-
