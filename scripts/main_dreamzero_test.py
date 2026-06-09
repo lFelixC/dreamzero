@@ -445,12 +445,12 @@ class DreamZeroRealPolicyClient:
     ) -> dict:
         height, width = self._image_resolution
         if not self._has_sent_initial_request:
-            exterior_0 = _resize_frames(right_image, height, width)
-            exterior_1 = _resize_frames(left_image, height, width)
+            exterior_0 = _resize_frames(left_image, height, width)
+            exterior_1 = _resize_frames(right_image, height, width)
             wrist = _resize_frames(wrist_image, height, width)
         else:
-            exterior_0 = _resize_frames(_select_history_frames(self._history["right"]), height, width)
-            exterior_1 = _resize_frames(_select_history_frames(self._history["left"]), height, width)
+            exterior_0 = _resize_frames(_select_history_frames(self._history["left"]), height, width)
+            exterior_1 = _resize_frames(_select_history_frames(self._history["right"]), height, width)
             wrist = _resize_frames(_select_history_frames(self._history["wrist"]), height, width)
 
         return {
