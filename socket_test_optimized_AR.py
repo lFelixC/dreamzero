@@ -341,20 +341,12 @@ class ARDroidRoboarenaPolicy:
         ):
             self._policy.trained_model.action_head.current_start_frame = 0
 
-    def _should_start_new_sequence(self, prompt: str) -> bool:
+    def _should_send_single_anchor_frame(self, prompt: str) -> bool:
         if self._is_first_call:
             return True
         if self._current_prompt is not None and prompt != self._current_prompt:
             return True
-
-        action_head = getattr(getattr(self._policy, "trained_model", None), "action_head", None)
-        if action_head is None:
-            return False
-
-        current_start_frame = getattr(action_head, "current_start_frame", 0)
-        model = getattr(action_head, "model", None)
-        local_attn_size = getattr(model, "local_attn_size", -1)
-        return local_attn_size != -1 and current_start_frame >= local_attn_size
+        return False
     
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
@@ -418,10 +410,11 @@ class ARDroidRoboarenaPolicy:
                 self._warned_single_external_fallback = True
             self._append_frames_to_buffer("video.exterior_image_2_left", exterior_0)
 
-        # Determine how many frames to use. At the beginning of a sequence
-        # (first call, language change, or local-attention window rollover),
-        # the action head should receive only the latest anchor frame.
-        if self._should_start_new_sequence(prompt):
+        # Determine how many frames to use. True episode starts and language
+        # changes need a single anchor frame. Local-attention rollover keeps the
+        # last observed DROID block so the action head can rebase as
+        # [observed previous block -> predicted current block].
+        if self._should_send_single_anchor_frame(prompt):
             num_frames = 1
         else:
             # Normal causal block: boundary/anchor frame plus 8 newly sampled

@@ -2210,6 +2210,7 @@ class WANPolicyHead(ActionHead):
                     align_corners=False,
                 ).reshape(b, c, t, target_h, target_w)
 
+        rebase_with_observed_prefix = False
         if self.language is None:
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
@@ -2221,8 +2222,12 @@ class WANPolicyHead(ActionHead):
         elif videos.shape[2] == 1:
             print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
-        elif self.current_start_frame >= self.model.local_attn_size:
-            print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
+        elif self.model.local_attn_size != -1 and self.current_start_frame >= self.model.local_attn_size:
+            rebase_with_observed_prefix = videos.shape[2] > 1
+            print(
+                "current_start_frame >= local_attn_size, reset current_start_frame to 0"
+                f" (rebase_with_observed_prefix={rebase_with_observed_prefix})"
+            )
             self.current_start_frame = 0
 
         if self.ip_rank == 0:
@@ -2238,7 +2243,9 @@ class WANPolicyHead(ActionHead):
         start_image_encoder_event.record()
 
         _, _, num_frames, height, width = videos.shape
-        if videos.shape[2] == 4 or videos.shape[2] == 9:
+        if rebase_with_observed_prefix:
+            image_pixels = videos[:, :, :1]
+        elif videos.shape[2] == 4 or videos.shape[2] == 9:
             # special case for real-world eval where language is updated
             image_pixels = videos[:, :, -1:]
         else:
@@ -2257,12 +2264,17 @@ class WANPolicyHead(ActionHead):
 
         start_vae_event.record()
 
-        if latent_video is not None and self.current_start_frame != 0:
-            image = latent_video
+        observed_prefix_latents = None
+        needs_observed_prefix = self.current_start_frame != 0 or rebase_with_observed_prefix
+        if latent_video is not None and needs_observed_prefix:
+            if rebase_with_observed_prefix:
+                observed_prefix_latents = latent_video
+            else:
+                image = latent_video
             static_init_frame_pixels = videos[:, :, -1:]
             if self.ip_rank == 0:
-                print("image shape@@", image.shape)
-        elif self.current_start_frame != 0:
+                print("image shape@@", latent_video.shape)
+        elif needs_observed_prefix:
             # this is for real world execution
             if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
                 print("no further action")
@@ -2278,12 +2290,16 @@ class WANPolicyHead(ActionHead):
                 videos = torch.cat([first_frame, videos], dim=2)
 
             static_init_frame_pixels = videos[:, :, -1:]
-            image = self.vae.encode(
+            encoded_observed_latents = self.vae.encode(
                 videos,
                 tiled=self.tiled,
                 tile_size=(self.tile_size_height, self.tile_size_width),
                 tile_stride=(self.tile_stride_height, self.tile_stride_width),
             )
+            if rebase_with_observed_prefix:
+                observed_prefix_latents = encoded_observed_latents
+            else:
+                image = encoded_observed_latents
 
         end_vae_event.record()
 
@@ -2312,6 +2328,8 @@ class WANPolicyHead(ActionHead):
         seq_len = num_frames * frame_seqlen
 
         image = image.transpose(1, 2)
+        if observed_prefix_latents is not None:
+            observed_prefix_latents = observed_prefix_latents.transpose(1, 2)
         noise_obs = noise_obs.transpose(1, 2)
 
         if self.current_start_frame == 0:
@@ -2365,7 +2383,38 @@ class WANPolicyHead(ActionHead):
 
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
-        if self.current_start_frame != 1:
+        if rebase_with_observed_prefix:
+            if observed_prefix_latents is None:
+                raise RuntimeError("Rollover rebase requires observed prefix latents.")
+            current_ref_latents = observed_prefix_latents[:, -self.num_frame_per_block:]
+            if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                y = self.ys[
+                    :,
+                    :,
+                    self.current_start_frame : self.current_start_frame + self.num_frame_per_block,
+                ]
+            else:
+                y = self.ys[:, :, -self.num_frame_per_block:]
+            self._run_diffusion_steps(
+                noisy_input=current_ref_latents.transpose(1, 2),
+                timestep=timestep * 0,
+                action=None,
+                timestep_action=None,
+                state=state_features,
+                embodiment_id=embodiment_id,
+                context=prompt_embs,
+                seq_len=seq_len,
+                y=y,
+                clip_feature=self.clip_feas,
+                kv_caches=kv_caches,
+                crossattn_caches=crossattn_caches,
+                kv_cache_metadata=dict(
+                    start_frame=self.current_start_frame,
+                    update_kv_cache=True,
+                ),
+            )
+            self.current_start_frame += self.num_frame_per_block
+        elif self.current_start_frame != 1:
             current_ref_latents = image[:, -self.num_frame_per_block:]
             if self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
