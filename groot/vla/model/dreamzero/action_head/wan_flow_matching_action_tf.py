@@ -527,35 +527,50 @@ class WANPolicyHead(ActionHead):
             return static_latents
         return torch.lerp(static_latents, gaussian_noise, noise_ratio)
 
-    def _build_static_prediction_pixels(
+    @staticmethod
+    def _prefix_pixel_frames_to_latent_frames(pixel_frames: int) -> int:
+        if pixel_frames < 1:
+            raise ValueError(f"pixel_frames must be >= 1, got {pixel_frames}.")
+        if (pixel_frames - 1) % 4 != 0:
+            raise ValueError(
+                "Static video initialization prefix must end on a Wan VAE temporal boundary: "
+                f"pixel_frames={pixel_frames} is not 1 + 4k."
+            )
+        return 1 + (pixel_frames - 1) // 4
+
+    def _build_static_prediction_pixels_from_prefix(
         self,
-        previous_frame: torch.Tensor,
+        prefix_pixels: torch.Tensor,
         latent_frames: int,
     ) -> torch.Tensor:
-        if previous_frame.ndim != 5 or previous_frame.shape[2] != 1:
+        if prefix_pixels.ndim != 5:
             raise ValueError(
-                "Expected previous_frame with shape [B, C, 1, H, W], "
-                f"got {tuple(previous_frame.shape)}."
+                "Expected prefix_pixels with shape [B, C, T, H, W], "
+                f"got {tuple(prefix_pixels.shape)}."
             )
+        self._prefix_pixel_frames_to_latent_frames(prefix_pixels.shape[2])
         if latent_frames < 1:
             raise ValueError(f"latent_frames must be >= 1, got {latent_frames}.")
-        return previous_frame.repeat(1, 1, 1 + 4 * latent_frames, 1, 1)
+        previous_frame = prefix_pixels[:, :, -1:]
+        static_future_pixels = previous_frame.repeat(1, 1, 4 * latent_frames, 1, 1)
+        return torch.cat([prefix_pixels, static_future_pixels], dim=2)
 
-    def _encode_static_block_latents(
+    def _encode_static_block_latents_from_prefix(
         self,
-        previous_frame: torch.Tensor,
+        prefix_pixels: torch.Tensor,
         latent_frames: int,
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        static_pixels = self._build_static_prediction_pixels(previous_frame, latent_frames)
+        static_pixels = self._build_static_prediction_pixels_from_prefix(prefix_pixels, latent_frames)
         static_latents = self.encode_video(
             static_pixels,
             self.tiled,
             (self.tile_size_height, self.tile_size_width),
             (self.tile_stride_height, self.tile_stride_width),
         )
-        static_latents = static_latents[:, :, 1:1 + latent_frames]
+        prefix_latent_frames = self._prefix_pixel_frames_to_latent_frames(prefix_pixels.shape[2])
+        static_latents = static_latents[:, :, prefix_latent_frames:prefix_latent_frames + latent_frames]
         return static_latents.to(device=device, dtype=dtype)
 
     def _encode_static_training_init(
@@ -580,62 +595,53 @@ class WANPolicyHead(ActionHead):
             )
 
         block_starts = list(range(1, latent_frames, self.num_frame_per_block))
-        previous_frames = []
         total_pixel_frames = videos.shape[2]
-        for block_start_latent in block_starts:
-            prev_pixel_index = 4 * (block_start_latent - 1)
-            if prev_pixel_index >= total_pixel_frames:
-                raise ValueError(
-                    "Cannot build static video initialization because the previous block frame is missing: "
-                    f"prev_pixel_index={prev_pixel_index}, total_pixel_frames={total_pixel_frames}."
-                )
-            previous_frames.append(videos[:, :, prev_pixel_index:prev_pixel_index + 1])
-
         batch_size = videos.shape[0]
-        batched_previous_frames = torch.cat(previous_frames, dim=0)
-        block_latents = self._encode_static_block_latents(
-            batched_previous_frames,
-            latent_frames=self.num_frame_per_block,
-            device=target_latents.device,
-            dtype=target_latents.dtype,
-        )
-        expected_block_shape = torch.Size((
-            len(block_starts) * batch_size,
-            target_latents.shape[1],
-            self.num_frame_per_block,
-            target_latents.shape[3],
-            target_latents.shape[4],
-        ))
-        if block_latents.shape != expected_block_shape:
-            raise ValueError(
-                "Static video initialization latent shape mismatch during training: "
-                f"got {tuple(block_latents.shape)}, expected {tuple(expected_block_shape)}."
+        block_latents = []
+        for block_start_latent in block_starts:
+            prefix_pixel_frames = 1 + 4 * (block_start_latent - 1)
+            if prefix_pixel_frames > total_pixel_frames:
+                raise ValueError(
+                    "Cannot build history-consistent static video initialization because the prefix is missing: "
+                    f"prefix_pixel_frames={prefix_pixel_frames}, total_pixel_frames={total_pixel_frames}."
+                )
+            prefix_pixels = videos[:, :, :prefix_pixel_frames]
+            block_latent = self._encode_static_block_latents_from_prefix(
+                prefix_pixels,
+                latent_frames=self.num_frame_per_block,
+                device=target_latents.device,
+                dtype=target_latents.dtype,
             )
+            expected_block_shape = torch.Size((
+                batch_size,
+                target_latents.shape[1],
+                self.num_frame_per_block,
+                target_latents.shape[3],
+                target_latents.shape[4],
+            ))
+            if block_latent.shape != expected_block_shape:
+                raise ValueError(
+                    "History-consistent static video initialization latent shape mismatch during training: "
+                    f"got {tuple(block_latent.shape)}, expected {tuple(expected_block_shape)}."
+                )
+            block_latents.append(block_latent)
 
-        block_latents = block_latents.reshape(
-            len(block_starts),
-            batch_size,
-            target_latents.shape[1],
-            self.num_frame_per_block,
-            target_latents.shape[3],
-            target_latents.shape[4],
-        )
         static_init_latents = target_latents.clone()
-        for block_index, block_start_latent in enumerate(block_starts):
+        for block_latent, block_start_latent in zip(block_latents, block_starts, strict=True):
             static_init_latents[
                 :, :, block_start_latent:block_start_latent + self.num_frame_per_block
-            ] = block_latents[block_index]
+            ] = block_latent
         return static_init_latents
 
     def _encode_static_prediction_init(
         self,
-        previous_frame: torch.Tensor,
+        prefix_pixels: torch.Tensor,
         latent_shape: tuple[int, int, int, int, int],
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        static_latents = self._encode_static_block_latents(
-            previous_frame,
+        static_latents = self._encode_static_block_latents_from_prefix(
+            prefix_pixels,
             latent_frames=latent_shape[2],
             device=device,
             dtype=dtype,
@@ -2250,7 +2256,7 @@ class WANPolicyHead(ActionHead):
             image_pixels = videos[:, :, -1:]
         else:
             image_pixels = videos[:, :, :1]
-        static_init_frame_pixels = image_pixels
+        static_init_prefix_pixels = image_pixels
         image = image_pixels.transpose(1, 2)
 
         if self.current_start_frame == 0:
@@ -2271,7 +2277,7 @@ class WANPolicyHead(ActionHead):
                 observed_prefix_latents = latent_video
             else:
                 image = latent_video
-            static_init_frame_pixels = videos[:, :, -1:]
+            static_init_prefix_pixels = videos
             if self.ip_rank == 0:
                 print("image shape@@", latent_video.shape)
         elif needs_observed_prefix:
@@ -2289,7 +2295,7 @@ class WANPolicyHead(ActionHead):
                 first_frame = videos[:, :, 0:1]  # Extract first frame
                 videos = torch.cat([first_frame, videos], dim=2)
 
-            static_init_frame_pixels = videos[:, :, -1:]
+            static_init_prefix_pixels = videos
             encoded_observed_latents = self.vae.encode(
                 videos,
                 tiled=self.tiled,
@@ -2312,7 +2318,7 @@ class WANPolicyHead(ActionHead):
         )
         if self._static_video_init_enabled():
             noise_obs = self._encode_static_prediction_init(
-                static_init_frame_pixels.to(device=image.device, dtype=torch.bfloat16),
+                static_init_prefix_pixels.to(device=image.device, dtype=torch.bfloat16),
                 latent_shape=noise_obs_shape,
                 device=image.device,
                 dtype=torch.bfloat16,
