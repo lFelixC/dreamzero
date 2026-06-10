@@ -1,6 +1,7 @@
 import sys
 import warnings
 import os
+import traceback
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=UserWarning)
@@ -24,6 +25,7 @@ from collections import OrderedDict
 import sys
 import warnings
 import os
+import traceback
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=UserWarning)
@@ -53,9 +55,10 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
-        except:
+        except Exception:
             print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+            traceback.print_exc()
+            sys.exit(1)
 
     def setup_scene(self, **kwargs):
         """

@@ -23,6 +23,8 @@ Useful optional envs:
   SLOTS_PER_NODE=8        GPU/client slots per remote node.
   EVAL_RUN_BASE=...       Parent output directory.
   RUN_ID=...              Run name under EVAL_RUN_BASE.
+  AUTO_CLEANUP=1          Clean server/client processes on exit, failure, or Ctrl-C.
+  PRE_CLEANUP=1           Clean stale server/client processes before starting.
   KEEP_SERVERS=0          Set to 1 to leave policy servers running after eval.
   EPISODE_TIMEOUT_SEC=900 Episode timeout passed to RoboTwin client.
   SAVE_COMPARISON_VIDEO=0 Save comparison videos from client.
@@ -53,6 +55,8 @@ PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC:-10}
 EPISODE_TIMEOUT_SEC=${EPISODE_TIMEOUT_SEC:-900}
 SAVE_COMPARISON_VIDEO=${SAVE_COMPARISON_VIDEO:-0}
 SAVE_SERVER_VIDEO=${SAVE_SERVER_VIDEO:-0}
+AUTO_CLEANUP=${AUTO_CLEANUP:-1}
+PRE_CLEANUP=${PRE_CLEANUP:-1}
 KEEP_SERVERS=${KEEP_SERVERS:-0}
 POLICY_NAME=${POLICY_NAME:-ACT}
 TASK_CONFIG=${TASK_CONFIG:-demo_clean}
@@ -78,6 +82,100 @@ SUMMARY_DIR=${SUMMARY_DIR:-${RUN_ROOT}/summary}
 NODE_LOG_DIR=${NODE_LOG_DIR:-${RUN_ROOT}/node_logs}
 
 mkdir -p "${RUN_ROOT}" "${STATUS_DIR}" "${SUMMARY_DIR}" "${NODE_LOG_DIR}"
+
+SERVER_PIDS=()
+WORKER_PIDS=()
+COORDINATOR_NODE_PIDS=()
+COORDINATOR_NODES=()
+MONITOR_PID=""
+LOCAL_CLEANED=0
+COORDINATOR_CLEANED=0
+
+kill_matching_eval_processes() {
+    if [[ "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" ]]; then
+        return
+    fi
+
+    pkill -TERM -f "example.robotwin.eval_polict_client_openpi" >/dev/null 2>&1 || true
+    pkill -TERM -f "socket_test_optimized_aloha_x5lite_bimanual.py" >/dev/null 2>&1 || true
+    sleep 2
+    pkill -KILL -f "example.robotwin.eval_polict_client_openpi" >/dev/null 2>&1 || true
+    pkill -KILL -f "socket_test_optimized_aloha_x5lite_bimanual.py" >/dev/null 2>&1 || true
+}
+
+pre_cleanup_local_eval_processes() {
+    if [[ "${PRE_CLEANUP}" != "1" || "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" ]]; then
+        return
+    fi
+    echo "Cleaning stale local RoboTwin eval processes before launch..."
+    kill_matching_eval_processes
+}
+
+cleanup_local_eval_processes() {
+    if [[ "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" || "${LOCAL_CLEANED}" == "1" ]]; then
+        return
+    fi
+    LOCAL_CLEANED=1
+
+    echo "Cleaning local RoboTwin eval processes..."
+    if (( ${#WORKER_PIDS[@]} > 0 )); then
+        kill "${WORKER_PIDS[@]}" >/dev/null 2>&1 || true
+    fi
+    if (( ${#SERVER_PIDS[@]} > 0 )); then
+        kill "${SERVER_PIDS[@]}" >/dev/null 2>&1 || true
+    fi
+    if (( ${#WORKER_PIDS[@]} > 0 )); then
+        wait "${WORKER_PIDS[@]}" >/dev/null 2>&1 || true
+    fi
+    if (( ${#SERVER_PIDS[@]} > 0 )); then
+        wait "${SERVER_PIDS[@]}" >/dev/null 2>&1 || true
+    fi
+    kill_matching_eval_processes
+}
+
+cleanup_remote_eval_processes() {
+    if [[ "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" ]]; then
+        return
+    fi
+    if (( ${#COORDINATOR_NODES[@]} == 0 )); then
+        return
+    fi
+
+    echo "Cleaning remote RoboTwin eval processes..."
+    for node in "${COORDINATOR_NODES[@]}"; do
+        if [[ "${node}" == "local" ]]; then
+            kill_matching_eval_processes
+            continue
+        fi
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${node}" \
+            "AUTO_CLEANUP='${AUTO_CLEANUP}' KEEP_SERVERS='${KEEP_SERVERS}' bash -lc '
+                if [[ \"\${AUTO_CLEANUP}\" == \"1\" && \"\${KEEP_SERVERS}\" != \"1\" ]]; then
+                    pkill -TERM -f example.robotwin.eval_polict_client_openpi >/dev/null 2>&1 || true
+                    pkill -TERM -f socket_test_optimized_aloha_x5lite_bimanual.py >/dev/null 2>&1 || true
+                    sleep 2
+                    pkill -KILL -f example.robotwin.eval_polict_client_openpi >/dev/null 2>&1 || true
+                    pkill -KILL -f socket_test_optimized_aloha_x5lite_bimanual.py >/dev/null 2>&1 || true
+                fi
+            '" >/dev/null 2>&1 || true
+    done
+}
+
+cleanup_coordinator() {
+    if [[ "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" || "${COORDINATOR_CLEANED}" == "1" ]]; then
+        return
+    fi
+    COORDINATOR_CLEANED=1
+
+    if [[ -n "${MONITOR_PID}" ]]; then
+        kill "${MONITOR_PID}" >/dev/null 2>&1 || true
+        wait "${MONITOR_PID}" >/dev/null 2>&1 || true
+    fi
+    if (( ${#COORDINATOR_NODE_PIDS[@]} > 0 )); then
+        kill "${COORDINATOR_NODE_PIDS[@]}" >/dev/null 2>&1 || true
+        wait "${COORDINATOR_NODE_PIDS[@]}" >/dev/null 2>&1 || true
+    fi
+    cleanup_remote_eval_processes
+}
 
 detect_gpu_ids() {
     if [[ -n "${CLIENT_GPUS:-}" ]]; then
@@ -137,10 +235,31 @@ load_tasks() {
     fi
 }
 
-port_is_open() {
+websocket_is_ready() {
     local host=$1
     local port=$2
-    timeout 1 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1
+    local python_bin="${DREAMZERO_VENV}/bin/python"
+    if [[ ! -x "${python_bin}" ]]; then
+        python_bin=python
+    fi
+
+    timeout 5 "${python_bin}" - "${host}" "${port}" <<'PY' >/dev/null 2>&1
+import sys
+
+from websockets.sync.client import connect
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+with connect(
+    f"ws://{host}:{port}",
+    compression=None,
+    max_size=None,
+    open_timeout=2,
+    ping_interval=None,
+):
+    pass
+PY
 }
 
 progress_bar() {
@@ -266,7 +385,7 @@ wait_for_local_servers() {
         local ready=0
         for local_slot in "${!_gpu_ids_ref[@]}"; do
             local port=$((START_PORT + local_slot))
-            if port_is_open 127.0.0.1 "${port}"; then
+            if websocket_is_ready 127.0.0.1 "${port}"; then
                 ready=$((ready + 1))
             fi
         done
@@ -287,16 +406,7 @@ wait_for_local_servers() {
 }
 
 stop_local_servers() {
-    if [[ "${KEEP_SERVERS}" == "1" ]]; then
-        echo "KEEP_SERVERS=1, leaving local policy servers running."
-        return
-    fi
-    if (( ${#SERVER_PIDS[@]} == 0 )); then
-        return
-    fi
-    echo "Stopping local policy servers..."
-    kill "${SERVER_PIDS[@]}" >/dev/null 2>&1 || true
-    wait "${SERVER_PIDS[@]}" >/dev/null 2>&1 || true
+    cleanup_local_eval_processes
 }
 
 run_client_slot() {
@@ -368,6 +478,10 @@ run_client_slot() {
 
             write_status_from_result "${task_name}" "${rc}" "${result_json}" "${task_log}"
             echo "[node ${node_rank} slot ${local_slot}] finished task=${task_name} rc=${rc}"
+            if [[ "${rc}" != "0" || ! -f "${result_json}" ]]; then
+                echo "[node ${node_rank} slot ${local_slot}] aborting slot after task=${task_name}: rc=${rc}, result_json=${result_json}"
+                exit 1
+            fi
         done
     } >> "${slot_log}" 2>&1
 }
@@ -391,20 +505,22 @@ node_main() {
     fi
 
     SERVER_PIDS=()
-    trap stop_local_servers EXIT INT TERM
+    WORKER_PIDS=()
+    trap cleanup_local_eval_processes EXIT
+    trap 'cleanup_local_eval_processes; exit 130' INT TERM
 
+    pre_cleanup_local_eval_processes
     start_local_servers gpu_ids "${node_rank}"
     wait_for_local_servers gpu_ids "${node_rank}"
 
-    local worker_pids=()
     for local_slot in "${!gpu_ids[@]}"; do
         local global_slot=$((node_rank * slots_per_node + local_slot))
         run_client_slot "${node_rank}" "${local_slot}" "${gpu_ids[${local_slot}]}" "${global_slot}" "${total_slots}" &
-        worker_pids+=("$!")
+        WORKER_PIDS+=("$!")
     done
 
     local status=0
-    for pid in "${worker_pids[@]}"; do
+    for pid in "${WORKER_PIDS[@]}"; do
         if ! wait "${pid}"; then
             status=1
         fi
@@ -462,7 +578,8 @@ rate_pct = float(rate) * 100.0
 suffix = "complete" if complete == "1" else "incomplete"
 if error:
     suffix += f", {error}"
-print(f"[task done] {task}: acc={rate_pct:.2f}% ({succ}/{total}) rc={rc} {suffix}")
+label = "task done" if complete == "1" else "task failed"
+print(f"[{label}] {task}: acc={rate_pct:.2f}% ({succ}/{total}) rc={rc} {suffix}")
 PY
         done
 
@@ -595,6 +712,8 @@ TOTAL_NODES=${node_count}
 SLOTS_PER_NODE=${SLOTS_PER_NODE}
 START_PORT=${START_PORT}
 MASTER_PORT=${MASTER_PORT}
+AUTO_CLEANUP=${AUTO_CLEANUP}
+PRE_CLEANUP=${PRE_CLEANUP}
 EOF
 
     echo "Run root: ${RUN_ROOT}"
@@ -602,7 +721,12 @@ EOF
     echo "Nodes: ${node_count}, slots per node: ${SLOTS_PER_NODE}"
     echo "Task file: ${TASK_FILE}"
 
-    local node_pids=()
+    COORDINATOR_NODES=("${nodes[@]}")
+    COORDINATOR_NODE_PIDS=()
+    MONITOR_PID=""
+    trap cleanup_coordinator EXIT
+    trap 'cleanup_coordinator; exit 130' INT TERM
+
     for node_rank in "${!nodes[@]}"; do
         local node="${nodes[${node_rank}]}"
         local node_log="${NODE_LOG_DIR}/node${node_rank}.log"
@@ -618,7 +742,8 @@ EOF
                 export RUN_ROOT TASK_FILE STATUS_DIR SUMMARY_DIR
                 export DREAMZERO_VENV ROBOTWIN_VENV START_PORT MASTER_PORT TEST_NUM SEED
                 export MAX_CHUNK_SIZE SERVER_READY_TIMEOUT_SEC SERVER_LAUNCH_STAGGER_SEC
-                export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO KEEP_SERVERS
+                export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO
+                export AUTO_CLEANUP PRE_CLEANUP KEEP_SERVERS
                 export POLICY_NAME TASK_CONFIG TRAIN_CONFIG_NAME MODEL_NAME
                 export ACTION_GUIDANCE_SCALE VIDEO_GUIDANCE_SCALE
                 bash "${SCRIPT_PATH}" "${CKPT}"
@@ -646,6 +771,8 @@ EOF
                 EPISODE_TIMEOUT_SEC='${EPISODE_TIMEOUT_SEC}' \
                 SAVE_COMPARISON_VIDEO='${SAVE_COMPARISON_VIDEO}' \
                 SAVE_SERVER_VIDEO='${SAVE_SERVER_VIDEO}' \
+                AUTO_CLEANUP='${AUTO_CLEANUP}' \
+                PRE_CLEANUP='${PRE_CLEANUP}' \
                 KEEP_SERVERS='${KEEP_SERVERS}' \
                 POLICY_NAME='${POLICY_NAME}' \
                 TASK_CONFIG='${TASK_CONFIG}' \
@@ -655,14 +782,14 @@ EOF
                 VIDEO_GUIDANCE_SCALE='${VIDEO_GUIDANCE_SCALE}' \
                 bash '${REMOTE_SCRIPT_PATH}' '${CKPT}'" > "${node_log}" 2>&1 &
         fi
-        node_pids+=("$!")
+        COORDINATOR_NODE_PIDS+=("$!")
     done
 
     monitor_progress &
-    local monitor_pid=$!
+    MONITOR_PID=$!
 
     local status=0
-    for pid in "${node_pids[@]}"; do
+    for pid in "${COORDINATOR_NODE_PIDS[@]}"; do
         if ! wait "${pid}"; then
             status=1
         fi
@@ -670,7 +797,7 @@ EOF
 
     local all_statuses_written=0
     for _ in 1 2 3; do
-        if ! kill -0 "${monitor_pid}" >/dev/null 2>&1; then
+        if ! kill -0 "${MONITOR_PID}" >/dev/null 2>&1; then
             break
         fi
         local status_count
@@ -682,13 +809,13 @@ EOF
         sleep 2
     done
     if (( all_statuses_written == 1 )); then
-        wait "${monitor_pid}" || true
-    elif kill -0 "${monitor_pid}" >/dev/null 2>&1; then
+        wait "${MONITOR_PID}" || true
+    elif kill -0 "${MONITOR_PID}" >/dev/null 2>&1; then
         printf '\n[coordinator] stopping progress monitor; some tasks may be missing because a node exited early.\n'
-        kill "${monitor_pid}" >/dev/null 2>&1 || true
-        wait "${monitor_pid}" || true
+        kill "${MONITOR_PID}" >/dev/null 2>&1 || true
+        wait "${MONITOR_PID}" || true
     else
-        wait "${monitor_pid}" || true
+        wait "${MONITOR_PID}" || true
     fi
     write_final_summary
     return "${status}"
