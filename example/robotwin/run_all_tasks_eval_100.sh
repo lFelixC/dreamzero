@@ -26,6 +26,10 @@ Useful optional envs:
   AUTO_CLEANUP=1          Clean server/client processes on exit, failure, or Ctrl-C.
   PRE_CLEANUP=1           Clean stale server/client processes before starting.
   KEEP_SERVERS=0          Set to 1 to leave policy servers running after eval.
+  NVIDIA_DRIVER_LIB_BASE=/2023133163/liuf/nvidia-driver-560.35.03
+                          Optional extracted NVIDIA driver libs for headless Vulkan.
+  NVIDIA_DRIVER_VERSION=560.35.03
+                          NVIDIA driver library version expected under NVIDIA_DRIVER_LIB_BASE.
   EPISODE_TIMEOUT_SEC=900 Episode timeout passed to RoboTwin client.
   SAVE_COMPARISON_VIDEO=0 Save comparison videos from client.
 EOF
@@ -58,6 +62,10 @@ SAVE_SERVER_VIDEO=${SAVE_SERVER_VIDEO:-0}
 AUTO_CLEANUP=${AUTO_CLEANUP:-1}
 PRE_CLEANUP=${PRE_CLEANUP:-1}
 KEEP_SERVERS=${KEEP_SERVERS:-0}
+NVIDIA_DRIVER_LIB_BASE=${NVIDIA_DRIVER_LIB_BASE:-/2023133163/liuf/nvidia-driver-560.35.03}
+NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-560.35.03}
+VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-}
+XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-root}
 POLICY_NAME=${POLICY_NAME:-ACT}
 TASK_CONFIG=${TASK_CONFIG:-demo_clean}
 TRAIN_CONFIG_NAME=${TRAIN_CONFIG_NAME:-0}
@@ -90,6 +98,41 @@ COORDINATOR_NODES=()
 MONITOR_PID=""
 LOCAL_CLEANED=0
 COORDINATOR_CLEANED=0
+
+setup_nvidia_vulkan_env() {
+    local driver_dirs=()
+
+    if [[ -d "${NVIDIA_DRIVER_LIB_BASE}" ]]; then
+        local gpucomp_dir=""
+        gpucomp_dir=$(find "${NVIDIA_DRIVER_LIB_BASE}" -name "libnvidia-gpucomp.so.${NVIDIA_DRIVER_VERSION}" -printf '%h\n' 2>/dev/null | head -1 || true)
+        if [[ -n "${gpucomp_dir}" ]]; then
+            driver_dirs+=("${gpucomp_dir}")
+        else
+            echo "[vulkan] warning: libnvidia-gpucomp.so.${NVIDIA_DRIVER_VERSION} not found under ${NVIDIA_DRIVER_LIB_BASE}" >&2
+        fi
+
+        if [[ -d "${NVIDIA_DRIVER_LIB_BASE}/usr/lib/x86_64-linux-gnu" ]]; then
+            driver_dirs+=("${NVIDIA_DRIVER_LIB_BASE}/usr/lib/x86_64-linux-gnu")
+        fi
+    fi
+
+    if (( ${#driver_dirs[@]} > 0 )); then
+        local driver_path
+        driver_path=$(IFS=:; echo "${driver_dirs[*]}")
+        export LD_LIBRARY_PATH="${driver_path}:${LD_LIBRARY_PATH:-}"
+    fi
+
+    if [[ -z "${VK_ICD_FILENAMES}" && -f /etc/vulkan/icd.d/nvidia_icd.json ]]; then
+        VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
+    fi
+    if [[ -n "${VK_ICD_FILENAMES}" ]]; then
+        export VK_ICD_FILENAMES
+    fi
+
+    export XDG_RUNTIME_DIR
+    mkdir -p "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+    chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+}
 
 kill_matching_eval_processes() {
     if [[ "${AUTO_CLEANUP}" != "1" || "${KEEP_SERVERS}" == "1" ]]; then
@@ -362,6 +405,7 @@ start_local_servers() {
             export VIRTUAL_ENV="${DREAMZERO_VENV}"
             export PATH="${DREAMZERO_VENV}/bin:${PATH}"
             export CUDA_VISIBLE_DEVICES="${gpu_id}"
+            setup_nvidia_vulkan_env
             "${python_bin}" -m torch.distributed.run \
                 --nproc_per_node 1 \
                 --master_port "${current_master_port}" \
@@ -431,6 +475,7 @@ run_client_slot() {
         export VIRTUAL_ENV="${ROBOTWIN_VENV}"
         export PATH="${ROBOTWIN_VENV}/bin:${PATH}"
         export LD_LIBRARY_PATH="/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}"
+        setup_nvidia_vulkan_env
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
         export EPISODE_TIMEOUT_SEC
         export SAVE_COMPARISON_VIDEO
@@ -509,6 +554,7 @@ node_main() {
     trap cleanup_local_eval_processes EXIT
     trap 'cleanup_local_eval_processes; exit 130' INT TERM
 
+    setup_nvidia_vulkan_env
     pre_cleanup_local_eval_processes
     start_local_servers gpu_ids "${node_rank}"
     wait_for_local_servers gpu_ids "${node_rank}"
@@ -714,6 +760,10 @@ START_PORT=${START_PORT}
 MASTER_PORT=${MASTER_PORT}
 AUTO_CLEANUP=${AUTO_CLEANUP}
 PRE_CLEANUP=${PRE_CLEANUP}
+NVIDIA_DRIVER_LIB_BASE=${NVIDIA_DRIVER_LIB_BASE}
+NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}
+VK_ICD_FILENAMES=${VK_ICD_FILENAMES}
+XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
 EOF
 
     echo "Run root: ${RUN_ROOT}"
@@ -744,6 +794,7 @@ EOF
                 export MAX_CHUNK_SIZE SERVER_READY_TIMEOUT_SEC SERVER_LAUNCH_STAGGER_SEC
                 export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO
                 export AUTO_CLEANUP PRE_CLEANUP KEEP_SERVERS
+                export NVIDIA_DRIVER_LIB_BASE NVIDIA_DRIVER_VERSION VK_ICD_FILENAMES XDG_RUNTIME_DIR
                 export POLICY_NAME TASK_CONFIG TRAIN_CONFIG_NAME MODEL_NAME
                 export ACTION_GUIDANCE_SCALE VIDEO_GUIDANCE_SCALE
                 bash "${SCRIPT_PATH}" "${CKPT}"
@@ -774,6 +825,10 @@ EOF
                 AUTO_CLEANUP='${AUTO_CLEANUP}' \
                 PRE_CLEANUP='${PRE_CLEANUP}' \
                 KEEP_SERVERS='${KEEP_SERVERS}' \
+                NVIDIA_DRIVER_LIB_BASE='${NVIDIA_DRIVER_LIB_BASE}' \
+                NVIDIA_DRIVER_VERSION='${NVIDIA_DRIVER_VERSION}' \
+                VK_ICD_FILENAMES='${VK_ICD_FILENAMES}' \
+                XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}' \
                 POLICY_NAME='${POLICY_NAME}' \
                 TASK_CONFIG='${TASK_CONFIG}' \
                 TRAIN_CONFIG_NAME='${TRAIN_CONFIG_NAME}' \
