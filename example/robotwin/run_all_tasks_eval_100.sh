@@ -30,6 +30,8 @@ Useful optional envs:
                           Optional extracted NVIDIA driver libs for headless Vulkan.
   NVIDIA_DRIVER_VERSION=560.35.03
                           NVIDIA driver library version expected under NVIDIA_DRIVER_LIB_BASE.
+  ROBOTWIN_EXTRA_PYTHONPATH=...
+                          Extra Python path prepended for RoboTwin clients.
   EPISODE_TIMEOUT_SEC=900 Episode timeout passed to RoboTwin client.
   SAVE_COMPARISON_VIDEO=0 Save comparison videos from client.
 EOF
@@ -66,6 +68,7 @@ NVIDIA_DRIVER_LIB_BASE=${NVIDIA_DRIVER_LIB_BASE:-/2023133163/liuf/nvidia-driver-
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-560.35.03}
 VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-}
 XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-root}
+ROBOTWIN_EXTRA_PYTHONPATH=${ROBOTWIN_EXTRA_PYTHONPATH:-}
 POLICY_NAME=${POLICY_NAME:-ACT}
 TASK_CONFIG=${TASK_CONFIG:-demo_clean}
 TRAIN_CONFIG_NAME=${TRAIN_CONFIG_NAME:-0}
@@ -474,7 +477,11 @@ run_client_slot() {
         cd "${REPO_ROOT}/third_party/RoboTwin"
         export VIRTUAL_ENV="${ROBOTWIN_VENV}"
         export PATH="${ROBOTWIN_VENV}/bin:${PATH}"
-        export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/RoboTwin/script:${PYTHONPATH:-}"
+        if [[ -n "${ROBOTWIN_EXTRA_PYTHONPATH}" ]]; then
+            export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/RoboTwin/script:${ROBOTWIN_EXTRA_PYTHONPATH}:${PYTHONPATH:-}"
+        else
+            export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/RoboTwin/script:${PYTHONPATH:-}"
+        fi
         export LD_LIBRARY_PATH="/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}"
         setup_nvidia_vulkan_env
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
@@ -765,6 +772,7 @@ NVIDIA_DRIVER_LIB_BASE=${NVIDIA_DRIVER_LIB_BASE}
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}
 VK_ICD_FILENAMES=${VK_ICD_FILENAMES}
 XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+ROBOTWIN_EXTRA_PYTHONPATH=${ROBOTWIN_EXTRA_PYTHONPATH}
 EOF
 
     echo "Run root: ${RUN_ROOT}"
@@ -796,6 +804,7 @@ EOF
                 export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO
                 export AUTO_CLEANUP PRE_CLEANUP KEEP_SERVERS
                 export NVIDIA_DRIVER_LIB_BASE NVIDIA_DRIVER_VERSION VK_ICD_FILENAMES XDG_RUNTIME_DIR
+                export ROBOTWIN_EXTRA_PYTHONPATH
                 export POLICY_NAME TASK_CONFIG TRAIN_CONFIG_NAME MODEL_NAME
                 export ACTION_GUIDANCE_SCALE VIDEO_GUIDANCE_SCALE
                 bash "${SCRIPT_PATH}" "${CKPT}"
@@ -830,6 +839,7 @@ EOF
                 NVIDIA_DRIVER_VERSION='${NVIDIA_DRIVER_VERSION}' \
                 VK_ICD_FILENAMES='${VK_ICD_FILENAMES}' \
                 XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}' \
+                ROBOTWIN_EXTRA_PYTHONPATH='${ROBOTWIN_EXTRA_PYTHONPATH}' \
                 POLICY_NAME='${POLICY_NAME}' \
                 TASK_CONFIG='${TASK_CONFIG}' \
                 TRAIN_CONFIG_NAME='${TRAIN_CONFIG_NAME}' \
