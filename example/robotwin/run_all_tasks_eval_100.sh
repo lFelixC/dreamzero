@@ -471,9 +471,10 @@ run_client_slot() {
     local slot_log="${client_log_dir}/slot${local_slot}_gpu${gpu_id}.log"
     {
         echo "[node ${node_rank} slot ${local_slot}] global_slot=${global_slot}/${total_slots} gpu=${gpu_id}"
-        cd "${REPO_ROOT}"
+        cd "${REPO_ROOT}/third_party/RoboTwin"
         export VIRTUAL_ENV="${ROBOTWIN_VENV}"
         export PATH="${ROBOTWIN_VENV}/bin:${PATH}"
+        export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/third_party/RoboTwin:${REPO_ROOT}/third_party/RoboTwin/script:${PYTHONPATH:-}"
         export LD_LIBRARY_PATH="/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}"
         setup_nvidia_vulkan_env
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
