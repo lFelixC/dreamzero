@@ -143,9 +143,11 @@ kill_matching_eval_processes() {
     fi
 
     pkill -TERM -f "example.robotwin.eval_polict_client_openpi" >/dev/null 2>&1 || true
+    pkill -TERM -f "eval_polict_client_openpi.py" >/dev/null 2>&1 || true
     pkill -TERM -f "socket_test_optimized_aloha_x5lite_bimanual.py" >/dev/null 2>&1 || true
     sleep 2
     pkill -KILL -f "example.robotwin.eval_polict_client_openpi" >/dev/null 2>&1 || true
+    pkill -KILL -f "eval_polict_client_openpi.py" >/dev/null 2>&1 || true
     pkill -KILL -f "socket_test_optimized_aloha_x5lite_bimanual.py" >/dev/null 2>&1 || true
 }
 
@@ -197,9 +199,11 @@ cleanup_remote_eval_processes() {
             "AUTO_CLEANUP='${AUTO_CLEANUP}' KEEP_SERVERS='${KEEP_SERVERS}' bash -lc '
                 if [[ \"\${AUTO_CLEANUP}\" == \"1\" && \"\${KEEP_SERVERS}\" != \"1\" ]]; then
                     pkill -TERM -f example.robotwin.eval_polict_client_openpi >/dev/null 2>&1 || true
+                    pkill -TERM -f eval_polict_client_openpi.py >/dev/null 2>&1 || true
                     pkill -TERM -f socket_test_optimized_aloha_x5lite_bimanual.py >/dev/null 2>&1 || true
                     sleep 2
                     pkill -KILL -f example.robotwin.eval_polict_client_openpi >/dev/null 2>&1 || true
+                    pkill -KILL -f eval_polict_client_openpi.py >/dev/null 2>&1 || true
                     pkill -KILL -f socket_test_optimized_aloha_x5lite_bimanual.py >/dev/null 2>&1 || true
                 fi
             '" >/dev/null 2>&1 || true
@@ -509,7 +513,7 @@ run_client_slot() {
             set +e
             PYTHONWARNINGS=ignore::UserWarning \
                 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-                "${python_bin}" -m example.robotwin.eval_polict_client_openpi \
+                "${python_bin}" "${REPO_ROOT}/example/robotwin/eval_polict_client_openpi.py" \
                     --config "policy/${POLICY_NAME}/deploy_policy.yml" \
                     --host 127.0.0.1 \
                     --port "$((START_PORT + local_slot))" \
