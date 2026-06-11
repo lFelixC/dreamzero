@@ -580,6 +580,46 @@ def add_init_pose(new_pose, init_pose):
     right_pose = add_eef_pose(new_pose[8:], init_pose[8:])
     return np.concatenate([left_pose, right_pose])
 
+def parse_bool_env(name, default=True):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() not in ("0", "false", "no")
+
+def safe_close_task_env(task_env, clear_cache=False):
+    try:
+        task_env.close_env(clear_cache=clear_cache)
+    except Exception as exc:
+        print(f"warning: failed to close RoboTwin env cleanly: {exc}")
+
+def clear_partial_robot(task_env):
+    if hasattr(task_env, "robot"):
+        try:
+            delattr(task_env, "robot")
+        except Exception as exc:
+            print(f"warning: failed to clear partial robot state: {exc}")
+
+def choose_episode_instruction(task_name, episode_info, test_num, instruction_type):
+    episode_params = {}
+    if isinstance(episode_info, dict):
+        episode_params = episode_info.get("info", {})
+    if not isinstance(episode_params, dict):
+        episode_params = {}
+
+    results = generate_episode_descriptions(task_name, [episode_params], test_num)
+    choices = []
+    if results:
+        choices = results[0].get(instruction_type, [])
+    if choices:
+        return np.random.choice(choices)
+
+    fallback = task_name.replace("_", " ")
+    print(
+        f"warning: no generated {instruction_type} instruction for task={task_name}; "
+        f"using fallback prompt: {fallback}"
+    )
+    return fallback
+
 def eval_policy(task_name,
                 TASK_ENV,
                 args,
@@ -594,13 +634,17 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = parse_bool_env("EXPERT_CHECK", True)
+    max_seed_attempts_raw = os.getenv("MAX_SEED_ATTEMPTS")
+    max_seed_attempts = int(max_seed_attempts_raw) if max_seed_attempts_raw else max(test_num * 20, 100)
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
     now_id = 0
     succ_seed = 0
     suc_test_seed_list = []
+    seed_attempts = 0
+    last_seed_error = None
 
 
     now_seed = st_seed
@@ -609,8 +653,16 @@ def eval_policy(task_name,
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        if seed_attempts >= max_seed_attempts:
+            raise RuntimeError(
+                f"Failed to collect {test_num} valid eval seeds after "
+                f"{seed_attempts} attempts. Last seed={now_seed - 1}, "
+                f"last_error={last_seed_error}"
+            )
+        seed_attempts += 1
         render_freq = args["render_freq"]
         args["render_freq"] = 0
+        episode_info = None
         episode_metrics = {
             "task": task_name,
             "episode_index": now_id,
@@ -641,14 +693,18 @@ def eval_policy(task_name,
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
-                TASK_ENV.close_env()
+                safe_close_task_env(TASK_ENV)
             except UnStableError as e:
-                TASK_ENV.close_env()
+                last_seed_error = f"UnStableError at seed={now_seed}: {e}"
+                safe_close_task_env(TASK_ENV)
+                clear_partial_robot(TASK_ENV)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                TASK_ENV.close_env()
+                last_seed_error = f"{type(e).__name__} at seed={now_seed}: {e}"
+                safe_close_task_env(TASK_ENV)
+                clear_partial_robot(TASK_ENV)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
@@ -660,6 +716,7 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            last_seed_error = f"expert filter rejected seed={now_seed}"
             now_seed += 1
             args["render_freq"] = render_freq
             continue
@@ -670,10 +727,10 @@ def eval_policy(task_name,
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_metrics["T_env_reset"] = time.perf_counter() - t_env_reset
         episode_metrics["step_limit"] = int(TASK_ENV.step_lim)
-        episode_info_list = [episode_info["info"]]
         t_generate_instruction = time.perf_counter()
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if episode_info is None:
+            episode_info = getattr(TASK_ENV, "info", {})
+        instruction = choose_episode_instruction(args["task_name"], episode_info, test_num, instruction_type)
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
         episode_metrics["T_generate_instruction"] = time.perf_counter() - t_generate_instruction
 

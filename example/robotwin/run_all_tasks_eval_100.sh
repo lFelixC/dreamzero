@@ -33,6 +33,8 @@ Useful optional envs:
   ROBOTWIN_EXTRA_PYTHONPATH=...
                           Extra Python path prepended for RoboTwin clients.
   EPISODE_TIMEOUT_SEC=900 Episode timeout passed to RoboTwin client.
+  EXPERT_CHECK=1          Set to 0 to skip expert seed filtering.
+  MAX_SEED_ATTEMPTS=...   Max candidate seeds to try per task before failing.
   SAVE_COMPARISON_VIDEO=0 Save comparison videos from client.
 EOF
 }
@@ -61,6 +63,8 @@ PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC:-10}
 EPISODE_TIMEOUT_SEC=${EPISODE_TIMEOUT_SEC:-900}
 SAVE_COMPARISON_VIDEO=${SAVE_COMPARISON_VIDEO:-0}
 SAVE_SERVER_VIDEO=${SAVE_SERVER_VIDEO:-0}
+EXPERT_CHECK=${EXPERT_CHECK:-1}
+MAX_SEED_ATTEMPTS=${MAX_SEED_ATTEMPTS:-}
 AUTO_CLEANUP=${AUTO_CLEANUP:-1}
 PRE_CLEANUP=${PRE_CLEANUP:-1}
 KEEP_SERVERS=${KEEP_SERVERS:-0}
@@ -491,6 +495,8 @@ run_client_slot() {
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
         export EPISODE_TIMEOUT_SEC
         export SAVE_COMPARISON_VIDEO
+        export EXPERT_CHECK
+        export MAX_SEED_ATTEMPTS
 
         for task_idx in "${!TASK_NAMES[@]}"; do
             local assigned_slot
@@ -806,6 +812,8 @@ EOF
                 export DREAMZERO_VENV ROBOTWIN_VENV START_PORT MASTER_PORT TEST_NUM SEED
                 export MAX_CHUNK_SIZE SERVER_READY_TIMEOUT_SEC SERVER_LAUNCH_STAGGER_SEC
                 export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO
+                export EXPERT_CHECK
+                export MAX_SEED_ATTEMPTS
                 export AUTO_CLEANUP PRE_CLEANUP KEEP_SERVERS
                 export NVIDIA_DRIVER_LIB_BASE NVIDIA_DRIVER_VERSION VK_ICD_FILENAMES XDG_RUNTIME_DIR
                 export ROBOTWIN_EXTRA_PYTHONPATH
@@ -836,6 +844,8 @@ EOF
                 EPISODE_TIMEOUT_SEC='${EPISODE_TIMEOUT_SEC}' \
                 SAVE_COMPARISON_VIDEO='${SAVE_COMPARISON_VIDEO}' \
                 SAVE_SERVER_VIDEO='${SAVE_SERVER_VIDEO}' \
+                EXPERT_CHECK='${EXPERT_CHECK}' \
+                MAX_SEED_ATTEMPTS='${MAX_SEED_ATTEMPTS}' \
                 AUTO_CLEANUP='${AUTO_CLEANUP}' \
                 PRE_CLEANUP='${PRE_CLEANUP}' \
                 KEEP_SERVERS='${KEEP_SERVERS}' \
