@@ -2,6 +2,8 @@ import sys
 import os
 import subprocess
 import time
+import re
+import fcntl
 try:
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -22,6 +24,43 @@ for path in (REPO_ROOT, robowin_root, robowin_root / "script"):
 
 
 import os
+
+def atomic_write_text(path: Path, content: str):
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+def ensure_robotwin_asset_paths(root: Path):
+    """Regenerate RoboTwin curobo configs so absolute asset paths match this checkout."""
+    root = root.resolve()
+    embodiments_dir = root / "assets" / "embodiments"
+    if not embodiments_dir.is_dir():
+        return
+
+    lock_path = embodiments_dir / ".curobo_path_fix.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        for tmp_file in embodiments_dir.glob("**/*_tmp.yml"):
+            target_file = tmp_file.with_name(tmp_file.name.replace("_tmp.yml", ".yml"))
+            content = tmp_file.read_text(encoding="utf-8")
+            content = content.replace("${ASSETS_PATH}", str(root))
+            content = content.replace("$ASSETS_PATH", str(root))
+            if not target_file.exists() or target_file.read_text(encoding="utf-8") != content:
+                atomic_write_text(target_file, content)
+
+        root_pattern = re.compile(r"/[^\s'\"<>]*/third_party/RoboTwin")
+        for config_file in embodiments_dir.glob("**/curobo*.yml"):
+            content = config_file.read_text(encoding="utf-8")
+            fixed = root_pattern.sub(str(root), content)
+            if fixed != content:
+                atomic_write_text(config_file, fixed)
+
+ensure_robotwin_asset_paths(robowin_root)
 os.chdir(robowin_root)
 
 CONFIGS_PATH = None
