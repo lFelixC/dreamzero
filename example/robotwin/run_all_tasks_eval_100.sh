@@ -36,6 +36,7 @@ Useful optional envs:
   EXPERT_CHECK=1          Set to 0 to skip expert seed filtering.
   MAX_SEED_ATTEMPTS=...   Max candidate seeds to try per task before failing.
   SAVE_COMPARISON_VIDEO=0 Save comparison videos from client.
+  SEQUENTIAL_TASKS=0      Set to 1 to run tasks one by one while all slots shard each task.
 EOF
 }
 
@@ -65,6 +66,7 @@ SAVE_COMPARISON_VIDEO=${SAVE_COMPARISON_VIDEO:-0}
 SAVE_SERVER_VIDEO=${SAVE_SERVER_VIDEO:-0}
 EXPERT_CHECK=${EXPERT_CHECK:-1}
 MAX_SEED_ATTEMPTS=${MAX_SEED_ATTEMPTS:-}
+SEQUENTIAL_TASKS=${SEQUENTIAL_TASKS:-0}
 AUTO_CLEANUP=${AUTO_CLEANUP:-1}
 PRE_CLEANUP=${PRE_CLEANUP:-1}
 KEEP_SERVERS=${KEEP_SERVERS:-0}
@@ -384,6 +386,218 @@ PY
     mv "${tmp_file}" "${status_file}"
 }
 
+write_shard_status_from_result() {
+    local task_name=$1
+    local global_slot=$2
+    local rc=$3
+    local result_json=$4
+    local log_file=$5
+    local expected=$6
+    local shard_dir="${STATUS_DIR}/shards/${task_name}"
+    mkdir -p "${shard_dir}"
+
+    local tmp_file="${shard_dir}/slot${global_slot}.status.tmp.$$"
+    local status_file="${shard_dir}/slot${global_slot}.status"
+
+    python - "${task_name}" "${global_slot}" "${rc}" "${result_json}" "${log_file}" "${expected}" > "${tmp_file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+task, slot_s, rc_s, result_s, log_s, expected_s = sys.argv[1:]
+rc = int(rc_s)
+expected = float(expected_s)
+result_path = Path(result_s)
+succ = 0.0
+total = 0.0
+rate = 0.0
+error = ""
+
+if expected == 0:
+    complete = int(rc == 0)
+elif result_path.exists():
+    try:
+        data = json.loads(result_path.read_text())
+        succ = float(data.get("succ_num", 0.0))
+        total = float(data.get("total_num", 0.0))
+        rate = float(data.get("succ_rate", 0.0))
+    except Exception as exc:
+        error = f"failed_to_parse_result:{exc}"
+    complete = int(rc == 0 and total >= expected)
+else:
+    error = "missing_result_json"
+    complete = 0
+
+print(
+    "\t".join(
+        [
+            task,
+            slot_s,
+            str(rc),
+            f"{succ:g}",
+            f"{total:g}",
+            f"{rate:.10f}",
+            str(complete),
+            str(result_path),
+            str(log_s),
+            error,
+        ]
+    )
+)
+PY
+    mv "${tmp_file}" "${status_file}"
+}
+
+wait_for_file() {
+    local file_path=$1
+    while [[ ! -f "${file_path}" ]]; do
+        sleep 2
+    done
+}
+
+prepare_sequential_task() {
+    local task_name=$1
+    local global_slot=$2
+    local shard_dir="${STATUS_DIR}/shards/${task_name}"
+    local ready_file="${shard_dir}/.prepared"
+
+    if (( global_slot == 0 )); then
+        rm -f "${STATUS_DIR}/${task_name}.status"
+        rm -rf "${shard_dir}"
+        mkdir -p "${shard_dir}"
+        touch "${ready_file}"
+    else
+        wait_for_file "${ready_file}"
+    fi
+}
+
+wait_for_sequential_shards() {
+    local task_name=$1
+    local total_slots=$2
+    local shard_dir="${STATUS_DIR}/shards/${task_name}"
+    local count=0
+
+    while true; do
+        count=$(find "${shard_dir}" -maxdepth 1 -name 'slot*.status' 2>/dev/null | wc -l | awk '{print $1}')
+        if (( count >= total_slots )); then
+            return 0
+        fi
+        sleep 2
+    done
+}
+
+aggregate_sequential_task_status() {
+    local task_name=$1
+    local total_slots=$2
+    local shard_dir="${STATUS_DIR}/shards/${task_name}"
+    local result_json="${SUMMARY_DIR}/task_results/${task_name}.json"
+    local tmp_file="${STATUS_DIR}/${task_name}.status.tmp.$$"
+    local status_file="${STATUS_DIR}/${task_name}.status"
+
+    mkdir -p "${SUMMARY_DIR}/task_results"
+
+    python - "${task_name}" "${TEST_NUM}" "${total_slots}" "${shard_dir}" "${result_json}" > "${tmp_file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+task, expected_s, total_slots_s, shard_dir_s, result_json_s = sys.argv[1:]
+expected = float(expected_s)
+total_slots = int(total_slots_s)
+shard_dir = Path(shard_dir_s)
+result_path = Path(result_json_s)
+
+succ = 0.0
+total = 0.0
+failed = []
+missing = []
+shards = []
+
+for slot in range(total_slots):
+    path = shard_dir / f"slot{slot}.status"
+    if not path.exists():
+        missing.append(slot)
+        continue
+
+    parts = path.read_text().rstrip("\n").split("\t")
+    parts += [""] * (10 - len(parts))
+    task_name, slot_s, rc_s, shard_succ, shard_total, shard_rate, complete, shard_result, shard_log, error = parts[:10]
+    rc = int(rc_s)
+    shard_succ_f = float(shard_succ)
+    shard_total_f = float(shard_total)
+    succ += shard_succ_f
+    total += shard_total_f
+    shard_info = {
+        "slot": int(slot_s),
+        "rc": rc,
+        "succ_num": shard_succ_f,
+        "total_num": shard_total_f,
+        "succ_rate": float(shard_rate),
+        "complete": complete == "1",
+        "result_json": shard_result,
+        "log_file": shard_log,
+        "error": error,
+    }
+    shards.append(shard_info)
+    if rc != 0 or complete != "1":
+        failed.append(shard_info)
+
+rate = succ / total if total else 0.0
+aggregate = {
+    "task": task,
+    "succ_num": succ,
+    "total_num": total,
+    "succ_rate": rate,
+    "expected_total_num": expected,
+    "total_slots": total_slots,
+    "missing_slots": missing,
+    "failed_shards": failed,
+    "shards": shards,
+}
+result_path.write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+
+rc = 0 if not missing and not failed else 1
+error = ""
+if missing:
+    error = "missing_shards:" + ",".join(map(str, missing[:8]))
+elif failed:
+    error = "failed_shards:" + ",".join(str(s["slot"]) for s in failed[:8])
+elif total < expected:
+    rc = 1
+    error = f"incomplete_total:{total:g}/{expected:g}"
+
+complete = int(rc == 0 and total >= expected)
+print(
+    "\t".join(
+        [
+            task,
+            str(rc),
+            f"{succ:g}",
+            f"{total:g}",
+            f"{rate:.10f}",
+            str(complete),
+            str(result_path),
+            str(shard_dir),
+            error,
+        ]
+    )
+)
+PY
+    mv "${tmp_file}" "${status_file}"
+}
+
+sequential_shard_test_num() {
+    local global_slot=$1
+    local total_slots=$2
+    local base=$((TEST_NUM / total_slots))
+    local remainder=$((TEST_NUM % total_slots))
+    local shard_num=${base}
+    if (( global_slot < remainder )); then
+        shard_num=$((shard_num + 1))
+    fi
+    echo "${shard_num}"
+}
+
 start_local_servers() {
     local -n _gpu_ids_ref=$1
     local node_rank=$2
@@ -497,6 +711,7 @@ run_client_slot() {
         export SAVE_COMPARISON_VIDEO
         export EXPERT_CHECK
         export MAX_SEED_ATTEMPTS
+        export SEQUENTIAL_TASKS
 
         for task_idx in "${!TASK_NAMES[@]}"; do
             local assigned_slot
@@ -505,43 +720,80 @@ run_client_slot() {
             else
                 assigned_slot=$((task_idx * total_slots / TOTAL_TASKS))
             fi
-            if (( assigned_slot != global_slot )); then
-                continue
+            if [[ "${SEQUENTIAL_TASKS}" != "1" ]]; then
+                if (( assigned_slot != global_slot )); then
+                    continue
+                fi
             fi
 
             local task_name="${TASK_NAMES[${task_idx}]}"
+            local task_test_num="${TEST_NUM}"
+            local task_seed="${SEED}"
             local task_log="${client_log_dir}/${task_name}.log"
-            local result_json="${client_output_dir}/stseed-$((10000 * (1 + SEED)))/metrics/${task_name}/res.json"
-            rm -f "${STATUS_DIR}/${task_name}.status"
+
+            if [[ "${SEQUENTIAL_TASKS}" == "1" ]]; then
+                prepare_sequential_task "${task_name}" "${global_slot}"
+                task_test_num=$(sequential_shard_test_num "${global_slot}" "${total_slots}")
+                task_seed=$((SEED + task_idx * total_slots + global_slot))
+                task_log="${client_log_dir}/${task_name}_slot${global_slot}.log"
+            else
+                rm -f "${STATUS_DIR}/${task_name}.status"
+            fi
+
+            local result_json="${client_output_dir}/stseed-$((10000 * (1 + task_seed)))/metrics/${task_name}/res.json"
             echo "[node ${node_rank} slot ${local_slot}] start task=${task_name} port=$((START_PORT + local_slot)) gpu=${gpu_id}"
+            echo "[node ${node_rank} slot ${local_slot}] task=${task_name} shard_episodes=${task_test_num}/${TEST_NUM} seed=${task_seed}"
 
             local rc=0
-            set +e
-            PYTHONWARNINGS=ignore::UserWarning \
-                XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-                "${python_bin}" "${REPO_ROOT}/example/robotwin/eval_polict_client_openpi.py" \
-                    --config "policy/${POLICY_NAME}/deploy_policy.yml" \
-                    --host 127.0.0.1 \
-                    --port "$((START_PORT + local_slot))" \
-                    --save_root "${client_output_dir}" \
-                    --video_guidance_scale "${VIDEO_GUIDANCE_SCALE}" \
-                    --action_guidance_scale "${ACTION_GUIDANCE_SCALE}" \
-                    --test_num "${TEST_NUM}" \
-                    --overrides \
-                    --task_name "${task_name}" \
-                    --task_config "${TASK_CONFIG}" \
-                    --train_config_name "${TRAIN_CONFIG_NAME}" \
-                    --model_name "${MODEL_NAME}" \
-                    --ckpt_setting "${MODEL_NAME}" \
-                    --seed "${SEED}" \
-                    --policy_name "${POLICY_NAME}" \
-                    > "${task_log}" 2>&1
-            rc=$?
-            set -e
+            if (( task_test_num > 0 )); then
+                set +e
+                PYTHONWARNINGS=ignore::UserWarning \
+                    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+                    "${python_bin}" "${REPO_ROOT}/example/robotwin/eval_polict_client_openpi.py" \
+                        --config "policy/${POLICY_NAME}/deploy_policy.yml" \
+                        --host 127.0.0.1 \
+                        --port "$((START_PORT + local_slot))" \
+                        --save_root "${client_output_dir}" \
+                        --video_guidance_scale "${VIDEO_GUIDANCE_SCALE}" \
+                        --action_guidance_scale "${ACTION_GUIDANCE_SCALE}" \
+                        --test_num "${task_test_num}" \
+                        --overrides \
+                        --task_name "${task_name}" \
+                        --task_config "${TASK_CONFIG}" \
+                        --train_config_name "${TRAIN_CONFIG_NAME}" \
+                        --model_name "${MODEL_NAME}" \
+                        --ckpt_setting "${MODEL_NAME}" \
+                        --seed "${task_seed}" \
+                        --policy_name "${POLICY_NAME}" \
+                        > "${task_log}" 2>&1
+                rc=$?
+                set -e
+            else
+                echo "[node ${node_rank} slot ${local_slot}] skip task=${task_name}; shard_episodes=0" > "${task_log}"
+            fi
 
-            write_status_from_result "${task_name}" "${rc}" "${result_json}" "${task_log}"
+            if [[ "${SEQUENTIAL_TASKS}" == "1" ]]; then
+                write_shard_status_from_result "${task_name}" "${global_slot}" "${rc}" "${result_json}" "${task_log}" "${task_test_num}"
+                wait_for_sequential_shards "${task_name}" "${total_slots}"
+                if (( global_slot == 0 )); then
+                    aggregate_sequential_task_status "${task_name}" "${total_slots}"
+                fi
+                wait_for_file "${STATUS_DIR}/${task_name}.status"
+            else
+                write_status_from_result "${task_name}" "${rc}" "${result_json}" "${task_log}"
+            fi
+
             echo "[node ${node_rank} slot ${local_slot}] finished task=${task_name} rc=${rc}"
-            if [[ "${rc}" != "0" || ! -f "${result_json}" ]]; then
+            if [[ "${SEQUENTIAL_TASKS}" == "1" ]]; then
+                local task_status_line
+                task_status_line=$(collect_status_line "${STATUS_DIR}/${task_name}.status")
+                local aggregate_task aggregate_rc aggregate_succ aggregate_total aggregate_rate aggregate_complete aggregate_result aggregate_log aggregate_error
+                IFS=$'\t' read -r aggregate_task aggregate_rc aggregate_succ aggregate_total aggregate_rate aggregate_complete aggregate_result aggregate_log aggregate_error <<< "${task_status_line}"
+                if [[ "${aggregate_complete}" != "1" ]]; then
+                    echo "[node ${node_rank} slot ${local_slot}] aborting after task=${task_name}: aggregate rc=${aggregate_rc}, total=${aggregate_total}/${TEST_NUM}, error=${aggregate_error}"
+                    exit 1
+                fi
+            elif [[ "${rc}" != "0" || ! -f "${result_json}" ]]; then
                 echo "[node ${node_rank} slot ${local_slot}] aborting slot after task=${task_name}: rc=${rc}, result_json=${result_json}"
                 exit 1
             fi
@@ -778,6 +1030,7 @@ START_PORT=${START_PORT}
 MASTER_PORT=${MASTER_PORT}
 AUTO_CLEANUP=${AUTO_CLEANUP}
 PRE_CLEANUP=${PRE_CLEANUP}
+SEQUENTIAL_TASKS=${SEQUENTIAL_TASKS}
 NVIDIA_DRIVER_LIB_BASE=${NVIDIA_DRIVER_LIB_BASE}
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}
 VK_ICD_FILENAMES=${VK_ICD_FILENAMES}
@@ -788,7 +1041,9 @@ EOF
     echo "Run root: ${RUN_ROOT}"
     echo "Tasks: ${TOTAL_TASKS}, episodes per task: ${TEST_NUM}"
     echo "Nodes: ${node_count}, slots per node: ${SLOTS_PER_NODE}"
+    echo "Sequential tasks: ${SEQUENTIAL_TASKS}"
     echo "Task file: ${TASK_FILE}"
+    echo "Monitor: bash example/robotwin/monitor_robotwin_eval.sh --watch ${RUN_ROOT}"
 
     COORDINATOR_NODES=("${nodes[@]}")
     COORDINATOR_NODE_PIDS=()
@@ -814,6 +1069,7 @@ EOF
                 export EPISODE_TIMEOUT_SEC SAVE_COMPARISON_VIDEO SAVE_SERVER_VIDEO
                 export EXPERT_CHECK
                 export MAX_SEED_ATTEMPTS
+                export SEQUENTIAL_TASKS
                 export AUTO_CLEANUP PRE_CLEANUP KEEP_SERVERS
                 export NVIDIA_DRIVER_LIB_BASE NVIDIA_DRIVER_VERSION VK_ICD_FILENAMES XDG_RUNTIME_DIR
                 export ROBOTWIN_EXTRA_PYTHONPATH
@@ -846,6 +1102,7 @@ EOF
                 SAVE_SERVER_VIDEO='${SAVE_SERVER_VIDEO}' \
                 EXPERT_CHECK='${EXPERT_CHECK}' \
                 MAX_SEED_ATTEMPTS='${MAX_SEED_ATTEMPTS}' \
+                SEQUENTIAL_TASKS='${SEQUENTIAL_TASKS}' \
                 AUTO_CLEANUP='${AUTO_CLEANUP}' \
                 PRE_CLEANUP='${PRE_CLEANUP}' \
                 KEEP_SERVERS='${KEEP_SERVERS}' \
