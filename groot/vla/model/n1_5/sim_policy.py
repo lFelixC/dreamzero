@@ -373,12 +373,19 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         # If the model's action head has target_video_height/width (e.g. DreamZero Wan 5B), use that
         # as the expected video resolution so the transform matches the model. metadata.json can
         # otherwise contain a different resolution (e.g. 180x320) from dataset config.
+        # For composite layouts such as RoboTwin T-shape, per-camera input resolution is intentionally
+        # different from the final action-head target resolution, so keep the train-time per-view size.
+        video_layout = getattr(train_cfg, "video_layout", "default")
         if hasattr(self.trained_model, "action_head") and hasattr(
             self.trained_model.action_head, "config"
         ):
             cfg = self.trained_model.action_head.config
-            target_h = getattr(cfg, "target_video_height", None)
-            target_w = getattr(cfg, "target_video_width", None)
+            if video_layout == "robotwin_tshape":
+                target_h = getattr(train_cfg, "image_resolution_height", None)
+                target_w = getattr(train_cfg, "image_resolution_width", None)
+            else:
+                target_h = getattr(cfg, "target_video_height", None)
+                target_w = getattr(cfg, "target_video_width", None)
             if target_h is not None and target_w is not None and metadata.modalities.video:
                 for key in metadata.modalities.video.keys():
                     metadata.modalities.video[key].resolution = (int(target_w), int(target_h))

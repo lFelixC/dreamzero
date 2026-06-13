@@ -135,6 +135,55 @@ def _validate_probability(name: str, value: float) -> float:
     return value
 
 
+def _validate_video_layout(value: str | None) -> str:
+    value = "default" if value is None else str(value)
+    valid_layouts = {"default", "robotwin_tshape"}
+    if value not in valid_layouts:
+        raise ValueError(f"video_layout must be one of {sorted(valid_layouts)}, got {value!r}")
+    return value
+
+
+def _resize_video_chw(video: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Resize [T,C,H,W] video with bilinear interpolation."""
+    target_h, target_w = size
+    if video.shape[-2:] == (target_h, target_w):
+        return video
+    tensor = torch.from_numpy(np.ascontiguousarray(video)).float()
+    resized = torch.nn.functional.interpolate(
+        tensor,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    if np.issubdtype(video.dtype, np.integer):
+        info = np.iinfo(video.dtype)
+        resized = resized.round().clamp(info.min, info.max)
+    return resized.cpu().numpy().astype(video.dtype, copy=False)
+
+
+def _aloha_multiview_instruction(task_text: str, video_layout: str) -> str:
+    task_text = str(task_text).lower()
+    if video_layout == "robotwin_tshape":
+        layout_text = (
+            "The video is arranged in a T-shaped layout: the top view shows cam_high, "
+            "the bottom-left view shows cam_left, and the bottom-right view shows cam_right."
+        )
+    else:
+        layout_text = (
+            "The video is split into four views: The top-left view shows cam_high, "
+            "the top-right view shows cam_right, the bottom-left view shows cam_left, "
+            "and the bottom-right view is a black screen."
+        )
+    return (
+        "A multi-view video shows that a robot "
+        + task_text
+        + " "
+        + layout_text
+        + " The robot "
+        + task_text
+    )
+
+
 def collate(
     features: List[dict],
     tokenizer: AutoTokenizer,
@@ -145,9 +194,11 @@ def collate(
     num_action_per_block: int | None = None,
     num_state_per_block: int | None = None,
     droid_random_drop_exterior_view_prob: float = 0.0,
+    video_layout: str = "default",
 ) -> dict:
     batch = {}
     keys = features[0].keys()
+    video_layout = _validate_video_layout(video_layout)
     droid_random_drop_exterior_view_prob = _validate_probability(
         "droid_random_drop_exterior_view_prob",
         droid_random_drop_exterior_view_prob,
@@ -186,7 +237,7 @@ def collate(
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.ALOHA_X5LITE_BIMANUAL.value]:
-                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows cam_high, the top-right view shows cam_right, the bottom-left view shows cam_left, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                        processed_item = _aloha_multiview_instruction(processed_item, video_layout)
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
                     output_values.append(processed_item)  
@@ -211,7 +262,7 @@ def collate(
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.ALOHA_X5LITE_BIMANUAL.value]:
-                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows cam_high, the top-right view shows cam_right, the bottom-left view shows cam_left, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                        item = _aloha_multiview_instruction(item, video_layout)
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
@@ -271,6 +322,7 @@ class DefaultDataCollator(DataCollatorMixin):
         num_action_per_block: int | None = None,
         num_state_per_block: int | None = None,
         droid_random_drop_exterior_view_prob: float = 0.0,
+        video_layout: str = "default",
     ):
         super().__init__()
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=max_length, clean='whitespace')
@@ -284,6 +336,7 @@ class DefaultDataCollator(DataCollatorMixin):
             "droid_random_drop_exterior_view_prob",
             droid_random_drop_exterior_view_prob,
         )
+        self.video_layout = _validate_video_layout(video_layout)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         with nvtx_range("dreamzero.train.collate"):
@@ -297,6 +350,7 @@ class DefaultDataCollator(DataCollatorMixin):
                 num_action_per_block=self.num_action_per_block,
                 num_state_per_block=self.num_state_per_block,
                 droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
+                video_layout=self.video_layout,
             )
 
 
@@ -349,6 +403,10 @@ class DreamTransform(InvertibleModalityTransform):
         le=1.0,
         description="Training probability of blacking out one DROID exterior view.",
     )
+    video_layout: str = Field(
+        default="default",
+        description="Multi-view image layout. Use 'robotwin_tshape' for cam_high over cam_left/cam_right.",
+    )
 
     # Add tokenizer attribute
     tokenizer_path: str = Field(
@@ -359,6 +417,7 @@ class DreamTransform(InvertibleModalityTransform):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.video_layout = _validate_video_layout(self.video_layout)
         # Initialize the tokenizer
         self._tokenizer = HuggingfaceTokenizer(
             name=self.tokenizer_path, 
@@ -490,6 +549,25 @@ class DreamTransform(InvertibleModalityTransform):
                 if drop_exterior_idx != 1:
                     concat_images[0, :, :, h:, w:] = right_exterior
 
+                return concat_images
+
+            if self.video_layout == "robotwin_tshape":
+                if v < 3:
+                    raise ValueError(f"`video_layout='robotwin_tshape'` requires 3 views, got {v}")
+                if h % 2 != 0 or w % 2 != 0:
+                    raise ValueError(
+                        "`video_layout='robotwin_tshape'` requires even input H/W so wrist views can be half-sized, "
+                        f"got HxW=({h},{w})"
+                    )
+
+                cam_high = images[0]
+                cam_left = _resize_video_chw(images[1], (h // 2, w // 2))
+                cam_right = _resize_video_chw(images[2], (h // 2, w // 2))
+
+                concat_images = np.zeros((1, t, c, h + h // 2, w), dtype=images.dtype)
+                concat_images[0, :, :, :h, :] = cam_high
+                concat_images[0, :, :, h:, : w // 2] = cam_left
+                concat_images[0, :, :, h:, w // 2 :] = cam_right
                 return concat_images
             
             # For other embodiments: use 2x2 grid layout
@@ -773,6 +851,7 @@ class DreamTransform(InvertibleModalityTransform):
             self.num_views,
             self.embodiment_tag_mapping,
             droid_random_drop_exterior_view_prob=self.droid_random_drop_exterior_view_prob,
+            video_layout=self.video_layout,
         )
 
     def apply(self, data: dict) -> dict:
