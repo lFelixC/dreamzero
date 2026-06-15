@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import datetime
 import gc
 import logging
 import math
@@ -10,6 +11,7 @@ from accelerate import load_checkpoint_and_dispatch
 
 from einops import rearrange
 from hydra.utils import instantiate
+import imageio
 from peft import LoraConfig, get_peft_model
 import torch
 from torch import nn
@@ -975,6 +977,152 @@ class WANPolicyHead(ActionHead):
         with torch.no_grad():
             latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
+
+    def _save_input_vae_roundtrip_debug(
+        self,
+        videos: torch.Tensor,
+        debug_spec: dict | None,
+        static_init_latents: torch.Tensor | None = None,
+        static_init_prefix_pixels: torch.Tensor | None = None,
+    ) -> None:
+        if debug_spec is None or self.ip_rank != 0:
+            return
+
+        save_dir = debug_spec.get("save_dir")
+        if not save_dir:
+            return
+
+        filename = str(debug_spec.get("filename", "model_input_vae_roundtrip.mp4"))
+        fps = int(debug_spec.get("fps", 5))
+        meta = dict(debug_spec.get("meta") or {})
+
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            input_videos = videos.detach().to(dtype=torch.bfloat16)
+            self._ensure_vae_on_device(input_videos)
+            with torch.no_grad():
+                latents = self.vae.encode(
+                    input_videos,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
+                decoded = self.vae.decode(
+                    latents,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
+                static_decoded = None
+                static_full_latents = None
+                static_pixels = None
+                if static_init_latents is not None:
+                    static_latents = static_init_latents.detach().to(
+                        device=input_videos.device,
+                        dtype=torch.bfloat16,
+                    )
+                    if static_init_prefix_pixels is not None:
+                        prefix_pixels = static_init_prefix_pixels.detach().to(
+                            device=input_videos.device,
+                            dtype=torch.bfloat16,
+                        )
+                        static_pixels = self._build_static_prediction_pixels_from_prefix(
+                            prefix_pixels,
+                            latent_frames=static_latents.shape[2],
+                        )
+                        prefix_latent_frames = self._prefix_pixel_frames_to_latent_frames(
+                            prefix_pixels.shape[2],
+                        )
+                        static_full_latents = self.vae.encode(
+                            static_pixels,
+                            tiled=self.tiled,
+                            tile_size=(self.tile_size_height, self.tile_size_width),
+                            tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                        )
+                        static_full_latents = static_full_latents.to(
+                            device=input_videos.device,
+                            dtype=torch.bfloat16,
+                        )
+                        static_full_latents[
+                            :, :, prefix_latent_frames:prefix_latent_frames + static_latents.shape[2]
+                        ] = static_latents
+                        static_decoded = self.vae.decode(
+                            static_full_latents,
+                            tiled=self.tiled,
+                            tile_size=(self.tile_size_height, self.tile_size_width),
+                            tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                        )
+                    else:
+                        static_decoded = self.vae.decode(
+                            static_latents,
+                            tiled=self.tiled,
+                            tile_size=(self.tile_size_height, self.tile_size_width),
+                            tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                        )
+
+            prefix_frames = rearrange(decoded[0], "c t h w -> t h w c")
+            prefix_frames = ((prefix_frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype("uint8")
+            frame_list = list(prefix_frames)
+            static_frames = None
+            if static_decoded is not None:
+                static_frames = rearrange(static_decoded[0], "c t h w -> t h w c")
+                static_frames = (
+                    (static_frames.float() + 1) * 127.5
+                ).clip(0, 255).cpu().numpy().astype("uint8")
+                frame_list.extend(list(static_frames))
+            output_path = os.path.join(save_dir, filename)
+            imageio.mimsave(output_path, frame_list, fps=fps, codec="libx264")
+
+            input_float = input_videos.float()
+            meta.update(
+                {
+                    "saved_at": datetime.datetime.now().isoformat(),
+                    "input_tensor_shape_bcthw": list(input_videos.shape),
+                    "input_tensor_dtype": str(input_videos.dtype),
+                    "input_tensor_min": float(input_float.min().detach().cpu()),
+                    "input_tensor_max": float(input_float.max().detach().cpu()),
+                    "vae_latent_shape_bcthw": list(latents.shape),
+                    "vae_latent_dtype": str(latents.dtype),
+                    "decoded_tensor_shape_bcthw": list(decoded.shape),
+                    "decoded_tensor_dtype": str(decoded.dtype),
+                    "prefix_saved_video_shape_thwc": list(prefix_frames.shape),
+                    "static_init_enabled": static_init_latents is not None,
+                    "static_init_latent_shape_bcthw": (
+                        list(static_init_latents.shape) if static_init_latents is not None else None
+                    ),
+                    "static_init_prefix_pixels_shape_bcthw": (
+                        list(static_init_prefix_pixels.shape) if static_init_prefix_pixels is not None else None
+                    ),
+                    "static_init_pixels_shape_bcthw": (
+                        list(static_pixels.shape) if static_pixels is not None else None
+                    ),
+                    "static_init_full_latent_shape_bcthw": (
+                        list(static_full_latents.shape) if static_full_latents is not None else None
+                    ),
+                    "static_init_decoded_shape_bcthw": (
+                        list(static_decoded.shape) if static_decoded is not None else None
+                    ),
+                    "static_init_saved_video_shape_thwc": (
+                        list(static_frames.shape) if static_frames is not None else None
+                    ),
+                    "static_init_model_latents_exclude_prefix": static_init_latents is not None,
+                    "static_init_segment_includes_prefix": static_full_latents is not None,
+                    "saved_video_frames": len(frame_list),
+                    "saved_video_layout": (
+                        "prefix VAE roundtrip frames followed by static-init decoded frames; "
+                        "static segment includes its VAE prefix when available"
+                    ),
+                    "roundtrip": (
+                        "VAE encode/decode of post-transform normalized model input plus "
+                        "constructed static init decoded with its prefix latents"
+                    ),
+                }
+            )
+            with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            logger.info("Saved VAE roundtrip model input video to: %s", output_path)
+        except Exception as exc:
+            logger.warning("Failed to save VAE roundtrip model input video: %s", exc)
 
     def encode_image(self, image, num_frames, height, width, encode_first_frame_latent=True):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
@@ -2158,6 +2306,7 @@ class WANPolicyHead(ActionHead):
         rtc_prefix_attention_schedule: str = "EXP",
         rtc_guidance_max_steps: int = 4,
         rtc_guidance_step_stride: int = 1,
+        input_vae_debug: dict | None = None,
     ) -> BatchFeature:
         start_time = time.perf_counter()
 
@@ -2172,6 +2321,7 @@ class WANPolicyHead(ActionHead):
         end_kv_event = torch.cuda.Event(enable_timing=True)
         start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
+        input_vae_debug_time = 0.0
 
         self.set_frozen_modules_to_eval_mode()
         data = action_input
@@ -2325,6 +2475,14 @@ class WANPolicyHead(ActionHead):
             )
         else:
             noise_obs = self.generate_noise(noise_obs_shape, seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        input_vae_debug_start = time.perf_counter()
+        self._save_input_vae_roundtrip_debug(
+            videos,
+            input_vae_debug,
+            static_init_latents=noise_obs if self._static_video_init_enabled() else None,
+            static_init_prefix_pixels=static_init_prefix_pixels,
+        )
+        input_vae_debug_time = time.perf_counter() - input_vae_debug_start
         noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
@@ -2804,7 +2962,15 @@ class WANPolicyHead(ActionHead):
         kv_creation_time = start_kv_event.elapsed_time(end_kv_event) / 1000
         diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]
         diffusion_time = sum(diffusion_times) / 1000
-        scheduler_time = total_time - kv_creation_time - diffusion_time - text_encoder_time - image_encoder_time - vae_time
+        scheduler_time = (
+            total_time
+            - kv_creation_time
+            - diffusion_time
+            - text_encoder_time
+            - image_encoder_time
+            - vae_time
+            - input_vae_debug_time
+        )
         video_refresh_time = None
         action_only_time = None
         if video_refresh_step_mask is not None:
@@ -2824,10 +2990,11 @@ class WANPolicyHead(ActionHead):
                   f"Text Encoder {text_encoder_time:.2f} seconds, "
                   f"Image Encoder {image_encoder_time:.2f} seconds, "
                   f"VAE {vae_time:.2f} seconds, "
+                  f"Input VAE Debug {input_vae_debug_time:.2f} seconds, "
                   f"KV Cache Creation {kv_creation_time:.2f} seconds, "
                   f"Diffusion {diffusion_time:.2f} seconds, "
                   f"DIT Compute Steps {dit_compute_steps} steps, "
-                  f"Scheduler {scheduler_time:.2f} seconds")
+                  f"Scheduler/Other {scheduler_time:.2f} seconds")
             if video_refresh_time is not None and action_only_time is not None:
                 print(
                     "[MoT] diffusion split: "

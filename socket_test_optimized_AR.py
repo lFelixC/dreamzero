@@ -90,6 +90,10 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    save_input_vae_videos: bool = True
+    max_saved_input_vae_videos: int = 0  # <= 0 means unlimited.
+    input_vae_video_fps: int = 5
+    input_vae_video_dir: str | None = None
     use_rtc: bool = False
     rtc_execution_horizon: int = 10
     rtc_max_guidance_weight: float = 10.0
@@ -245,6 +249,10 @@ class ARDroidRoboarenaPolicy:
         image_width: int,
         output_dir: str | None = None,
         max_chunk_size: int | None = None,
+        save_input_vae_videos: bool = True,
+        max_saved_input_vae_videos: int = 0,
+        input_vae_video_fps: int = 5,
+        input_vae_video_dir: str | None = None,
         use_rtc: bool = False,
         rtc_execution_horizon: int = 10,
         rtc_max_guidance_weight: float = 10.0,
@@ -258,6 +266,12 @@ class ARDroidRoboarenaPolicy:
         self._image_width = image_width
         self._output_dir = output_dir
         self._max_chunk_size = max_chunk_size
+        self._save_input_vae_videos = save_input_vae_videos
+        self._max_saved_input_vae_videos = max_saved_input_vae_videos
+        self._input_vae_video_fps = input_vae_video_fps
+        self._input_vae_video_dir = input_vae_video_dir
+        self._saved_input_vae_video_count = 0
+        self._last_input_num_frames = 0
         self._use_rtc = use_rtc
         self._mot_inference_video_mode, self._cache_order_sensitive = _dreamzero_cache_mode(groot_policy)
         if self._cache_order_sensitive and self._use_rtc:
@@ -295,6 +309,11 @@ class ARDroidRoboarenaPolicy:
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+        if self._save_input_vae_videos:
+            if self._input_vae_video_dir is None and self._output_dir:
+                self._input_vae_video_dir = os.path.join(self._output_dir, "input_vae_roundtrip")
+            if self._input_vae_video_dir:
+                os.makedirs(self._input_vae_video_dir, exist_ok=True)
 
     def _infer_phase(self, rtc_requested: bool, had_previous_chunk: bool) -> str:
         if not rtc_requested:
@@ -325,6 +344,44 @@ class ARDroidRoboarenaPolicy:
             arr = arr.astype(np.uint8)
 
         return np.ascontiguousarray(arr)
+
+    def _make_input_vae_debug_spec(self, prompt: str) -> dict | None:
+        if not self._save_input_vae_videos or not self._input_vae_video_dir:
+            return None
+        if self._max_saved_input_vae_videos > 0 and (
+            self._saved_input_vae_video_count >= self._max_saved_input_vae_videos
+        ):
+            return None
+
+        save_index = self._saved_input_vae_video_count
+        self._saved_input_vae_video_count += 1
+        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S_%f")
+        save_dir = os.path.join(
+            self._input_vae_video_dir,
+            f"{save_index:06d}_msg_{self._msg_index:06d}_{timestamp}_t{self._last_input_num_frames}",
+        )
+
+        action_head = getattr(getattr(self._policy, "trained_model", None), "action_head", None)
+        model = getattr(action_head, "model", None)
+        return {
+            "save_dir": save_dir,
+            "filename": "model_input_vae_roundtrip.mp4",
+            "fps": self._input_vae_video_fps,
+            "meta": {
+                "save_index": save_index,
+                "msg_index": self._msg_index,
+                "call_count": self._call_count,
+                "num_server_input_frames": self._last_input_num_frames,
+                "prompt": prompt,
+                "is_first_call": self._is_first_call,
+                "current_start_frame_before_forward": getattr(action_head, "current_start_frame", None),
+                "local_attn_size": getattr(model, "local_attn_size", None),
+                "source": (
+                    "post-transform action_input['images'] VAE roundtrip, followed by "
+                    "constructed static-init latents decoded through the VAE"
+                ),
+            },
+        }
 
     def _append_frames_to_buffer(self, droid_key: str, data: np.ndarray) -> None:
         if data.ndim == 4:
@@ -444,6 +501,7 @@ class ARDroidRoboarenaPolicy:
             # Normal causal block: boundary/anchor frame plus 8 newly sampled
             # raw frames, matching DROID training's [0,3,...,24] block.
             num_frames = self.FRAMES_PER_CHUNK
+        self._last_input_num_frames = num_frames
         
         # Build video tensors from accumulated frames
         for droid_key, buffer in self._frame_buffers.items():
@@ -653,6 +711,10 @@ class ARDroidRoboarenaPolicy:
             with nvtx_range(f"dreamzero.ar.infer[{phase}].convert_observation"):
                 converted_obs = self._convert_observation(obs)
                 worker_obs = self._set_reset_flag(converted_obs, should_reset)
+                prompt_for_debug = str(converted_obs.get("annotation.language.action_text", ""))
+                input_vae_debug = self._make_input_vae_debug_spec(prompt_for_debug)
+                if input_vae_debug is not None:
+                    model_kwargs["input_vae_debug"] = input_vae_debug
 
             # Signal workers to continue (0 = continue)
             signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
@@ -1398,6 +1460,10 @@ def main(args: Args) -> None:
             image_width=image_width,
             output_dir=output_dir,
             max_chunk_size=args.max_chunk_size,
+            save_input_vae_videos=args.save_input_vae_videos,
+            max_saved_input_vae_videos=args.max_saved_input_vae_videos,
+            input_vae_video_fps=args.input_vae_video_fps,
+            input_vae_video_dir=args.input_vae_video_dir,
             use_rtc=args.use_rtc,
             rtc_execution_horizon=args.rtc_execution_horizon,
             rtc_max_guidance_weight=args.rtc_max_guidance_weight,
