@@ -51,6 +51,7 @@ import groot.vla.common.utils as U
 from groot.vla.data.dataset.lerobot_sharded import ShardedLeRobotMixtureDataset
 from groot.vla.data.schema import EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+from groot.vla.experiment.checkpoint_retention import CheckpointRetention
 from groot.vla.experiment.utils import (
     compute_grad_accum_to_match_global_bs,
     dtype_from_string,
@@ -1332,6 +1333,72 @@ class BaseTrainer(transformers.Trainer):
             torch.cuda.empty_cache()
 
         return ret
+
+    def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
+        """Override HuggingFace Trainer's checkpoint rotation to respect retention rules.
+
+        This extends the default rotation logic to support long-term checkpoint retention
+        rules like keep_every_n_steps and keep_milestone_steps, while still respecting
+        save_total_limit for recent non-protected checkpoints.
+
+        Protected checkpoints are excluded from the standard save_total_limit rotation,
+        allowing them to be kept indefinitely while still respecting the recent N limit
+        for temporary checkpoints.
+        """
+        if self.args.save_total_limit is None or self.args.save_total_limit <= 0:
+            return
+
+        # Initialize checkpoint retention manager if config exists
+        if not hasattr(self, "_checkpoint_retention"):
+            if hasattr(self, "base_cfg"):
+                self._checkpoint_retention = CheckpointRetention(
+                    self.base_cfg, Path(self.args.output_dir)
+                )
+            else:
+                # No config, fall back to default behavior
+                self._checkpoint_retention = None
+
+        # Get all checkpoints sorted by step number
+        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        if len(checkpoints_sorted) <= self.args.save_total_limit:
+            return
+
+        # Handle save_total_limit=1 with load_best_model_at_end=True safeguard
+        # If save_total_limit=1 with load_best_model_at_end=True, we could end up
+        # deleting the last checkpoint, which we don't do to allow resuming.
+        save_total_limit = self.args.save_total_limit
+        if (
+            self.state.best_model_checkpoint is not None
+            and self.args.save_total_limit == 1
+            and checkpoints_sorted[-1] != self.state.best_model_checkpoint
+        ):
+            save_total_limit = 2
+
+        # Use custom retention logic if configured
+        if self._checkpoint_retention is not None:
+            current_step = self.state.global_step
+            checkpoints_to_delete = self._checkpoint_retention.get_checkpoints_to_delete(
+                checkpoints_sorted,
+                current_step,
+                limit=save_total_limit,
+            )
+
+            # Additional safeguard: never delete best_model_checkpoint if it exists
+            best_model_checkpoint = self.state.best_model_checkpoint
+            if best_model_checkpoint is not None:
+                checkpoints_to_delete = [
+                    cp for cp in checkpoints_to_delete
+                    if str(Path(cp)) != str(Path(best_model_checkpoint))
+                ]
+
+            for checkpoint in checkpoints_to_delete:
+                logger.info(
+                    f"Deleting older checkpoint [{checkpoint}] (not protected by retention rules)"
+                )
+                shutil.rmtree(checkpoint, ignore_errors=True)
+        else:
+            # Fall back to default HuggingFace behavior
+            super()._rotate_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
 
     def train(
         self,

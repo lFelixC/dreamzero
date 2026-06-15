@@ -75,6 +75,14 @@ save_steps: 500
 eval_strategy: "no"  # there has to be a double quote; otherwise a bare `no` will be interpreted as False
 eval_steps: null
 save_total_limit: 8
+
+# ======== Checkpoint Retention ========
+# Long-term checkpoint retention rules (protected from save_total_limit rotation)
+checkpoint_retention:
+  keep_every_n_steps: null          # Keep one checkpoint every N steps (e.g., 20000)
+  keep_milestone_steps: []          # Keep checkpoints at specific milestones (e.g., [5000, 10000, 50000])
+  keep_best_n: 0                    # Keep N best checkpoints by eval metric (future: requires eval integration)
+
 report_to: wandb
 seed: 42
 do_eval: false
