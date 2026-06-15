@@ -34,6 +34,32 @@ DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend=
 
 logger = logging.getLogger(__name__)
 
+
+def _prefix_latent_frames_to_pixel_frames(prefix_latent_frames: int) -> int:
+    if prefix_latent_frames <= 0:
+        return 0
+    return 1 + 4 * (prefix_latent_frames - 1)
+
+
+def _decode_video_pred_chunks(action_head, chunks: list[tuple[torch.Tensor, int]]) -> list[np.ndarray]:
+    from einops import rearrange
+
+    frame_list: list[np.ndarray] = []
+    for latents, prefix_latent_frames in chunks:
+        with torch.no_grad():
+            frames = action_head.vae.decode(
+                latents,
+                tiled=action_head.tiled,
+                tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+            )
+        frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+        output_start = min(_prefix_latent_frames_to_pixel_frames(prefix_latent_frames), len(frames))
+        frame_list.extend(list(frames[output_start:]))
+    return frame_list
+
+
 RESET_FLAG_KEY = "__reset_policy_state__"
 CONTINUE_SIGNAL = 0
 SHUTDOWN_SIGNAL = 1
@@ -346,7 +372,7 @@ class AlohaBimanualPolicy:
         self._rtc_guidance_step_stride = rtc_guidance_step_stride
         self._current_session_id: str | None = None
         self._reset_next_infer = False
-        self._video_pred_latents: list[torch.Tensor] = []
+        self._video_pred_latents: list[tuple[torch.Tensor, int]] = []
         self._current_prompt = ""
         self._rtc_session_states: dict[str, RTCSessionState] = {}
         self._frame_buffers: dict[str, list[np.ndarray]] = {key: [] for key in self.VIDEO_KEYS}
@@ -647,20 +673,9 @@ class AlohaBimanualPolicy:
 
         try:
             import imageio
-            from einops import rearrange
 
             action_head = self._policy.trained_model.action_head
-            latents = torch.cat(self._video_pred_latents, dim=2)
-            with torch.no_grad():
-                frames = action_head.vae.decode(
-                    latents,
-                    tiled=action_head.tiled,
-                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
-                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
-                )
-
-            frames = rearrange(frames, "B C T H W -> B T H W C")[0]
-            frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+            frames = _decode_video_pred_chunks(action_head, self._video_pred_latents)
             if len(frames) == 0:
                 return
 
@@ -693,7 +708,7 @@ class AlohaBimanualPolicy:
         self._is_first_call = True
         _reset_model_temporal_state(self._policy)
 
-    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+    def _prepare_video_pred_for_saving(self, video_pred: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         condition_latent_frames = int(
             getattr(
                 self._policy.trained_model.action_head,
@@ -703,23 +718,17 @@ class AlohaBimanualPolicy:
             or 0
         )
         if condition_latent_frames <= 0:
-            return video_pred
+            return video_pred.detach(), 0
         if video_pred.ndim < 3:
             logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
-            return video_pred
-        if video_pred.shape[2] <= condition_latent_frames:
-            logger.warning(
-                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
-                condition_latent_frames,
-                tuple(video_pred.shape),
-            )
-            return None
+            return video_pred.detach(), 0
+        condition_latent_frames = min(condition_latent_frames, video_pred.shape[2])
         logger.info(
-            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            "Keeping %d condition/input latent frame(s) for per-chunk VAE decode; video_pred shape=%s",
             condition_latent_frames,
             tuple(video_pred.shape),
         )
-        return video_pred[:, :, condition_latent_frames:]
+        return video_pred.detach(), condition_latent_frames
 
     def flush_pending_video(self) -> None:
         self._reset_local_state(save_video=True)
@@ -805,9 +814,9 @@ class AlohaBimanualPolicy:
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
         dist.barrier()
         if video_pred is not None and self._output_dir:
-            video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+            video_pred_to_save = self._prepare_video_pred_for_saving(video_pred)
             if video_pred_to_save is not None:
-                self._video_pred_latents.append(video_pred_to_save.detach())
+                self._video_pred_latents.append(video_pred_to_save)
 
         action_dict = _extract_action_dict(result_batch.act)
         action = self._convert_action(action_dict)

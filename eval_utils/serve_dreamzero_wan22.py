@@ -78,6 +78,31 @@ DEFAULT_IMAGE_WIDTH = 320
 FRAMES_PER_CHUNK = 4  # matches 5B num_frame_per_block for causal chunked inference
 
 
+def _prefix_latent_frames_to_pixel_frames(prefix_latent_frames: int) -> int:
+    if prefix_latent_frames <= 0:
+        return 0
+    return 1 + 4 * (prefix_latent_frames - 1)
+
+
+def _decode_video_pred_chunks(action_head, chunks: list[tuple[torch.Tensor, int]]) -> list[np.ndarray]:
+    from einops import rearrange
+
+    frame_list: list[np.ndarray] = []
+    for latents, prefix_latent_frames in chunks:
+        with torch.no_grad():
+            frames = action_head.vae.decode(
+                latents,
+                tiled=action_head.tiled,
+                tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+            )
+        frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+        output_start = min(_prefix_latent_frames_to_pixel_frames(prefix_latent_frames), len(frames))
+        frame_list.extend(list(frames[output_start:]))
+    return frame_list
+
+
 def _get_expected_video_resolution(policy: GrootSimPolicy) -> tuple[int, int]:
     """Get (height, width) the policy's eval_transform expects for video (from checkpoint
     metadata). Resolution in metadata is (width, height); we return (height, width) for resize.
@@ -182,7 +207,7 @@ class DreamZeroWan225BPolicy(BasePolicy):
         self._current_session_id = None
         self._save_video_pred = save_video_pred
         self._video_output_dir = video_output_dir
-        self._video_pred_latents: list[torch.Tensor] = []
+        self._video_pred_latents: list[tuple[torch.Tensor, int]] = []
         self._current_prompt: str = ""
 
     def _request_phase(self) -> str:
@@ -289,9 +314,9 @@ class DreamZeroWan225BPolicy(BasePolicy):
                     result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
             if self._save_video_pred and video_pred is not None:
                 with nvtx_range(f"dreamzero.simple.infer[{phase}].video_pred_buffer"):
-                    video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+                    video_pred_to_save = self._prepare_video_pred_for_saving(video_pred)
                     if video_pred_to_save is not None:
-                        self._video_pred_latents.append(video_pred_to_save.detach())
+                        self._video_pred_latents.append(video_pred_to_save)
             with nvtx_range(f"dreamzero.simple.infer[{phase}].action_postprocess"):
                 action_dict = {}
                 action_chunk_dict = result_batch.act
@@ -303,7 +328,7 @@ class DreamZeroWan225BPolicy(BasePolicy):
             self._is_first_call = False
         return action
 
-    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+    def _prepare_video_pred_for_saving(self, video_pred: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         condition_latent_frames = int(
             getattr(
                 self._policy.trained_model.action_head,
@@ -313,23 +338,17 @@ class DreamZeroWan225BPolicy(BasePolicy):
             or 0
         )
         if condition_latent_frames <= 0:
-            return video_pred
+            return video_pred.detach(), 0
         if video_pred.ndim < 3:
             logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
-            return video_pred
-        if video_pred.shape[2] <= condition_latent_frames:
-            logger.warning(
-                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
-                condition_latent_frames,
-                tuple(video_pred.shape),
-            )
-            return None
+            return video_pred.detach(), 0
+        condition_latent_frames = min(condition_latent_frames, video_pred.shape[2])
         logger.info(
-            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            "Keeping %d condition/input latent frame(s) for per-chunk VAE decode; video_pred shape=%s",
             condition_latent_frames,
             tuple(video_pred.shape),
         )
-        return video_pred[:, :, condition_latent_frames:]
+        return video_pred.detach(), condition_latent_frames
 
     def _save_predicted_video(self) -> None:
         """Decode accumulated video prediction latents through the VAE and save as mp4."""
@@ -337,23 +356,14 @@ class DreamZeroWan225BPolicy(BasePolicy):
             return
         with nvtx_range("dreamzero.simple.reset.video_decode_save"):
             try:
-                from einops import rearrange
-
                 action_head = self._policy.trained_model.action_head
-                latents = torch.cat(self._video_pred_latents, dim=2)
-                with torch.no_grad():
-                    frames = action_head.vae.decode(
-                        latents,
-                        tiled=action_head.tiled,
-                        tile_size=(action_head.tile_size_height, action_head.tile_size_width),
-                        tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
-                    )
-                frames = rearrange(frames, "B C T H W -> B T H W C")[0]
-                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                frames = _decode_video_pred_chunks(action_head, self._video_pred_latents)
+                if not frames:
+                    logger.warning("No predicted video frames to save after prefix trimming.")
+                    return
 
                 os.makedirs(self._video_output_dir, exist_ok=True)
                 timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                n_latent_frames = latents.shape[2]
                 existing = [f for f in os.listdir(self._video_output_dir) if f.endswith(".mp4")]
                 safe_prompt = self._current_prompt.replace(" ", "_")
                 safe_prompt = "".join(c for c in safe_prompt if c.isalnum() or c in "_-.")

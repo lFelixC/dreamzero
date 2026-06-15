@@ -11,7 +11,6 @@ from pathlib import Path
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
-from einops import rearrange
 import imageio
 import torch
 from torch.distributed.device_mesh import init_device_mesh
@@ -24,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 from eval_utils.policy_server import PolicyServerConfig, WebsocketPolicyServer
 from eval_utils.serve_dreamzero_wan22 import (  # noqa: E402
     DreamZeroWan225BPolicy,
+    _decode_video_pred_chunks,
     _get_expected_video_resolution,
     _maybe_init_distributed,
 )
@@ -96,23 +96,11 @@ class SessionAwareDreamZeroPolicy(DreamZeroWan225BPolicy):
         output_path = self._session_run_dir() / "pred.mp4"
         try:
             action_head = self._policy.trained_model.action_head
-            latents = torch.cat(self._video_pred_latents, dim=2)
-            with torch.no_grad():
-                frames = action_head.vae.decode(
-                    latents,
-                    tiled=action_head.tiled,
-                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
-                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
-                )
-            frames = rearrange(frames, "B C T H W -> B T H W C")[0]
-            frames = (
-                ((frames.float() + 1) * 127.5)
-                .clip(0, 255)
-                .cpu()
-                .numpy()
-                .astype("uint8")
-            )
-            imageio.mimsave(str(output_path), list(frames), fps=5, codec="libx264")
+            frames = _decode_video_pred_chunks(action_head, self._video_pred_latents)
+            if not frames:
+                append_run_log(self._session_log_path(), "[server] no predicted frames after prefix trimming")
+                return
+            imageio.mimsave(str(output_path), frames, fps=5, codec="libx264")
             append_run_log(
                 self._session_log_path(),
                 f"[server] saved_pred_video={output_path} frames={len(frames)}",

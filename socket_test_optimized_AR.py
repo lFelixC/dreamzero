@@ -54,6 +54,30 @@ WAN_MOT_MODEL_TARGET = "groot.vla.model.dreamzero.modules.dreamzero_mot.MoTCausa
 
 logger = logging.getLogger(__name__)
 
+
+def _prefix_latent_frames_to_pixel_frames(prefix_latent_frames: int) -> int:
+    if prefix_latent_frames <= 0:
+        return 0
+    return 1 + 4 * (prefix_latent_frames - 1)
+
+
+def _decode_video_pred_chunks(action_head, chunks: list[tuple[torch.Tensor, int]]) -> list[np.ndarray]:
+    frame_list: list[np.ndarray] = []
+    for latents, prefix_latent_frames in chunks:
+        with torch.no_grad():
+            frames = action_head.vae.decode(
+                latents,
+                tiled=action_head.tiled,
+                tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+            )
+        frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+        output_start = min(_prefix_latent_frames_to_pixel_frames(prefix_latent_frames), len(frames))
+        frame_list.extend(list(frames[output_start:]))
+    return frame_list
+
+
 @dataclasses.dataclass
 class Args:
     host: str = "0.0.0.0"
@@ -659,7 +683,7 @@ class ARDroidRoboarenaPolicy:
 
             # Store video predictions for potential saving.
             if video_pred is not None:
-                video_pred_to_save = self._drop_condition_latents_from_video_pred(video_pred)
+                video_pred_to_save = self._prepare_video_pred_for_saving(video_pred)
                 if video_pred_to_save is not None:
                     self.video_across_time.append(video_pred_to_save)
 
@@ -703,7 +727,7 @@ class ARDroidRoboarenaPolicy:
         
         return action
     
-    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+    def _prepare_video_pred_for_saving(self, video_pred: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         condition_latent_frames = int(
             getattr(
                 self._policy.trained_model.action_head,
@@ -713,23 +737,17 @@ class ARDroidRoboarenaPolicy:
             or 0
         )
         if condition_latent_frames <= 0:
-            return video_pred
+            return video_pred.detach(), 0
         if video_pred.ndim < 3:
             logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
-            return video_pred
-        if video_pred.shape[2] <= condition_latent_frames:
-            logger.warning(
-                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
-                condition_latent_frames,
-                tuple(video_pred.shape),
-            )
-            return None
+            return video_pred.detach(), 0
+        condition_latent_frames = min(condition_latent_frames, video_pred.shape[2])
         logger.info(
-            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            "Keeping %d condition/input latent frame(s) for per-chunk VAE decode; video_pred shape=%s",
             condition_latent_frames,
             tuple(video_pred.shape),
         )
-        return video_pred[:, :, condition_latent_frames:]
+        return video_pred.detach(), condition_latent_frames
 
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
@@ -742,19 +760,10 @@ class ARDroidRoboarenaPolicy:
             if save_video and len(self.video_across_time) > 0 and self._output_dir:
                 with nvtx_range("dreamzero.ar.reset.video_decode_save"):
                     try:
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                        frame_list = _decode_video_pred_chunks(
+                            self._policy.trained_model.action_head,
+                            self.video_across_time,
                         )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        for frame in frames:
-                            frame_list.append(frame)
 
                         if len(frame_list) > 0:
                             sample_frame = frame_list[0]
@@ -764,7 +773,7 @@ class ARDroidRoboarenaPolicy:
                                 all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                                 timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                                 num_frames = len(frame_list)
-                                n = (num_frames - 1) // 8
+                                n = num_frames // self.RAW_FRAMES_PER_BLOCK
                                 output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                                 imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                                 logger.info(f"Saved video on reset to: {output_path}")
@@ -893,7 +902,7 @@ class WebsocketPolicyServer:
                 logger.warning(f"Failed to save obs key '{key}': {e}")
                 continue
 
-    def _drop_condition_latents_from_video_pred(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+    def _prepare_video_pred_for_saving(self, video_pred: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         condition_latent_frames = int(
             getattr(
                 self._policy.trained_model.action_head,
@@ -903,23 +912,17 @@ class WebsocketPolicyServer:
             or 0
         )
         if condition_latent_frames <= 0:
-            return video_pred
+            return video_pred.detach(), 0
         if video_pred.ndim < 3:
             logger.warning("Unexpected video_pred shape %s; keeping it unchanged", tuple(video_pred.shape))
-            return video_pred
-        if video_pred.shape[2] <= condition_latent_frames:
-            logger.warning(
-                "Dropping all %d condition latent frame(s) would empty video_pred shape=%s; skipping append",
-                condition_latent_frames,
-                tuple(video_pred.shape),
-            )
-            return None
+            return video_pred.detach(), 0
+        condition_latent_frames = min(condition_latent_frames, video_pred.shape[2])
         logger.info(
-            "Dropping %d reset condition latent frame(s) from video_pred shape=%s",
+            "Keeping %d condition/input latent frame(s) for per-chunk VAE decode; video_pred shape=%s",
             condition_latent_frames,
             tuple(video_pred.shape),
         )
-        return video_pred[:, :, condition_latent_frames:]
+        return video_pred.detach(), condition_latent_frames
 
 
 
@@ -1068,7 +1071,7 @@ class WebsocketPolicyServer:
 
                     action_chunk_dict = result_batch.act
                     video_chunk = (
-                        self._drop_condition_latents_from_video_pred(video_pred)
+                        self._prepare_video_pred_for_saving(video_pred)
                         if video_pred is not None
                         else None
                     )
@@ -1079,20 +1082,10 @@ class WebsocketPolicyServer:
                         self.video_across_time.append(video_chunk)
 
                     if len(self.video_across_time) > 10:
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                        frame_list = _decode_video_pred_chunks(
+                            self._policy.trained_model.action_head,
+                            self.video_across_time,
                         )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
 
                         sample_frame = frame_list[0]
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
@@ -1102,7 +1095,7 @@ class WebsocketPolicyServer:
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
+                            n = num_frames // 8
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")
@@ -1112,20 +1105,10 @@ class WebsocketPolicyServer:
                         self.video_across_time = []
                     elif self._policy.trained_model.action_head.current_start_frame == 1 + self._policy.trained_model.action_head.num_frame_per_block and len(self.video_across_time) > 1:
                         print("current_start_frame == 1 + num_frame_per_block and len(self.video_across_time) > 1")
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time[:-1], dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                        frame_list = _decode_video_pred_chunks(
+                            self._policy.trained_model.action_head,
+                            self.video_across_time[:-1],
                         )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
                         sample_frame = frame_list[0]
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                             # Save all frames as a single MP4 file
@@ -1134,7 +1117,7 @@ class WebsocketPolicyServer:
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
+                            n = num_frames // 8
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")
@@ -1154,20 +1137,10 @@ class WebsocketPolicyServer:
                 except websockets.ConnectionClosed:
                     logger.info(f"Connection from {websocket.remote_address} closed")
                     if len(self.video_across_time) > 0:
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                        frame_list = _decode_video_pred_chunks(
+                            self._policy.trained_model.action_head,
+                            self.video_across_time,
                         )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
 
                         sample_frame = frame_list[0]
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
@@ -1177,7 +1150,7 @@ class WebsocketPolicyServer:
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
+                            n = num_frames // 8
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")

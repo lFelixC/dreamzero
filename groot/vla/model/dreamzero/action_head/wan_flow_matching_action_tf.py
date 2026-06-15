@@ -2336,6 +2336,9 @@ class WANPolicyHead(ActionHead):
         image = image.transpose(1, 2)
         if observed_prefix_latents is not None:
             observed_prefix_latents = observed_prefix_latents.transpose(1, 2)
+        # video_pred is decoded outside the model for visualization. Wan VAE is temporal-causal,
+        # so every predicted block must be decoded with the clean observed prefix from this call.
+        video_decode_prefix = observed_prefix_latents if observed_prefix_latents is not None else image
         noise_obs = noise_obs.transpose(1, 2)
 
         if self.current_start_frame == 0:
@@ -2695,9 +2698,9 @@ class WANPolicyHead(ActionHead):
                     )[0]
 
             output = noisy_input
-            if self.current_start_frame == 1:
-                output = torch.cat([image, output], dim=1)
-                condition_latent_frames = image.shape[1]
+            if video_decode_prefix is not None:
+                output = torch.cat([video_decode_prefix, output], dim=1)
+                condition_latent_frames = video_decode_prefix.shape[1]
             if self.ip_rank == 0:
                 print(
                     "[MoT] decoupled_denoise compute: "
@@ -2782,9 +2785,9 @@ class WANPolicyHead(ActionHead):
                 )[0]
 
             output = noisy_input
-            if self.current_start_frame == 1:
-                output = torch.cat([image, output], dim=1)
-                condition_latent_frames = image.shape[1]
+            if video_decode_prefix is not None:
+                output = torch.cat([video_decode_prefix, output], dim=1)
+                condition_latent_frames = video_decode_prefix.shape[1]
         self.last_video_pred_condition_latent_frames = condition_latent_frames
         self.current_start_frame += self.num_frame_per_block
 
