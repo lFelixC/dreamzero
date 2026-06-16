@@ -519,6 +519,9 @@ class WANPolicyHead(ActionHead):
             getattr(self.config, "static_video_init_noise", self.static_video_init_noise),
         )
 
+    def _mask_static_video_from_action(self) -> bool:
+        return self._static_video_init_enabled() and self._static_video_init_noise_ratio() < 1.0
+
     def _mix_static_init_with_noise(
         self,
         static_latents: torch.Tensor,
@@ -1452,6 +1455,23 @@ class WANPolicyHead(ActionHead):
                     device=self._device,
                     dtype=torch.bool,
                 ).any(dim=2)
+            if static_init_latents is not None and self._mask_static_video_from_action():
+                action_video_frame_mask = torch.ones(
+                    latents.shape[0],
+                    latents.shape[1],
+                    device=latents.device,
+                    dtype=torch.bool,
+                )
+                if latent_frame_mask is not None:
+                    action_video_frame_mask &= latent_frame_mask.to(
+                        device=latents.device,
+                        dtype=torch.bool,
+                    )
+                action_video_frame_mask[:, 1:] = False
+                model_mask_kwargs["action_video_frame_mask"] = action_video_frame_mask.to(
+                    device=self._device,
+                    dtype=torch.bool,
+                )
 
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
@@ -1591,6 +1611,7 @@ class WANPolicyHead(ActionHead):
         kv_caches: list[KVCacheType],
         crossattn_caches: list[KVCacheType],
         kv_cache_metadata: dict[str, bool | int],
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         predictions = []
         for index, prompt_emb in enumerate(context):
@@ -1609,6 +1630,7 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_caches[index],
                     crossattn_cache=crossattn_caches[index],
                     kv_cache_metadata=kv_cache_metadata,
+                    action_video_frame_mask=action_video_frame_mask,
                 )
             )
         return self._exchange_predictions(predictions)
@@ -1629,6 +1651,7 @@ class WANPolicyHead(ActionHead):
         crossattn_cache: KVCacheType,
         kv_cache_metadata: dict[str, bool | int],
         allow_trt: bool = True,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             allow_trt
@@ -1648,6 +1671,9 @@ class WANPolicyHead(ActionHead):
                 kv_cache=kv_cache,
             )
         else:
+            model_kwargs = {}
+            if action_video_frame_mask is not None and getattr(self.model, "is_mot_wam", False):
+                model_kwargs["action_video_frame_mask"] = action_video_frame_mask
             obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
                 noisy_input,
                 timestep,
@@ -1662,6 +1688,7 @@ class WANPolicyHead(ActionHead):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start_frame=kv_cache_metadata["start_frame"],
+                **model_kwargs,
             )
             if kv_cache_metadata["update_kv_cache"]:
                 for block_index, updated_kv_cache in enumerate(updated_kv_caches):
@@ -1808,6 +1835,7 @@ class WANPolicyHead(ActionHead):
         kv_cache: KVCacheType,
         crossattn_cache: KVCacheType,
         current_start_frame: int,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         if not getattr(self.model, "is_mot_wam", False):
             raise RuntimeError("MoT decoupled denoise refresh requires MoTCausalWanModel.")
@@ -1826,6 +1854,7 @@ class WANPolicyHead(ActionHead):
             kv_cache=kv_cache,
             crossattn_cache=crossattn_cache,
             current_start_frame=current_start_frame,
+            action_video_frame_mask=action_video_frame_mask,
         )
         return (
             obs_noise_pred.clone(),
@@ -1847,6 +1876,7 @@ class WANPolicyHead(ActionHead):
         kv_caches: list[KVCacheType],
         crossattn_caches: list[KVCacheType],
         current_start_frame: int,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None]:
         predictions = []
         cond_video_kv: list[torch.Tensor] | None = None
@@ -1864,6 +1894,7 @@ class WANPolicyHead(ActionHead):
                 kv_cache=kv_caches[index],
                 crossattn_cache=crossattn_caches[index],
                 current_start_frame=current_start_frame,
+                action_video_frame_mask=action_video_frame_mask,
             )
             predictions.append((obs_pred, action_pred))
             if (self.ip_size == 1 or self.ip_rank == 0) and index == 0:
@@ -1883,6 +1914,7 @@ class WANPolicyHead(ActionHead):
         current_start_frame: int,
         prefix_kv_cache: list[torch.Tensor] | None = None,
         current_video_token_len: int | None = None,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.ip_size > 1 and self.ip_rank != 0:
             return self._broadcast_cond_tensor(torch.empty_like(noisy_input_action))
@@ -1900,6 +1932,7 @@ class WANPolicyHead(ActionHead):
             current_start_frame=current_start_frame,
             prefix_kv_cache=prefix_kv_cache,
             current_video_token_len=current_video_token_len,
+            action_video_frame_mask=action_video_frame_mask,
         )
         if self.ip_size > 1:
             action_noise_pred = self._broadcast_cond_tensor(action_noise_pred)
@@ -2062,6 +2095,7 @@ class WANPolicyHead(ActionHead):
         rtc_max_guidance_weight: float,
         rtc_prefix_attention_schedule: str,
         apply_rtc_guidance: bool = True,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         kv_cache_metadata = dict(
             start_frame=start_frame,
@@ -2082,6 +2116,7 @@ class WANPolicyHead(ActionHead):
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=kv_cache_metadata,
+                action_video_frame_mask=action_video_frame_mask,
             )
             return self._combine_cfg_predictions(predictions)
 
@@ -2123,6 +2158,7 @@ class WANPolicyHead(ActionHead):
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=kv_cache_metadata,
+                action_video_frame_mask=action_video_frame_mask,
             )
             return self._combine_cfg_predictions(predictions)
 
@@ -2161,6 +2197,7 @@ class WANPolicyHead(ActionHead):
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=kv_cache_metadata,
+                action_video_frame_mask=action_video_frame_mask,
             )
             return self._combine_cfg_predictions(predictions)
 
@@ -2185,6 +2222,7 @@ class WANPolicyHead(ActionHead):
                     crossattn_cache=crossattn_caches[0],
                     kv_cache_metadata=kv_cache_metadata,
                     allow_trt=False,
+                    action_video_frame_mask=action_video_frame_mask,
                 )
             flow_pred_cond = flow_pred_cond.detach()
 
@@ -2204,6 +2242,7 @@ class WANPolicyHead(ActionHead):
                         kv_cache=kv_caches[1],
                         crossattn_cache=crossattn_caches[1],
                         kv_cache_metadata=kv_cache_metadata,
+                        action_video_frame_mask=action_video_frame_mask,
                     )
                 flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
             else:
@@ -2232,6 +2271,7 @@ class WANPolicyHead(ActionHead):
                         crossattn_cache=crossattn_caches[0],
                         kv_cache_metadata=kv_cache_metadata,
                         allow_trt=False,
+                        action_video_frame_mask=action_video_frame_mask,
                     )
                 local_prediction = (local_prediction[0].detach(), local_prediction[1])
             else:
@@ -2250,6 +2290,7 @@ class WANPolicyHead(ActionHead):
                         kv_cache=kv_caches[0],
                         crossattn_cache=crossattn_caches[0],
                         kv_cache_metadata=kv_cache_metadata,
+                        action_video_frame_mask=action_video_frame_mask,
                     )
 
             predictions = self._exchange_predictions([local_prediction])
@@ -2610,6 +2651,14 @@ class WANPolicyHead(ActionHead):
 
         noisy_input = noise_obs
         noisy_input_action = noise_action
+        action_video_frame_mask = None
+        if getattr(self.model, "is_mot_wam", False) and self._mask_static_video_from_action():
+            action_video_frame_mask = torch.zeros(
+                batch_size,
+                self.num_frame_per_block,
+                device=noise_obs.device,
+                dtype=torch.bool,
+            )
 
         # Step 3.1: Spatial denoising loop
 
@@ -2736,6 +2785,7 @@ class WANPolicyHead(ActionHead):
                             kv_caches=kv_caches,
                             crossattn_caches=crossattn_caches,
                             current_start_frame=self.current_start_frame,
+                            action_video_frame_mask=action_video_frame_mask,
                         )
                     else:
                         action_compute_steps += 1
@@ -2748,6 +2798,7 @@ class WANPolicyHead(ActionHead):
                             current_start_frame=self.current_start_frame,
                             prefix_kv_cache=kv_caches[0],
                             current_video_token_len=seq_len,
+                            action_video_frame_mask=action_video_frame_mask,
                         )
 
                     end_diffusion_events[index].record()
@@ -2820,6 +2871,7 @@ class WANPolicyHead(ActionHead):
                             kv_caches=kv_caches,
                             crossattn_caches=crossattn_caches,
                             current_start_frame=self.current_start_frame,
+                            action_video_frame_mask=action_video_frame_mask,
                         )
                         latest_video_flow = flow_pred
                     else:
@@ -2836,6 +2888,7 @@ class WANPolicyHead(ActionHead):
                             current_start_frame=self.current_start_frame,
                             prefix_kv_cache=kv_caches[0],
                             current_video_token_len=seq_len,
+                            action_video_frame_mask=action_video_frame_mask,
                         )
 
                     end_diffusion_events[index].record()
@@ -2916,6 +2969,7 @@ class WANPolicyHead(ActionHead):
                         rtc_max_guidance_weight=rtc_max_guidance_weight,
                         rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
                         apply_rtc_guidance=apply_rtc_guidance,
+                        action_video_frame_mask=action_video_frame_mask,
                     )
                     prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
                     max_cache_size = 2

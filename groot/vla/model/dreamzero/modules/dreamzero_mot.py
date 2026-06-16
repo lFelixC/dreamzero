@@ -959,6 +959,32 @@ class MoTCausalWanModel(CausalWanModel):
             return self._drop_full_true_mask(video_key_mask)
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
+    def _build_action_video_attention_mask(
+        self,
+        *,
+        video_token_mask: torch.Tensor | None,
+        action_video_token_mask: torch.Tensor | None,
+        clean_seq_len: int,
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if action_video_token_mask is None:
+            if clean_seq_len > 0 and video_token_mask is not None:
+                return torch.cat([video_token_mask, video_token_mask], dim=1)
+            return video_token_mask
+
+        action_video_token_mask = self._align_token_mask(action_video_token_mask, seq_len, device)
+        if clean_seq_len <= 0:
+            return self._drop_full_true_mask(action_video_token_mask)
+
+        if video_token_mask is None:
+            clean_mask = torch.ones(batch_size, clean_seq_len, dtype=torch.bool, device=device)
+        else:
+            clean_mask = self._align_token_mask(video_token_mask, clean_seq_len, device)
+            assert clean_mask is not None
+        return self._drop_full_true_mask(torch.cat([clean_mask, action_video_token_mask], dim=1))
+
     def _select_cached_video_kv_for_action(
         self,
         updated_kv_cache: torch.Tensor,
@@ -993,6 +1019,70 @@ class MoTCausalWanModel(CausalWanModel):
                     video_k = video_k[:, -max_tokens:]
                     video_v = video_v[:, -max_tokens:]
             return video_k, video_v
+        raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
+
+    def _select_cached_video_mask_for_action(
+        self,
+        updated_kv_cache: torch.Tensor,
+        prefix_kv_cache: torch.Tensor | None = None,
+        current_video_token_len: int | None = None,
+        current_video_key_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if current_video_key_mask is None:
+            return None
+
+        mode = self.mot_action_video_attention
+        if mode == "none":
+            return None
+
+        video_length = updated_kv_cache[0].shape[1]
+        batch_size = updated_kv_cache[0].shape[0]
+        device = updated_kv_cache.device
+        current_video_key_mask = self._align_token_mask(
+            current_video_key_mask,
+            int(current_video_token_len or current_video_key_mask.shape[1]),
+            device,
+        )
+        assert current_video_key_mask is not None
+
+        if mode == "first_frame":
+            if prefix_kv_cache is not None and prefix_kv_cache.shape[2] > 0:
+                return None
+            end = min(self.frame_seqlen, video_length, current_video_key_mask.shape[1])
+            return self._drop_full_true_mask(current_video_key_mask[:, :end])
+
+        if mode == "full_video":
+            if (
+                prefix_kv_cache is not None
+                and prefix_kv_cache.shape[2] > 0
+                and current_video_token_len is not None
+                and video_length <= int(current_video_token_len)
+            ):
+                prefix_mask = torch.ones(
+                    batch_size,
+                    prefix_kv_cache.shape[2],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                current_mask = self._align_token_mask(current_video_key_mask, video_length, device)
+                assert current_mask is not None
+                mask = torch.cat([prefix_mask, current_mask], dim=1)
+                if self.local_attn_size != -1:
+                    max_tokens = self.local_attn_size * self.frame_seqlen
+                    mask = mask[:, -max_tokens:]
+                return self._drop_full_true_mask(mask)
+
+            mask = torch.ones(batch_size, video_length, dtype=torch.bool, device=device)
+            if current_video_token_len is None:
+                current_len = min(current_video_key_mask.shape[1], video_length)
+            else:
+                current_len = min(int(current_video_token_len), video_length)
+            if current_len > 0:
+                current_mask = self._align_token_mask(current_video_key_mask, current_len, device)
+                assert current_mask is not None
+                mask[:, -current_len:] = current_mask[:, -current_len:]
+            return self._drop_full_true_mask(mask)
+
         raise ValueError(f"Unsupported mot_action_video_attention={self.mot_action_video_attention!r}")
 
     @staticmethod
@@ -1303,6 +1393,7 @@ class MoTCausalWanModel(CausalWanModel):
         context: torch.Tensor | None,
         video_kv: tuple[torch.Tensor, torch.Tensor] | None,
         current_start_frame: int,
+        video_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         action_register_length = tokens.shape[1]
         (
@@ -1343,7 +1434,7 @@ class MoTCausalWanModel(CausalWanModel):
                 v_action=v_action,
                 video_kv=video_kv,
                 action_key_mask=None,
-                video_key_mask=None,
+                video_key_mask=video_key_mask,
                 num_state_per_block=num_state_per_block,
                 clean_seq_len=0,
                 cached_current_start_frame=current_start_frame,
@@ -1352,12 +1443,19 @@ class MoTCausalWanModel(CausalWanModel):
             if video_kv is None:
                 k_context = k_action
                 v_context = v_action
+                key_mask = None
             else:
                 video_k, video_v = video_kv
                 k_context = torch.cat([video_k, k_action], dim=1)
                 v_context = torch.cat([video_v, v_action], dim=1)
+                key_mask = self._concat_key_masks(
+                    [video_key_mask, None],
+                    [video_k.shape[1], k_action.shape[1]],
+                    batch_size=tokens.shape[0],
+                    device=tokens.device,
+                )
 
-            mixed = block.attn(q_action, k_context, v_context).flatten(2)
+            mixed = block.attn(q_action, k_context, v_context, key_mask=key_mask).flatten(2)
         return block.apply_mixed_attention_output(
             residual_x=residual_tokens,
             mixed_attn_out=mixed,
@@ -1383,6 +1481,7 @@ class MoTCausalWanModel(CausalWanModel):
         timestep_action=None,
         state=None,
         embodiment_id=None,
+        action_video_frame_mask=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         if self.model_type == "i2v":
             assert clip_feature is not None and y is not None
@@ -1449,6 +1548,14 @@ class MoTCausalWanModel(CausalWanModel):
                 state=state,
                 embodiment_id=embodiment_id,
             )
+        current_video_key_mask = None
+        if action_video_frame_mask is not None:
+            current_video_key_mask = self._build_video_token_mask(
+                video_frame_mask=action_video_frame_mask,
+                video_frames=action_video_frame_mask.shape[1],
+                seq_len=seq_len,
+                device=x.device,
+            )
 
         updated_kv_caches: list[torch.Tensor] = []
         for layer_idx, block in enumerate(self.blocks):
@@ -1467,17 +1574,25 @@ class MoTCausalWanModel(CausalWanModel):
                 continue
 
             assert action_e is not None
+            video_kv = self._select_cached_video_kv_for_action(
+                updated_kv_cache,
+                prefix_kv_cache=kv_cache[layer_idx],
+                current_video_token_len=seq_len,
+            )
+            video_key_mask = self._select_cached_video_mask_for_action(
+                updated_kv_cache,
+                prefix_kv_cache=kv_cache[layer_idx],
+                current_video_token_len=seq_len,
+                current_video_key_mask=current_video_key_mask,
+            )
             action_tokens = self._run_action_expert_block_cached(
                 block=self.action_expert.blocks[layer_idx],
                 tokens=action_tokens,
                 e=action_e,
                 context=None,
-                video_kv=self._select_cached_video_kv_for_action(
-                    updated_kv_cache,
-                    prefix_kv_cache=kv_cache[layer_idx],
-                    current_video_token_len=seq_len,
-                ),
+                video_kv=video_kv,
                 current_start_frame=current_start_frame,
+                video_key_mask=video_key_mask,
             )
 
         x_video = self.head(x[:, :seq_len], e[:, :seq_len].unsqueeze(2))
@@ -1508,6 +1623,7 @@ class MoTCausalWanModel(CausalWanModel):
         require_full_video: bool = False,
         prefix_kv_cache: list[torch.Tensor] | None = None,
         current_video_token_len: int | None = None,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run only the MoT action expert using a supplied per-layer video K/V cache."""
         if require_full_video and self.mot_action_video_attention != "full_video":
@@ -1527,6 +1643,17 @@ class MoTCausalWanModel(CausalWanModel):
             embodiment_id=embodiment_id,
         )
 
+        current_video_key_mask = None
+        if action_video_frame_mask is not None:
+            if current_video_token_len is None:
+                raise ValueError("action_video_frame_mask requires current_video_token_len.")
+            current_video_key_mask = self._build_video_token_mask(
+                video_frame_mask=action_video_frame_mask,
+                video_frames=action_video_frame_mask.shape[1],
+                seq_len=current_video_token_len,
+                device=action.device,
+            )
+
         for layer_idx, block in enumerate(self.action_expert.blocks):
             layer_prefix_kv = None
             if prefix_kv_cache is not None:
@@ -1535,6 +1662,12 @@ class MoTCausalWanModel(CausalWanModel):
                 kv_cache[layer_idx],
                 prefix_kv_cache=layer_prefix_kv,
                 current_video_token_len=current_video_token_len,
+            )
+            layer_video_key_mask = self._select_cached_video_mask_for_action(
+                kv_cache[layer_idx],
+                prefix_kv_cache=layer_prefix_kv,
+                current_video_token_len=current_video_token_len,
+                current_video_key_mask=current_video_key_mask,
             )
 
             if torch.is_grad_enabled() and self.action_expert.use_gradient_checkpointing:
@@ -1548,6 +1681,7 @@ class MoTCausalWanModel(CausalWanModel):
                             context=None,
                             video_kv=None,
                             current_start_frame=current_start_frame,
+                            video_key_mask=None,
                         )
 
                     action_tokens = torch.utils.checkpoint.checkpoint(
@@ -1565,6 +1699,7 @@ class MoTCausalWanModel(CausalWanModel):
                         video_k,
                         video_v,
                         _block=block,
+                        _video_mask=layer_video_key_mask,
                     ):
                         return self._run_action_expert_block_cached(
                             block=_block,
@@ -1573,6 +1708,7 @@ class MoTCausalWanModel(CausalWanModel):
                             context=None,
                             video_kv=(video_k, video_v),
                             current_start_frame=current_start_frame,
+                            video_key_mask=_video_mask,
                         )
 
                     action_tokens = torch.utils.checkpoint.checkpoint(
@@ -1591,6 +1727,7 @@ class MoTCausalWanModel(CausalWanModel):
                     context=None,
                     video_kv=layer_video_kv,
                     current_start_frame=current_start_frame,
+                    video_key_mask=layer_video_key_mask,
                 )
 
         return self.action_expert.decode_action(
@@ -1629,6 +1766,7 @@ class MoTCausalWanModel(CausalWanModel):
         current_start_frame: int,
         prefix_kv_cache: list[torch.Tensor] | None = None,
         current_video_token_len: int | None = None,
+        action_video_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run action expert from the latest full-video denoise refresh K/V."""
         return self._forward_action_from_video_kv_cache(
@@ -1641,6 +1779,7 @@ class MoTCausalWanModel(CausalWanModel):
             require_full_video=True,
             prefix_kv_cache=prefix_kv_cache,
             current_video_token_len=current_video_token_len,
+            action_video_frame_mask=action_video_frame_mask,
         )
 
     def _forward_train(
@@ -1660,6 +1799,7 @@ class MoTCausalWanModel(CausalWanModel):
         video_frame_mask=None,
         action_token_mask=None,
         state_token_mask=None,
+        action_video_frame_mask=None,
     ):
         if self.model_type == "i2v":
             assert clip_feature is not None and y is not None
@@ -1682,6 +1822,15 @@ class MoTCausalWanModel(CausalWanModel):
             device=x.device,
         )
         video_attention_mask = video_token_mask
+        action_video_token_mask = self._build_video_token_mask(
+            video_frame_mask=action_video_frame_mask,
+            video_frames=video_frames,
+            seq_len=seq_len,
+            device=x.device,
+        )
+        action_video_attention_mask = (
+            action_video_token_mask if action_video_token_mask is not None else video_attention_mask
+        )
 
         timestep_video = timestep.unsqueeze(-1).expand(
             batch_size, video_frames, seq_len // video_frames
@@ -1721,6 +1870,14 @@ class MoTCausalWanModel(CausalWanModel):
             clean_seq_len = clean_x.shape[1]
             if video_token_mask is not None:
                 video_attention_mask = torch.cat([video_token_mask, video_token_mask], dim=1)
+            action_video_attention_mask = self._build_action_video_attention_mask(
+                video_token_mask=video_token_mask,
+                action_video_token_mask=action_video_token_mask,
+                clean_seq_len=clean_seq_len,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=x.device,
+            )
 
             if aug_t is None:
                 aug_t = torch.zeros_like(timestep_original)
@@ -1795,7 +1952,7 @@ class MoTCausalWanModel(CausalWanModel):
                     clean_seq_len=clean_seq_len,
                 )
                 video_kv_mask = self._select_video_mask_for_action(
-                    video_attention_mask,
+                    action_video_attention_mask,
                     seq_len=seq_len,
                     clean_seq_len=clean_seq_len,
                 )
