@@ -46,6 +46,7 @@ class PolicyServerConfig:
     cache_order_sensitive: bool = False
     supports_rtc: bool = True
     supports_async_prefetch: bool = True
+    supports_parallel_sessions: bool = False
 
 
 class WebsocketPolicyServer:
@@ -86,6 +87,7 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._open_timeout = _normalize_timeout(open_timeout)
+        self._policy_lock = asyncio.Lock()
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -116,14 +118,15 @@ class WebsocketPolicyServer:
                 
                 endpoint = obs["endpoint"]
                 del obs["endpoint"]
-                if endpoint == "reset":
-                    self._policy.reset(obs)
-                    to_return = "reset successful"
-                else:
-                    action = self._policy.infer(obs)
-                    if not isinstance(action, dict):
-                        action = {"actions": action}
-                    to_return = packer.pack(action)
+                async with self._policy_lock:
+                    if endpoint == "reset":
+                        self._policy.reset(obs)
+                        to_return = "reset successful"
+                    else:
+                        action = self._policy.infer(obs)
+                        if not isinstance(action, dict):
+                            action = {"actions": action}
+                        to_return = packer.pack(action)
                 await websocket.send(to_return)
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
