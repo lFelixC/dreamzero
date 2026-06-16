@@ -20,6 +20,7 @@ max_chunk_size: 5
 dataset_shard_sampling_rate: 0.1
 dataset_shard_sampling_strategy: random
 dataset_shard_sampling_block_size: 64
+dataset_shard_schedule_strategy: weighted_random
 mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
 single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
 droid_data_root: ???
@@ -53,3 +54,4 @@ train_dataset:
     shard_sampling_rate: ${dataset_shard_sampling_rate}
     shard_sampling_strategy: ${dataset_shard_sampling_strategy}
     shard_sampling_block_size: ${dataset_shard_sampling_block_size}
+    shard_schedule_strategy: ${dataset_shard_schedule_strategy}

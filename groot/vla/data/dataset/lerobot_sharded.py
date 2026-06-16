@@ -1500,6 +1500,7 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         shard_sampling_rate: float = 0.5,
         shard_sampling_strategy: str = "random",
         shard_sampling_block_size: int = 64,
+        shard_schedule_strategy: str = "weighted_random",
         num_shards_to_sample: int = 2**20,
         allow_padding_at_end: bool = False,
     ):
@@ -1516,6 +1517,8 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
             shard_sampling_strategy (str): "random" keeps the legacy per-step shuffle;
                 "block" samples contiguous runs inside each shard to improve video decode locality.
             shard_sampling_block_size (int): Number of consecutive allowed steps per sampled block.
+            shard_schedule_strategy (str): "weighted_random" keeps legacy shard sampling with replacement;
+                "permutation" cycles through shuffled shards without replacement inside each dataset.
             num_shards_to_sample (int): The number of shards to sample.
         """
         super().__init__(
@@ -1532,6 +1535,7 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         self.shard_sampling_rate = shard_sampling_rate
         self.shard_sampling_strategy = shard_sampling_strategy
         self.shard_sampling_block_size = shard_sampling_block_size
+        self.shard_schedule_strategy = shard_schedule_strategy
         self.num_shards_to_sample = num_shards_to_sample
 
         # Calculate shard sampling weights
@@ -1559,6 +1563,10 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
             "random",
             "block",
         }, f"Unsupported shard_sampling_strategy={shard_sampling_strategy}"
+        assert shard_schedule_strategy in {
+            "weighted_random",
+            "permutation",
+        }, f"Unsupported shard_schedule_strategy={shard_schedule_strategy}"
         assert shard_sampling_block_size >= 1, "shard_sampling_block_size must be >= 1"
 
         # Set properties for distributed training
@@ -1610,14 +1618,57 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         self.seed = seed
         self._shards_sample_schedule = self.generate_shards_sample_schedule()
 
+    def _generate_permutation_shards_sample_schedule(
+        self,
+        rng: np.random.Generator,
+    ) -> list[tuple[int, int]]:
+        dataset_weights = np.asarray(self.dataset_sampling_weights, dtype=np.float64)
+        valid_dataset_ids = np.asarray(
+            [
+                dataset_id
+                for dataset_id, dataset in enumerate(self.datasets)
+                if dataset.num_shards > 0 and dataset_weights[dataset_id] > 0
+            ],
+            dtype=int,
+        )
+        assert valid_dataset_ids.size > 0, "No shards available for permutation schedule."
+        dataset_weights = dataset_weights[valid_dataset_ids]
+        dataset_weights /= dataset_weights.sum()
+
+        shard_cycles: dict[int, list[tuple[int, int]]] = {}
+        cycle_offsets: dict[int, int] = {}
+        for dataset_id in valid_dataset_ids:
+            dataset = self.datasets[int(dataset_id)]
+            shard_cycle = [(int(dataset_id), shard_idx) for shard_idx in range(dataset.num_shards)]
+            rng.shuffle(shard_cycle)
+            shard_cycles[int(dataset_id)] = shard_cycle
+            cycle_offsets[int(dataset_id)] = 0
+
+        shards_sample_schedule = []
+        for _ in range(self.num_shards_to_sample):
+            dataset_id = int(rng.choice(valid_dataset_ids, p=dataset_weights))
+            shard_cycle = shard_cycles[dataset_id]
+            offset = cycle_offsets[dataset_id]
+            if offset >= len(shard_cycle):
+                rng.shuffle(shard_cycle)
+                offset = 0
+            shards_sample_schedule.append(shard_cycle[offset])
+            cycle_offsets[dataset_id] = offset + 1
+        return shards_sample_schedule
+
     def generate_shards_sample_schedule(self):
         if self.training:
             rng = np.random.default_rng(self.seed)
-            sampled_shard_ids = rng.choice(
-                len(self.all_shards), size=self.num_shards_to_sample, p=self.shard_sampling_weights
-            )
-            shards_sample_schedule = [self.all_shards[i] for i in sampled_shard_ids]
-            rng.shuffle(shards_sample_schedule)
+            if self.shard_schedule_strategy == "permutation":
+                shards_sample_schedule = self._generate_permutation_shards_sample_schedule(rng)
+            else:
+                sampled_shard_ids = rng.choice(
+                    len(self.all_shards),
+                    size=self.num_shards_to_sample,
+                    p=self.shard_sampling_weights,
+                )
+                shards_sample_schedule = [self.all_shards[i] for i in sampled_shard_ids]
+                rng.shuffle(shards_sample_schedule)
         else:
             shards_sample_schedule = [
                 self.all_shards[i % len(self.all_shards)] for i in range(self.num_shards_to_sample)
