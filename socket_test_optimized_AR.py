@@ -15,7 +15,7 @@ import tyro
 from einops import rearrange
 import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from eval_utils.torch_compile_backend import configure_torch_compile_backend
 from eval_utils.inference_rtc import (
@@ -49,6 +49,8 @@ from groot.vla.utils.nvtx_utils import nvtx_range
 
 DEFAULT_TORCH_COMPILE_BACKEND = configure_torch_compile_backend(default_backend="cudagraphs")
 RESET_FLAG_KEY = "__reset_policy_state__"
+SESSION_ID_KEY = "__dreamzero_session_id__"
+RESET_ALL_SESSIONS_KEY = "__reset_all_dreamzero_sessions__"
 WAN_JOINT_MODEL_TARGET = "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel"
 WAN_MOT_MODEL_TARGET = "groot.vla.model.dreamzero.modules.dreamzero_mot.MoTCausalWanModel"
 
@@ -196,6 +198,117 @@ def _dreamzero_cache_mode(policy: GrootSimPolicy) -> tuple[str | None, bool]:
     return mode, mode == "decoupled_denoise"
 
 
+ACTION_HEAD_TEMPORAL_ATTRS = (
+    "current_start_frame",
+    "language",
+    "clip_feas",
+    "ys",
+    "kv_cache1",
+    "kv_cache_neg",
+    "crossattn_cache",
+    "crossattn_cache_neg",
+    "skip_countdown",
+    "last_video_pred_condition_latent_frames",
+)
+
+
+def _empty_frame_buffers() -> dict[str, list[np.ndarray]]:
+    return {
+        "video.exterior_image_1_left": [],
+        "video.exterior_image_2_left": [],
+        "video.wrist_image_left": [],
+    }
+
+
+def _get_action_head(policy: Any) -> Any | None:
+    trained_model = getattr(policy, "trained_model", None)
+    if trained_model is None:
+        return None
+    return getattr(trained_model, "action_head", None)
+
+
+@dataclasses.dataclass
+class ActionHeadTemporalState:
+    values: dict[str, Any]
+
+
+class ActionHeadSessionStore:
+    """Per-session holder for DreamZero action-head temporal state."""
+
+    def __init__(self, policy: GrootSimPolicy) -> None:
+        self._policy = policy
+        self._states: dict[str, ActionHeadTemporalState] = {}
+        self._loaded_key: str | None = None
+
+    def reset_loaded_state(self) -> None:
+        if hasattr(self._policy, "reset_inference_state"):
+            self._policy.reset_inference_state()
+            return
+        action_head = _get_action_head(self._policy)
+        if action_head is None:
+            return
+        if hasattr(action_head, "reset_inference_state"):
+            action_head.reset_inference_state()
+            return
+        if hasattr(action_head, "current_start_frame"):
+            action_head.current_start_frame = 0
+        if hasattr(action_head, "language"):
+            action_head.language = None
+
+    def restore(self, session_id: str | None, *, reset: bool = False) -> str:
+        key = session_key(session_id)
+        if reset:
+            self._states.pop(key, None)
+
+        state = self._states.get(key)
+        if state is None:
+            self.reset_loaded_state()
+        else:
+            action_head = _get_action_head(self._policy)
+            if action_head is not None:
+                for attr, value in state.values.items():
+                    setattr(action_head, attr, value)
+        self._loaded_key = key
+        return key
+
+    def capture(self, session_id: str | None) -> None:
+        key = session_key(session_id)
+        action_head = _get_action_head(self._policy)
+        if action_head is None:
+            self._states[key] = ActionHeadTemporalState({})
+        else:
+            self._states[key] = ActionHeadTemporalState(
+                {
+                    attr: getattr(action_head, attr)
+                    for attr in ACTION_HEAD_TEMPORAL_ATTRS
+                    if hasattr(action_head, attr)
+                }
+            )
+        self._loaded_key = key
+
+    def reset_session(self, session_id: str | None) -> None:
+        key = session_key(session_id)
+        self._states.pop(key, None)
+        if self._loaded_key == key:
+            self.reset_loaded_state()
+            self._loaded_key = None
+
+    def reset_all(self) -> None:
+        self._states.clear()
+        self.reset_loaded_state()
+        self._loaded_key = None
+
+
+@dataclasses.dataclass
+class ARSessionState:
+    frame_buffers: dict[str, list[np.ndarray]] = dataclasses.field(default_factory=_empty_frame_buffers)
+    call_count: int = 0
+    is_first_call: bool = True
+    current_prompt: str | None = None
+    warned_single_external_fallback: bool = False
+    video_across_time: list[torch.Tensor] = dataclasses.field(default_factory=list)
+
+
 class ARDroidRoboarenaPolicy:
     """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
     
@@ -248,18 +361,21 @@ class ARDroidRoboarenaPolicy:
         self._rtc_guidance_max_steps = rtc_guidance_max_steps
         self._rtc_guidance_step_stride = rtc_guidance_step_stride
         
-        # Frame buffers for accumulation (per camera view)
-        self._frame_buffers: dict[str, list[np.ndarray]] = {
-            "video.exterior_image_1_left": [],
-            "video.exterior_image_2_left": [],
-            "video.wrist_image_left": [],
-        }
+        # Frame buffers for accumulation (per camera view). These attributes
+        # point at the currently loaded session state.
+        self._frame_buffers: dict[str, list[np.ndarray]] = _empty_frame_buffers()
         self._call_count = 0
         self._is_first_call = True
         
-        # Session tracking - reset state when new session starts
+        # Session tracking. RoboLab parallel eval interleaves env sessions, so
+        # both the wrapper state and action-head temporal state are keyed by
+        # session_id instead of being reset on every session switch.
+        self._session_states: dict[str, ARSessionState] = {}
+        self._model_session_store = ActionHeadSessionStore(self._policy)
+        self._active_session_key: str | None = None
         self._current_session_id: str | None = None
-        self._reset_next_infer = False
+        self._pending_worker_reset_all = False
+        self._pending_worker_reset_sessions: set[str] = set()
         self._current_prompt: str | None = None
         self._warned_single_external_fallback = False
         self._rtc_session_states: dict[str, RTCSessionState] = {}
@@ -333,13 +449,72 @@ class ARDroidRoboarenaPolicy:
             return action_dict
 
     def _reset_model_temporal_state(self) -> None:
-        if hasattr(self._policy, "reset_inference_state"):
-            self._policy.reset_inference_state()
-            return
-        if hasattr(self._policy.trained_model, "action_head") and hasattr(
-            self._policy.trained_model.action_head, "current_start_frame"
-        ):
-            self._policy.trained_model.action_head.current_start_frame = 0
+        self._model_session_store.reset_loaded_state()
+
+    def _apply_ar_session_state(self, state: ARSessionState) -> None:
+        self._frame_buffers = state.frame_buffers
+        self._call_count = state.call_count
+        self._is_first_call = state.is_first_call
+        self._current_prompt = state.current_prompt
+        self._warned_single_external_fallback = state.warned_single_external_fallback
+        self.video_across_time = state.video_across_time
+
+    def _load_ar_session(self, session_id: str | None, *, reset: bool = False) -> str:
+        key = session_key(session_id)
+        if reset:
+            self._session_states.pop(key, None)
+            self._rtc_session_states.pop(key, None)
+
+        state = self._session_states.setdefault(key, ARSessionState())
+        self._apply_ar_session_state(state)
+        self._model_session_store.restore(session_id, reset=reset)
+        self._active_session_key = key
+        self._current_session_id = None if session_id is None else str(session_id)
+        return key
+
+    def _capture_ar_session(self, session_id: str | None) -> None:
+        key = session_key(session_id)
+        self._session_states[key] = ARSessionState(
+            frame_buffers=self._frame_buffers,
+            call_count=self._call_count,
+            is_first_call=self._is_first_call,
+            current_prompt=self._current_prompt,
+            warned_single_external_fallback=self._warned_single_external_fallback,
+            video_across_time=self.video_across_time,
+        )
+        self._model_session_store.capture(session_id)
+        self._active_session_key = key
+
+    def _clear_ar_session(self, session_id: str | None, *, save_video: bool) -> None:
+        key = session_key(session_id)
+        state = self._session_states.get(key)
+        if state is not None:
+            self._apply_ar_session_state(state)
+            self._active_session_key = key
+            self._current_session_id = None if session_id is None else str(session_id)
+            self._reset_state(save_video=save_video)
+        self._session_states.pop(key, None)
+        self._rtc_session_states.pop(key, None)
+        self._model_session_store.reset_session(session_id)
+
+    def _clear_all_ar_sessions(self, *, save_video: bool) -> None:
+        for key, state in list(self._session_states.items()):
+            self._apply_ar_session_state(state)
+            self._active_session_key = key
+            self._current_session_id = None if key == "__default__" else key
+            self._reset_state(save_video=save_video)
+
+        self._session_states.clear()
+        self._rtc_session_states.clear()
+        self._model_session_store.reset_all()
+        self._active_session_key = None
+        self._current_session_id = None
+        self._frame_buffers = _empty_frame_buffers()
+        self._call_count = 0
+        self._is_first_call = True
+        self._current_prompt = None
+        self._warned_single_external_fallback = False
+        self.video_across_time = []
 
     def _should_send_single_anchor_frame(self, prompt: str) -> bool:
         if self._is_first_call:
@@ -539,9 +714,18 @@ class ARDroidRoboarenaPolicy:
             data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
             dist.broadcast(data_tensor, src=0)
 
-    def _set_reset_flag(self, converted_obs: dict, should_reset: bool) -> dict:
+    def _set_reset_flag(
+        self,
+        converted_obs: dict,
+        should_reset: bool,
+        *,
+        session_id: str | None,
+        reset_all_sessions: bool = False,
+    ) -> dict:
         worker_obs = dict(converted_obs)
         worker_obs[RESET_FLAG_KEY] = bool(should_reset)
+        worker_obs[SESSION_ID_KEY] = session_key(session_id)
+        worker_obs[RESET_ALL_SESSIONS_KEY] = bool(reset_all_sessions)
         return worker_obs
     
     def infer(self, obs: dict) -> np.ndarray:
@@ -553,25 +737,24 @@ class ARDroidRoboarenaPolicy:
         Returns:
             action: (N, 8) action array
         """
-        # Check for session change - reset state if new session
         session_id = obs.get("session_id", None)
-        session_changed = session_id is not None and session_id != self._current_session_id
-        should_reset = self._reset_next_infer or session_changed
-        if should_reset:
-            if self._reset_next_infer:
-                logger.info("Applying deferred reset before next inference")
-                with nvtx_range("dreamzero.ar.reset.on_deferred_reset"):
-                    self._reset_state(save_video=False)
-                self._reset_next_infer = False
-            elif self._current_session_id is not None:
-                logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
-                # Reset state for new session
-                with nvtx_range("dreamzero.ar.reset.on_session_change"):
-                    self._reset_state()
-            else:
-                logger.info(f"New session started: '{session_id}'")
-        if session_id is not None:
-            self._current_session_id = session_id
+        session_state_key = session_key(session_id)
+        reset_all_sessions_for_workers = self._pending_worker_reset_all
+        reset_session_for_workers = session_state_key in self._pending_worker_reset_sessions
+        if reset_all_sessions_for_workers:
+            self._pending_worker_reset_all = False
+            self._pending_worker_reset_sessions.clear()
+        elif reset_session_for_workers:
+            self._pending_worker_reset_sessions.discard(session_state_key)
+
+        new_session = session_state_key not in self._session_states
+        if new_session:
+            logger.info("New session started: '%s'", session_id)
+        elif self._active_session_key != session_state_key:
+            logger.info("Switching session from '%s' to '%s'", self._active_session_key, session_state_key)
+
+        with nvtx_range("dreamzero.ar.session.restore"):
+            self._load_ar_session(session_id, reset=reset_session_for_workers)
 
         rtc_step_idx = extract_optional_int(obs.get("rtc_step_idx", None))
         rtc_inference_delay_steps = max(
@@ -628,7 +811,12 @@ class ARDroidRoboarenaPolicy:
                         )
             with nvtx_range(f"dreamzero.ar.infer[{phase}].convert_observation"):
                 converted_obs = self._convert_observation(obs)
-                worker_obs = self._set_reset_flag(converted_obs, should_reset)
+                worker_obs = self._set_reset_flag(
+                    converted_obs,
+                    reset_session_for_workers,
+                    session_id=session_id,
+                    reset_all_sessions=reset_all_sessions_for_workers,
+                )
 
             # Signal workers to continue (0 = continue)
             signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
@@ -700,6 +888,8 @@ class ARDroidRoboarenaPolicy:
         # Update first call flag
         if self._is_first_call:
             self._is_first_call = False
+        with nvtx_range("dreamzero.ar.session.capture"):
+            self._capture_ar_session(session_id)
         
         return action
     
@@ -780,7 +970,6 @@ class ARDroidRoboarenaPolicy:
                 self.video_across_time = []
                 self._current_prompt = None
                 self._warned_single_external_fallback = False
-                self._rtc_session_states.clear()
                 self._reset_model_temporal_state()
     
     def reset(self, reset_info: dict) -> None:
@@ -788,10 +977,36 @@ class ARDroidRoboarenaPolicy:
         
         Clears frame buffers and resets call count.
         """
-        self._reset_state(save_video=True)
-        self._reset_next_infer = True
+        reset_all = bool(reset_info.get("reset_all_sessions", False))
+        session_ids = reset_info.get("session_ids", None)
+        if session_ids is None and reset_info.get("session_id", None) is not None:
+            session_ids = [reset_info["session_id"]]
+
+        if isinstance(session_ids, np.ndarray):
+            session_ids = session_ids.reshape(-1).tolist()
+        elif isinstance(session_ids, (str, bytes)):
+            session_ids = [session_ids.decode() if isinstance(session_ids, bytes) else session_ids]
+
+        if session_ids is None:
+            reset_all = True
+
+        if reset_all:
+            self._clear_all_ar_sessions(save_video=True)
+            self._pending_worker_reset_all = True
+            self._pending_worker_reset_sessions.clear()
+        else:
+            for session_id in session_ids:
+                session_id_str = session_id.decode() if isinstance(session_id, bytes) else str(session_id)
+                self._clear_ar_session(session_id_str, save_video=True)
+                self._pending_worker_reset_sessions.add(session_key(session_id_str))
+
         self._current_session_id = None
-        logger.info("policy reset requested with keys=%s", sorted(reset_info.keys()))
+        logger.info(
+            "policy reset requested with keys=%s reset_all=%s session_ids=%s",
+            sorted(reset_info.keys()),
+            reset_all,
+            session_ids,
+        )
 
 
 class WebsocketPolicyServer:
@@ -817,14 +1032,14 @@ class WebsocketPolicyServer:
         self.video_across_time = []
         self._msg_index = 0
         self._signal_group = signal_group
+        self._session_store = ActionHeadSessionStore(policy)
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
             os.makedirs(os.path.join(self._output_dir, "inputs"), exist_ok=True)
 
     def _reset_policy_temporal_state(self) -> None:
-        if hasattr(self._policy, "reset_inference_state"):
-            self._policy.reset_inference_state()
+        self._session_store.reset_loaded_state()
     
     def _save_input_obs(self, obs: dict) -> None:
         """Save incoming observation images per message.
@@ -971,8 +1186,14 @@ class WebsocketPolicyServer:
                 with nvtx_range("dreamzero.ar.worker.receive_payload"):
                     batch, model_kwargs = self._receive_batch_from_rank0()
                 reset_flag = bool(batch.obs.pop(RESET_FLAG_KEY, False))
-                if reset_flag:
-                    with nvtx_range("dreamzero.ar.worker.reset_state"):
+                reset_all_sessions = bool(batch.obs.pop(RESET_ALL_SESSIONS_KEY, False))
+                worker_session_id = batch.obs.pop(SESSION_ID_KEY, None)
+                with nvtx_range("dreamzero.ar.worker.session_restore"):
+                    if reset_all_sessions:
+                        self._session_store.reset_all()
+                    if worker_session_id is not None:
+                        self._session_store.restore(str(worker_session_id), reset=reset_flag)
+                    elif reset_flag:
                         self._reset_policy_temporal_state()
                 # Participate in distributed forward pass
                 with nvtx_range("dreamzero.ar.worker.dist_barrier.pre_forward"):
@@ -982,6 +1203,9 @@ class WebsocketPolicyServer:
                         result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
                 with nvtx_range("dreamzero.ar.worker.dist_barrier.post_forward"):
                     dist.barrier()
+                if worker_session_id is not None:
+                    with nvtx_range("dreamzero.ar.worker.session_capture"):
+                        self._session_store.capture(str(worker_session_id))
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
@@ -1446,6 +1670,7 @@ def main(args: Args) -> None:
         cache_order_sensitive=cache_order_sensitive,
         supports_rtc=not cache_order_sensitive,
         supports_async_prefetch=not cache_order_sensitive,
+        supports_parallel_sessions=True,
     )
     
     if rank == 0:
