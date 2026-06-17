@@ -1275,7 +1275,21 @@ class ARDroidRoboarenaPolicy:
         ]
 
         actions_by_index: list[np.ndarray | None] = [None for _ in obs_list]
-        for group in self._build_inference_groups(prepared_items):
+        groups = self._build_inference_groups(prepared_items)
+        # Log how many distinct inference groups a single incoming batch was
+        # split into. When all sessions share the same causal phase + frame
+        # count + action-head state, this collapses to 1 group of len(obs_list),
+        # which is the only way to get a single batched forward. More groups
+        # means more (smaller) forwards -> lower throughput.
+        if len(obs_list) > 1:
+            group_sizes = [len(group) for group in groups]
+            logger.debug(
+                "infer_many split %d requests into %d group(s) sizes=%s",
+                len(obs_list),
+                len(groups),
+                group_sizes,
+            )
+        for group in groups:
             try:
                 group_actions = self._run_prepared_group(group)
             except BatchIncompatibleError:

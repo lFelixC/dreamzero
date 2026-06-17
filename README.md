@@ -125,13 +125,18 @@ The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/Dre
 
 ## Running the Inference Server
 
+For RoboLab 120-task benchmark evaluation with SSH tunneling and the local RoboLab client, see the Chinese runbook:
+[DreamZero 在 RoboLab 上的评测流程](docs/README_ROBOLAB_EVAL_ZH.md).
+
 ### Command Overview
 
 The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint>
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint> --batch-max-size 8 --batch-timeout-ms 8.0
 ```
+
+The server keeps per-`session_id` temporal/cache state (`ActionHeadSessionStore`) and supports concurrent sessions plus server-side request batching, so multiple client processes (and `--num-envs > 1` within a single process) are state-safe. `--batch-max-size` caps how many concurrent requests are aggregated into one forward, and `--batch-timeout-ms` is the wait window to fill that batch; raise both as concurrency grows. Note that a batch is only actually filled when multiple **independent connections** query the server at the same time (e.g. several `run_parallel.py` workers) — within one process the RoboLab client queries its envs sequentially, so `--num-envs > 1` is state-safe but does not by itself fill the batch. The server logs a rolling `policy_batch_summary` every 5s (per-forward sizes are at DEBUG) so you can confirm batches are actually filling.
 
 (Optional only for GB200) Tensorrt enables faster generation
 ```bash
@@ -139,6 +144,8 @@ export LOAD_TRT_ENGINE=<path/to/checkpoint>/tensorrt/wan/WanModel_nvfp4.trt
 export DYNAMIC_CACHE_SCHEDULE=true 
 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 /mnt/aws-lfs-02/shared/seonghyeony/dreamzero/socket_test_optimized_AR.py --port 8000 --enable-dit-cache --model-path <path/to/checkpoint>
 ```
+
+> Note: `DYNAMIC_CACHE_SCHEDULE=true` uses batch-global skip state, so the server automatically disables request batching (`supports_batching=False`) in that mode. Concurrency across clients is still safe, but each request runs as its own forward rather than an aggregated batch.
 To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
 
 ```

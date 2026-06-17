@@ -8,6 +8,7 @@ Adapted from https://github.com/robo-arena/roboarena/
 import asyncio
 import dataclasses
 import logging
+import time
 import traceback
 from typing import Any
 
@@ -15,6 +16,8 @@ from openpi_client.base_policy import BasePolicy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server
 import websockets.frames
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_timeout(timeout_seconds: float | None) -> float | None:
@@ -169,6 +172,19 @@ class WebsocketPolicyServer:
         max_batch_size = max(int(self._server_config.max_batch_size), 1)
         batch_timeout = max(float(self._server_config.batch_timeout_ms), 0.0) / 1000.0
 
+        # Per-batch observability: track how full each batch was so that
+        # operators can tell whether requests are actually being aggregated
+        # (the whole point of server-side batching) or whether they mostly
+        # fire at batch_size=1 (timeout too short, clients out of phase, ...).
+        # These counters are reset after each summary log, so each summary is a
+        # rolling window of the last ~_batch_log_interval seconds (not a
+        # cumulative total since server start).
+        self._batch_size_hist: dict[int, int] = {}
+        self._batch_total_requests = 0
+        self._batch_total_forwards = 0
+        self._batch_last_log = time.perf_counter()
+        self._batch_log_interval = 5.0
+
         while True:
             if self._deferred_request is not None:
                 first_request = self._deferred_request
@@ -213,6 +229,41 @@ class WebsocketPolicyServer:
                 active_requests = [request for request in requests if not request.future.cancelled()]
                 if not active_requests:
                     continue
+
+                # Record batch fullness before the forward pass.
+                batch_size = len(active_requests)
+                self._batch_size_hist[batch_size] = self._batch_size_hist.get(batch_size, 0) + 1
+                self._batch_total_requests += batch_size
+                self._batch_total_forwards += 1
+                # Per-forward fullness is noisy at high inference rates; keep it
+                # at debug and surface a rolling summary at info instead.
+                logger.debug(
+                    "policy_batch_forward size=%d/%d queue_remaining=%d",
+                    batch_size,
+                    max_batch_size,
+                    self._request_queue.qsize(),
+                )
+                now = time.perf_counter()
+                if now - self._batch_last_log >= self._batch_log_interval:
+                    self._batch_last_log = now
+                    if self._batch_total_forwards > 0:
+                        avg_fill = self._batch_total_requests / self._batch_total_forwards
+                        hist_str = ", ".join(
+                            f"{k}:{v}" for k, v in sorted(self._batch_size_hist.items())
+                        )
+                        logger.info(
+                            "policy_batch_summary forwards=%d requests=%d avg_fill=%.2f/%d hist={%s}",
+                            self._batch_total_forwards,
+                            self._batch_total_requests,
+                            avg_fill,
+                            max_batch_size,
+                            hist_str,
+                        )
+                        # Reset so the next summary covers only the following
+                        # window (rolling, not cumulative since server start).
+                        self._batch_size_hist = {}
+                        self._batch_total_requests = 0
+                        self._batch_total_forwards = 0
 
                 async with self._policy_lock:
                     if len(active_requests) > 1 and hasattr(self._policy, "infer_many"):
