@@ -102,6 +102,8 @@ class Args:
     rtc_prefix_attention_schedule: str = "EXP"
     rtc_guidance_max_steps: int = 4
     rtc_guidance_step_stride: int = 1
+    batch_max_size: int = 8
+    batch_timeout_ms: float = 2.0
 
 
 def _action_head_inner_cfg(config: dict) -> dict | None:
@@ -238,6 +240,13 @@ ACTION_HEAD_TEMPORAL_ATTRS = (
     "skip_countdown",
     "last_video_pred_condition_latent_frames",
 )
+ACTION_HEAD_BATCH_DIM0_ATTRS = {"language", "clip_feas", "ys"}
+ACTION_HEAD_BATCH_DIM1_ATTRS = {
+    "kv_cache1",
+    "kv_cache_neg",
+    "crossattn_cache",
+    "crossattn_cache_neg",
+}
 
 
 def _empty_frame_buffers() -> dict[str, list[np.ndarray]]:
@@ -258,6 +267,65 @@ def _get_action_head(policy: Any) -> Any | None:
 @dataclasses.dataclass
 class ActionHeadTemporalState:
     values: dict[str, Any]
+
+
+class BatchIncompatibleError(ValueError):
+    """Raised before forward when a prepared request group cannot share one batch."""
+
+
+def _temporal_scalar_signature(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return ("np", str(value.dtype), tuple(value.shape), value.tobytes())
+    if torch.is_tensor(value):
+        return ("torch-scalar", str(value.dtype), tuple(value.shape), value.detach().cpu().numpy().tobytes())
+    return value
+
+
+def _tensor_signature_without_dim(value: torch.Tensor, batch_dim: int) -> tuple:
+    shape = list(value.shape)
+    if len(shape) <= batch_dim:
+        raise ValueError(f"Cannot remove batch dim {batch_dim} from tensor shape {tuple(value.shape)}.")
+    del shape[batch_dim]
+    return (str(value.dtype), str(value.device), tuple(shape))
+
+
+def _temporal_attr_signature(attr: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if attr in ACTION_HEAD_BATCH_DIM0_ATTRS:
+        if not torch.is_tensor(value):
+            raise ValueError(f"Expected tensor temporal attr {attr}, got {type(value)!r}.")
+        return _tensor_signature_without_dim(value, 0)
+    if attr in ACTION_HEAD_BATCH_DIM1_ATTRS:
+        if not isinstance(value, list):
+            raise ValueError(f"Expected list temporal attr {attr}, got {type(value)!r}.")
+        return tuple(_tensor_signature_without_dim(tensor, 1) for tensor in value)
+    return _temporal_scalar_signature(value)
+
+
+def _pack_temporal_attr(attr: str, values: list[Any]) -> Any:
+    if attr in ACTION_HEAD_BATCH_DIM0_ATTRS:
+        return torch.cat(values, dim=0)
+    if attr in ACTION_HEAD_BATCH_DIM1_ATTRS:
+        num_layers = len(values[0])
+        return [
+            torch.cat([value[layer_idx] for value in values], dim=1)
+            for layer_idx in range(num_layers)
+        ]
+    return values[0]
+
+
+def _split_temporal_attr(attr: str, value: Any, batch_size: int) -> list[Any]:
+    if value is None:
+        return [None for _ in range(batch_size)]
+    if attr in ACTION_HEAD_BATCH_DIM0_ATTRS:
+        return [value[index : index + 1] for index in range(batch_size)]
+    if attr in ACTION_HEAD_BATCH_DIM1_ATTRS:
+        return [
+            [layer[:, index : index + 1] for layer in value]
+            for index in range(batch_size)
+        ]
+    return [value for _ in range(batch_size)]
 
 
 class ActionHeadSessionStore:
@@ -299,6 +367,61 @@ class ActionHeadSessionStore:
         self._loaded_key = key
         return key
 
+    def state_signature(self, session_id: str | None, *, reset: bool = False) -> tuple:
+        key = session_key(session_id)
+        if reset or key not in self._states:
+            return ("empty",)
+
+        state = self._states[key]
+        signature = []
+        for attr in ACTION_HEAD_TEMPORAL_ATTRS:
+            if attr not in state.values:
+                signature.append((attr, "missing"))
+            else:
+                signature.append((attr, _temporal_attr_signature(attr, state.values[attr])))
+        return tuple(signature)
+
+    def restore_many(self, session_ids: list[str | None], *, resets: list[bool]) -> list[str]:
+        if len(session_ids) != len(resets):
+            raise ValueError("session_ids and resets must have the same length.")
+        if len(session_ids) == 1:
+            return [self.restore(session_ids[0], reset=resets[0])]
+
+        keys = [session_key(session_id) for session_id in session_ids]
+        for key, reset in zip(keys, resets, strict=True):
+            if reset:
+                self._states.pop(key, None)
+
+        states = [self._states.get(key) for key in keys]
+        if all(state is None for state in states):
+            self.reset_loaded_state()
+            self._loaded_key = "__batch__"
+            return keys
+        if any(state is None for state in states):
+            raise BatchIncompatibleError("Cannot batch new and cached DreamZero sessions in one action-head state.")
+
+        first_signature = self.state_signature(keys[0])
+        for key in keys[1:]:
+            signature = self.state_signature(key)
+            if signature != first_signature:
+                raise BatchIncompatibleError("Cannot batch DreamZero sessions with incompatible action-head state.")
+
+        packed_values: dict[str, Any] = {}
+        for attr in ACTION_HEAD_TEMPORAL_ATTRS:
+            attr_values = [state.values.get(attr) for state in states if state is not None]
+            if all(value is None for value in attr_values):
+                continue
+            if any(value is None for value in attr_values):
+                raise BatchIncompatibleError(f"Cannot batch temporal attr {attr} with mixed missing values.")
+            packed_values[attr] = _pack_temporal_attr(attr, attr_values)
+
+        action_head = _get_action_head(self._policy)
+        if action_head is not None:
+            for attr, value in packed_values.items():
+                setattr(action_head, attr, value)
+        self._loaded_key = "__batch__"
+        return keys
+
     def capture(self, session_id: str | None) -> None:
         key = session_key(session_id)
         action_head = _get_action_head(self._policy)
@@ -313,6 +436,33 @@ class ActionHeadSessionStore:
                 }
             )
         self._loaded_key = key
+
+    def capture_many(self, session_ids: list[str | None]) -> None:
+        if len(session_ids) == 1:
+            self.capture(session_ids[0])
+            return
+
+        action_head = _get_action_head(self._policy)
+        keys = [session_key(session_id) for session_id in session_ids]
+        batch_size = len(keys)
+        if action_head is None:
+            for key in keys:
+                self._states[key] = ActionHeadTemporalState({})
+            self._loaded_key = "__batch__"
+            return
+
+        per_session_values = [dict() for _ in keys]
+        for attr in ACTION_HEAD_TEMPORAL_ATTRS:
+            if not hasattr(action_head, attr):
+                continue
+            value = getattr(action_head, attr)
+            values = _split_temporal_attr(attr, value, batch_size)
+            for index, item_value in enumerate(values):
+                per_session_values[index][attr] = item_value
+
+        for key, values in zip(keys, per_session_values, strict=True):
+            self._states[key] = ActionHeadTemporalState(values)
+        self._loaded_key = "__batch__"
 
     def reset_session(self, session_id: str | None) -> None:
         key = session_key(session_id)
@@ -335,6 +485,25 @@ class ARSessionState:
     current_prompt: str | None = None
     warned_single_external_fallback: bool = False
     video_across_time: list[tuple[torch.Tensor, int]] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class PreparedARInference:
+    index: int
+    obs: dict
+    session_id: str | None
+    session_key: str
+    converted_obs: dict
+    model_kwargs: dict[str, object]
+    reset_session_for_workers: bool
+    reset_all_sessions_for_workers: bool
+    rtc_requested: bool
+    rtc_step_idx: int | None
+    rtc_inference_delay_steps: int
+    session_state: RTCSessionState | None
+    had_previous_chunk: bool
+    phase: str
+    wrapper_state: ARSessionState
 
 
 class ARDroidRoboarenaPolicy:
@@ -564,6 +733,18 @@ class ARDroidRoboarenaPolicy:
             video_across_time=self.video_across_time,
         )
         self._model_session_store.capture(session_id)
+        self._active_session_key = key
+
+    def _capture_ar_session_wrapper(self, session_id: str | None) -> None:
+        key = session_key(session_id)
+        self._session_states[key] = ARSessionState(
+            frame_buffers=self._frame_buffers,
+            call_count=self._call_count,
+            is_first_call=self._is_first_call,
+            current_prompt=self._current_prompt,
+            warned_single_external_fallback=self._warned_single_external_fallback,
+            video_across_time=self.video_across_time,
+        )
         self._active_session_key = key
 
     def _clear_ar_session(self, session_id: str | None, *, save_video: bool) -> None:
@@ -809,24 +990,118 @@ class ARDroidRoboarenaPolicy:
         worker_obs[SESSION_ID_KEY] = session_key(session_id)
         worker_obs[RESET_ALL_SESSIONS_KEY] = bool(reset_all_sessions)
         return worker_obs
+
+    def _set_batch_reset_flags(
+        self,
+        converted_obs: dict,
+        reset_flags: list[bool],
+        *,
+        session_ids: list[str | None],
+        reset_all_sessions: bool = False,
+    ) -> dict:
+        if len(reset_flags) != len(session_ids):
+            raise ValueError("reset_flags and session_ids must have the same length.")
+        if len(session_ids) == 1:
+            return self._set_reset_flag(
+                converted_obs,
+                reset_flags[0],
+                session_id=session_ids[0],
+                reset_all_sessions=reset_all_sessions,
+            )
+
+        worker_obs = dict(converted_obs)
+        worker_obs[RESET_FLAG_KEY] = [bool(flag) for flag in reset_flags]
+        worker_obs[SESSION_ID_KEY] = [session_key(session_id) for session_id in session_ids]
+        worker_obs[RESET_ALL_SESSIONS_KEY] = bool(reset_all_sessions)
+        return worker_obs
+
+    @staticmethod
+    def _pack_converted_observations(converted_obs_list: list[dict]) -> dict:
+        if len(converted_obs_list) == 1:
+            return converted_obs_list[0]
+
+        keys = converted_obs_list[0].keys()
+        packed: dict[str, Any] = {}
+        for obs in converted_obs_list[1:]:
+            if obs.keys() != keys:
+                raise BatchIncompatibleError("Cannot batch observations with different converted keys.")
+
+        for key in keys:
+            values = [obs[key] for obs in converted_obs_list]
+            first = values[0]
+            if isinstance(first, np.ndarray):
+                packed[key] = np.stack(values, axis=0)
+            elif torch.is_tensor(first):
+                packed[key] = torch.stack(values, dim=0)
+            elif isinstance(first, str):
+                packed[key] = np.asarray(values)
+            else:
+                packed[key] = np.asarray(values)
+        return packed
+
+    @staticmethod
+    def _converted_video_frame_count(converted_obs: dict) -> int:
+        for key, value in converted_obs.items():
+            if key.startswith("video."):
+                return int(value.shape[0])
+        return 0
+
+    @staticmethod
+    def _slice_action_dict(
+        action_dict: dict[str, np.ndarray | torch.Tensor],
+        batch_index: int,
+        batch_size: int,
+    ) -> dict[str, np.ndarray | torch.Tensor]:
+        if batch_size == 1:
+            return action_dict
+
+        sliced: dict[str, np.ndarray | torch.Tensor] = {}
+        for key, value in action_dict.items():
+            if torch.is_tensor(value):
+                if value.ndim == 0 or value.shape[0] != batch_size:
+                    sliced[key] = value
+                else:
+                    sliced[key] = value[batch_index]
+            else:
+                arr = np.asarray(value)
+                if arr.ndim == 0 or arr.shape[0] != batch_size:
+                    sliced[key] = arr
+                else:
+                    sliced[key] = arr[batch_index]
+        return sliced
+
+    @staticmethod
+    def _snapshot_wrapper_state(
+        frame_buffers: dict[str, list[np.ndarray]],
+        call_count: int,
+        is_first_call: bool,
+        current_prompt: str | None,
+        warned_single_external_fallback: bool,
+        video_across_time: list[tuple[torch.Tensor, int]],
+    ) -> ARSessionState:
+        return ARSessionState(
+            frame_buffers=frame_buffers,
+            call_count=call_count,
+            is_first_call=is_first_call,
+            current_prompt=current_prompt,
+            warned_single_external_fallback=warned_single_external_fallback,
+            video_across_time=video_across_time,
+        )
     
-    def infer(self, obs: dict) -> np.ndarray:
-        """Infer actions from observations.
-        
-        Args:
-            obs: Observation dict in roboarena format
-            
-        Returns:
-            action: (N, 8) action array
-        """
+    def _prepare_inference(
+        self,
+        obs: dict,
+        *,
+        index: int,
+        reset_all_sessions_for_workers: bool,
+    ) -> PreparedARInference:
         session_id = obs.get("session_id", None)
         session_state_key = session_key(session_id)
-        reset_all_sessions_for_workers = self._pending_worker_reset_all
-        reset_session_for_workers = session_state_key in self._pending_worker_reset_sessions
-        if reset_all_sessions_for_workers:
-            self._pending_worker_reset_all = False
-            self._pending_worker_reset_sessions.clear()
-        elif reset_session_for_workers:
+        reset_session_for_workers = (
+            reset_all_sessions_for_workers
+            or session_state_key in self._pending_worker_reset_sessions
+        )
+        if reset_session_for_workers:
             self._pending_worker_reset_sessions.discard(session_state_key)
 
         new_session = session_state_key not in self._session_states
@@ -857,59 +1132,192 @@ class ARDroidRoboarenaPolicy:
                 "Received rtc_inference_delay_steps=%d without rtc_step_idx; ignoring RTC delay metadata for this call.",
                 rtc_inference_delay_steps,
             )
-        
+
         self._msg_index += 1
         self._call_count += 1
-        
+
         session_state = self._get_session_state(session_id) if rtc_requested else None
         had_previous_chunk = bool(
             rtc_requested and session_state is not None and session_state.last_action_chunk_abs is not None
         )
         phase = self._infer_phase(rtc_requested, had_previous_chunk)
-        with nvtx_range(f"dreamzero.ar.infer[{phase}].total"):
-            with nvtx_range(f"dreamzero.ar.infer[{phase}].rtc_request_prepare"):
-                prev_chunk_left_over_abs = None
-                model_kwargs: dict[str, object] = {}
-                if rtc_requested and session_state is not None:
-                    prev_chunk_left_over_abs = compute_prev_chunk_left_over(session_state, rtc_step_idx)
-                    model_kwargs = {
-                        "use_rtc": True,
-                        "prev_chunk_left_over_abs": prev_chunk_left_over_abs,
-                        "inference_delay": rtc_inference_delay_steps,
-                        "rtc_execution_horizon": self._rtc_execution_horizon,
-                        "rtc_max_guidance_weight": self._rtc_max_guidance_weight,
-                        "rtc_prefix_attention_schedule": self._rtc_prefix_attention_schedule,
-                        "rtc_guidance_max_steps": self._rtc_guidance_max_steps,
-                        "rtc_guidance_step_stride": self._rtc_guidance_step_stride,
-                    }
-                    if had_previous_chunk:
-                        left_over_len = 0 if prev_chunk_left_over_abs is None else int(prev_chunk_left_over_abs.shape[0])
-                        logger.info(
-                            "RTC request session=%s step_idx=%d prev_left_over=%d delay=%d",
-                            session_id,
-                            rtc_step_idx,
-                            left_over_len,
-                            rtc_inference_delay_steps,
-                        )
-            with nvtx_range(f"dreamzero.ar.infer[{phase}].convert_observation"):
-                converted_obs = self._convert_observation(obs)
-                worker_obs = self._set_reset_flag(
-                    converted_obs,
-                    reset_session_for_workers,
-                    session_id=session_id,
-                    reset_all_sessions=reset_all_sessions_for_workers,
-                )
-                prompt_for_debug = str(converted_obs.get("annotation.language.action_text", ""))
-                input_vae_debug = self._make_input_vae_debug_spec(prompt_for_debug)
-                if input_vae_debug is not None:
-                    model_kwargs["input_vae_debug"] = input_vae_debug
 
-            # Signal workers to continue (0 = continue)
-            signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+        prev_chunk_left_over_abs = None
+        model_kwargs: dict[str, object] = {}
+        if rtc_requested and session_state is not None:
+            prev_chunk_left_over_abs = compute_prev_chunk_left_over(session_state, rtc_step_idx)
+            model_kwargs = {
+                "use_rtc": True,
+                "prev_chunk_left_over_abs": prev_chunk_left_over_abs,
+                "inference_delay": rtc_inference_delay_steps,
+                "rtc_execution_horizon": self._rtc_execution_horizon,
+                "rtc_max_guidance_weight": self._rtc_max_guidance_weight,
+                "rtc_prefix_attention_schedule": self._rtc_prefix_attention_schedule,
+                "rtc_guidance_max_steps": self._rtc_guidance_max_steps,
+                "rtc_guidance_step_stride": self._rtc_guidance_step_stride,
+            }
+            if had_previous_chunk:
+                left_over_len = 0 if prev_chunk_left_over_abs is None else int(prev_chunk_left_over_abs.shape[0])
+                logger.info(
+                    "RTC request session=%s step_idx=%d prev_left_over=%d delay=%d",
+                    session_id,
+                    rtc_step_idx,
+                    left_over_len,
+                    rtc_inference_delay_steps,
+                )
+
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].convert_observation"):
+            converted_obs = self._convert_observation(obs)
+            prompt_for_debug = str(converted_obs.get("annotation.language.action_text", ""))
+            input_vae_debug = self._make_input_vae_debug_spec(prompt_for_debug)
+            if input_vae_debug is not None:
+                model_kwargs["input_vae_debug"] = input_vae_debug
+
+        wrapper_state = self._snapshot_wrapper_state(
+            self._frame_buffers,
+            self._call_count,
+            self._is_first_call,
+            self._current_prompt,
+            self._warned_single_external_fallback,
+            self.video_across_time,
+        )
+
+        return PreparedARInference(
+            index=index,
+            obs=obs,
+            session_id=None if session_id is None else session_state_key,
+            session_key=session_state_key,
+            converted_obs=converted_obs,
+            model_kwargs=model_kwargs,
+            reset_session_for_workers=reset_session_for_workers,
+            reset_all_sessions_for_workers=reset_all_sessions_for_workers,
+            rtc_requested=rtc_requested,
+            rtc_step_idx=rtc_step_idx,
+            rtc_inference_delay_steps=rtc_inference_delay_steps,
+            session_state=session_state,
+            had_previous_chunk=had_previous_chunk,
+            phase=phase,
+            wrapper_state=wrapper_state,
+        )
+
+    def _batch_group_signature(self, prepared: PreparedARInference) -> tuple:
+        if prepared.model_kwargs:
+            return ("single", prepared.index)
+        return (
+            "batch",
+            self._converted_video_frame_count(prepared.converted_obs),
+            self._model_session_store.state_signature(
+                prepared.session_id,
+                reset=prepared.reset_session_for_workers,
+            ),
+        )
+
+    def _build_inference_groups(self, prepared_items: list[PreparedARInference]) -> list[list[PreparedARInference]]:
+        groups: list[list[PreparedARInference]] = []
+        signature_to_group: dict[tuple, list[PreparedARInference]] = {}
+        for prepared in prepared_items:
+            signature = self._batch_group_signature(prepared)
+            group = signature_to_group.get(signature)
+            if group is None:
+                group = []
+                signature_to_group[signature] = group
+                groups.append(group)
+            group.append(prepared)
+        return groups
+
+    def _postprocess_group_actions(
+        self,
+        prepared_items: list[PreparedARInference],
+        result_batch: Batch,
+        video_pred: torch.Tensor | None,
+    ) -> list[np.ndarray]:
+        batch_size = len(prepared_items)
+        action_dict = self._extract_action_dict(result_batch.act)
+        actions: list[np.ndarray] = []
+
+        for batch_index, prepared in enumerate(prepared_items):
+            self._apply_ar_session_state(prepared.wrapper_state)
+            sliced_action_dict = self._slice_action_dict(action_dict, batch_index, batch_size)
+            action = self._convert_action(sliced_action_dict)
+
+            if prepared.rtc_requested and prepared.had_previous_chunk:
+                if prepared.rtc_inference_delay_steps >= action.shape[0]:
+                    logger.warning(
+                        "RTC inference delay %d exceeds chunk length %d; keeping the final action only.",
+                        prepared.rtc_inference_delay_steps,
+                        action.shape[0],
+                    )
+                action, applied_delay_steps = trim_action_chunk_for_delay(
+                    action,
+                    prepared.rtc_inference_delay_steps,
+                )
+            else:
+                applied_delay_steps = 0
+
+            if prepared.rtc_requested and prepared.session_state is not None:
+                prepared.session_state.last_action_chunk_abs = action.copy()
+                prepared.session_state.request_count += 1
+                prepared.session_state.consumed_steps = 0
+                if prepared.rtc_step_idx is not None:
+                    prepared.session_state.chunk_start_step_idx = prepared.rtc_step_idx + applied_delay_steps
+                else:
+                    prepared.session_state.chunk_start_step_idx = None
+                logger.info(
+                    "RTC stored executable chunk session=%s len=%d chunk_start_step_idx=%s delay_trim=%d",
+                    prepared.session_id,
+                    action.shape[0],
+                    prepared.session_state.chunk_start_step_idx,
+                    applied_delay_steps,
+                )
+
+            if video_pred is not None:
+                video_pred_for_session = (
+                    video_pred[batch_index : batch_index + 1]
+                    if batch_size > 1
+                    else video_pred
+                )
+                video_chunk = self._prepare_video_pred_for_saving(video_pred_for_session)
+                if video_chunk is not None:
+                    self.video_across_time.append(video_chunk)
+
+            if self._is_first_call:
+                self._is_first_call = False
+            self._capture_ar_session_wrapper(prepared.session_id)
+            actions.append(action)
+
+        return actions
+
+    def _run_prepared_group(self, prepared_items: list[PreparedARInference]) -> list[np.ndarray]:
+        if not prepared_items:
+            return []
+        phase = "batch" if len(prepared_items) > 1 else prepared_items[0].phase
+        session_ids = [prepared.session_id for prepared in prepared_items]
+        reset_flags = [prepared.reset_session_for_workers for prepared in prepared_items]
+        reset_all_sessions = any(prepared.reset_all_sessions_for_workers for prepared in prepared_items)
+        model_kwargs = prepared_items[0].model_kwargs
+        if any(prepared.model_kwargs != model_kwargs for prepared in prepared_items):
+            raise BatchIncompatibleError("Cannot batch requests with different model kwargs.")
+
+        with nvtx_range(f"dreamzero.ar.infer[{phase}].total"):
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].session_restore"):
+                self._model_session_store.restore_many(session_ids, resets=reset_flags)
+
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].batch_build"):
+                converted_obs = self._pack_converted_observations(
+                    [prepared.converted_obs for prepared in prepared_items]
+                )
+                worker_obs = self._set_batch_reset_flags(
+                    converted_obs,
+                    reset_flags,
+                    session_ids=session_ids,
+                    reset_all_sessions=reset_all_sessions,
+                )
+                batch = Batch(obs=converted_obs)
+
+            signal_tensor = torch.zeros(1, dtype=torch.int32, device="cpu")
             with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_broadcast.signal"):
                 dist.broadcast(signal_tensor, src=0, group=self._signal_group)
 
-            # Broadcast obs and model kwargs to workers
             self._broadcast_payload_to_workers(
                 {
                     "obs": worker_obs,
@@ -918,11 +1326,6 @@ class ARDroidRoboarenaPolicy:
                 phase=phase,
             )
 
-            # Create batch for policy
-            with nvtx_range(f"dreamzero.ar.infer[{phase}].batch_build"):
-                batch = Batch(obs=converted_obs)
-
-            # Distributed forward pass
             with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_barrier.pre_forward"):
                 dist.barrier()
             with nvtx_range(f"dreamzero.ar.infer[{phase}].policy_forward"):
@@ -931,53 +1334,49 @@ class ARDroidRoboarenaPolicy:
             with nvtx_range(f"dreamzero.ar.infer[{phase}].dist_barrier.post_forward"):
                 dist.barrier()
 
-            # Store video predictions for potential saving.
-            if video_pred is not None:
-                video_pred_to_save = self._prepare_video_pred_for_saving(video_pred)
-                if video_pred_to_save is not None:
-                    self.video_across_time.append(video_pred_to_save)
-
-            # Extract and convert action
+            with nvtx_range(f"dreamzero.ar.infer[{phase}].session_capture"):
+                self._model_session_store.capture_many(session_ids)
             with nvtx_range(f"dreamzero.ar.infer[{phase}].action_postprocess"):
-                action_dict = self._extract_action_dict(result_batch.act)
-                action = self._convert_action(action_dict)
-                if rtc_requested and had_previous_chunk:
-                    if rtc_inference_delay_steps >= action.shape[0]:
-                        logger.warning(
-                            "RTC inference delay %d exceeds chunk length %d; keeping the final action only.",
-                            rtc_inference_delay_steps,
-                            action.shape[0],
-                        )
-                    action, applied_delay_steps = trim_action_chunk_for_delay(
-                        action,
-                        rtc_inference_delay_steps,
-                    )
-                else:
-                    applied_delay_steps = 0
+                return self._postprocess_group_actions(prepared_items, result_batch, video_pred)
 
-                if rtc_requested and session_state is not None:
-                    session_state.last_action_chunk_abs = action.copy()
-                    session_state.request_count += 1
-                    session_state.consumed_steps = 0
-                    if rtc_step_idx is not None:
-                        session_state.chunk_start_step_idx = rtc_step_idx + applied_delay_steps
-                    else:
-                        session_state.chunk_start_step_idx = None
-                    logger.info(
-                        "RTC stored executable chunk session=%s len=%d chunk_start_step_idx=%s delay_trim=%d",
-                        session_id,
-                        action.shape[0],
-                        session_state.chunk_start_step_idx,
-                        applied_delay_steps,
-                    )
-        
-        # Update first call flag
-        if self._is_first_call:
-            self._is_first_call = False
-        with nvtx_range("dreamzero.ar.session.capture"):
-            self._capture_ar_session(session_id)
-        
-        return action
+    def infer_many(self, obs_list: list[dict]) -> list[np.ndarray]:
+        if not obs_list:
+            return []
+
+        reset_all_for_next_group = self._pending_worker_reset_all
+        if reset_all_for_next_group:
+            self._pending_worker_reset_all = False
+            self._pending_worker_reset_sessions.clear()
+
+        prepared_items = [
+            self._prepare_inference(
+                obs,
+                index=index,
+                reset_all_sessions_for_workers=reset_all_for_next_group and index == 0,
+            )
+            for index, obs in enumerate(obs_list)
+        ]
+
+        actions_by_index: list[np.ndarray | None] = [None for _ in obs_list]
+        for group in self._build_inference_groups(prepared_items):
+            try:
+                group_actions = self._run_prepared_group(group)
+            except BatchIncompatibleError:
+                if len(group) == 1:
+                    raise
+                group_actions = []
+                for prepared in group:
+                    group_actions.extend(self._run_prepared_group([prepared]))
+            for prepared, action in zip(group, group_actions, strict=True):
+                actions_by_index[prepared.index] = action
+
+        if any(action is None for action in actions_by_index):
+            raise RuntimeError("Missing action for one or more DreamZero batched requests.")
+        return [action for action in actions_by_index if action is not None]
+
+    def infer(self, obs: dict) -> np.ndarray:
+        """Infer actions from one roboarena observation."""
+        return self.infer_many([obs])[0]
     
     def _prepare_video_pred_for_saving(self, video_pred: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         condition_latent_frames = int(
@@ -1250,15 +1649,24 @@ class WebsocketPolicyServer:
                 # This is a simplified version - the actual obs structure needs to be broadcasted
                 with nvtx_range("dreamzero.ar.worker.receive_payload"):
                     batch, model_kwargs = self._receive_batch_from_rank0()
-                reset_flag = bool(batch.obs.pop(RESET_FLAG_KEY, False))
+                reset_flag_raw = batch.obs.pop(RESET_FLAG_KEY, False)
                 reset_all_sessions = bool(batch.obs.pop(RESET_ALL_SESSIONS_KEY, False))
                 worker_session_id = batch.obs.pop(SESSION_ID_KEY, None)
                 with nvtx_range("dreamzero.ar.worker.session_restore"):
                     if reset_all_sessions:
                         self._session_store.reset_all()
-                    if worker_session_id is not None:
-                        self._session_store.restore(str(worker_session_id), reset=reset_flag)
-                    elif reset_flag:
+                    if isinstance(worker_session_id, list):
+                        if isinstance(reset_flag_raw, list):
+                            reset_flags = [bool(flag) for flag in reset_flag_raw]
+                        else:
+                            reset_flags = [bool(reset_flag_raw) for _ in worker_session_id]
+                        self._session_store.restore_many(
+                            [str(session_id) for session_id in worker_session_id],
+                            resets=reset_flags,
+                        )
+                    elif worker_session_id is not None:
+                        self._session_store.restore(str(worker_session_id), reset=bool(reset_flag_raw))
+                    elif bool(reset_flag_raw):
                         self._reset_policy_temporal_state()
                 # Participate in distributed forward pass
                 with nvtx_range("dreamzero.ar.worker.dist_barrier.pre_forward"):
@@ -1268,7 +1676,10 @@ class WebsocketPolicyServer:
                         result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch, **model_kwargs)
                 with nvtx_range("dreamzero.ar.worker.dist_barrier.post_forward"):
                     dist.barrier()
-                if worker_session_id is not None:
+                if isinstance(worker_session_id, list):
+                    with nvtx_range("dreamzero.ar.worker.session_capture"):
+                        self._session_store.capture_many([str(session_id) for session_id in worker_session_id])
+                elif worker_session_id is not None:
                     with nvtx_range("dreamzero.ar.worker.session_capture"):
                         self._session_store.capture(str(worker_session_id))
 
@@ -1656,6 +2067,13 @@ def main(args: Args) -> None:
             "Checkpoint mode %s is cache-order-sensitive; RTC requests will be ignored.",
             mot_inference_video_mode,
         )
+    action_head = getattr(getattr(policy, "trained_model", None), "action_head", None)
+    dynamic_cache_schedule = bool(getattr(action_head, "dynamic_cache_schedule", False))
+    supports_batching = not dynamic_cache_schedule
+    if dynamic_cache_schedule:
+        logger.warning(
+            "Disabling server-side request batching because DYNAMIC_CACHE_SCHEDULE uses batch-global skip state."
+        )
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
@@ -1710,6 +2128,9 @@ def main(args: Args) -> None:
         supports_rtc=not cache_order_sensitive,
         supports_async_prefetch=not cache_order_sensitive,
         supports_parallel_sessions=True,
+        supports_batching=supports_batching,
+        max_batch_size=args.batch_max_size,
+        batch_timeout_ms=args.batch_timeout_ms,
     )
     
     if rank == 0:
