@@ -59,6 +59,15 @@ class _InferRequest:
     future: asyncio.Future
 
 
+@dataclasses.dataclass
+class _ResetRequest:
+    obs: dict[str, Any]
+    future: asyncio.Future
+
+
+_PolicyRequest = _InferRequest | _ResetRequest
+
+
 class WebsocketPolicyServer:
     """
     Serves a policy using the websocket protocol.
@@ -98,7 +107,8 @@ class WebsocketPolicyServer:
         self._port = port
         self._open_timeout = _normalize_timeout(open_timeout)
         self._policy_lock = asyncio.Lock()
-        self._infer_queue: asyncio.Queue[_InferRequest] | None = None
+        self._request_queue: asyncio.Queue[_PolicyRequest] | None = None
+        self._deferred_request: _PolicyRequest | None = None
         self._batch_worker_task: asyncio.Task | None = None
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
@@ -107,7 +117,7 @@ class WebsocketPolicyServer:
 
     async def run(self):
         if self._server_config.supports_batching:
-            self._infer_queue = asyncio.Queue()
+            self._request_queue = asyncio.Queue()
             self._batch_worker_task = asyncio.create_task(self._infer_batch_worker())
         async with websockets.asyncio.server.serve(
             self._handler,
@@ -132,46 +142,79 @@ class WebsocketPolicyServer:
                 action = {"actions": action}
             return action
 
-        if self._infer_queue is None:
+        if self._request_queue is None:
             raise RuntimeError("Batched inference queue was not initialized.")
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        await self._infer_queue.put(_InferRequest(obs=obs, future=future))
+        await self._request_queue.put(_InferRequest(obs=obs, future=future))
+        return await future
+
+    async def _reset(self, obs: dict[str, Any]) -> str:
+        if not self._server_config.supports_batching:
+            async with self._policy_lock:
+                self._policy.reset(obs)
+            return "reset successful"
+
+        if self._request_queue is None:
+            raise RuntimeError("Batched inference queue was not initialized.")
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._request_queue.put(_ResetRequest(obs=obs, future=future))
         return await future
 
     async def _infer_batch_worker(self) -> None:
-        assert self._infer_queue is not None
+        assert self._request_queue is not None
         max_batch_size = max(int(self._server_config.max_batch_size), 1)
         batch_timeout = max(float(self._server_config.batch_timeout_ms), 0.0) / 1000.0
 
         while True:
-            first_request = await self._infer_queue.get()
+            if self._deferred_request is not None:
+                first_request = self._deferred_request
+                self._deferred_request = None
+            else:
+                first_request = await self._request_queue.get()
+
+            if isinstance(first_request, _ResetRequest):
+                try:
+                    async with self._policy_lock:
+                        self._policy.reset(first_request.obs)
+                    if not first_request.future.cancelled():
+                        first_request.future.set_result("reset successful")
+                except Exception as exc:
+                    if not first_request.future.cancelled():
+                        first_request.future.set_exception(exc)
+                continue
+
             active_requests = [first_request]
             try:
+                requests = [first_request]
+                deadline = asyncio.get_running_loop().time() + batch_timeout
+                while len(requests) < max_batch_size:
+                    if batch_timeout == 0:
+                        try:
+                            request = self._request_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    else:
+                        timeout = deadline - asyncio.get_running_loop().time()
+                        if timeout <= 0:
+                            break
+                        try:
+                            request = await asyncio.wait_for(self._request_queue.get(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            break
+                    if isinstance(request, _ResetRequest):
+                        self._deferred_request = request
+                        break
+                    requests.append(request)
+
+                active_requests = [request for request in requests if not request.future.cancelled()]
+                if not active_requests:
+                    continue
+
                 async with self._policy_lock:
-                    requests = [first_request]
-                    deadline = asyncio.get_running_loop().time() + batch_timeout
-                    while len(requests) < max_batch_size:
-                        if batch_timeout == 0:
-                            try:
-                                request = self._infer_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                        else:
-                            timeout = deadline - asyncio.get_running_loop().time()
-                            if timeout <= 0:
-                                break
-                            try:
-                                request = await asyncio.wait_for(self._infer_queue.get(), timeout=timeout)
-                            except asyncio.TimeoutError:
-                                break
-                        requests.append(request)
-
-                    active_requests = [request for request in requests if not request.future.cancelled()]
-                    if not active_requests:
-                        continue
-
                     if len(active_requests) > 1 and hasattr(self._policy, "infer_many"):
                         actions = self._policy.infer_many([request.obs for request in active_requests])
                     else:
@@ -192,6 +235,9 @@ class WebsocketPolicyServer:
                 for request in active_requests:
                     if not request.future.cancelled():
                         request.future.set_exception(exc)
+                if self._deferred_request is not None and self._deferred_request.future.cancelled():
+                    self._deferred_request = None
+
 
     async def _handler(self, websocket: websockets.asyncio.server.ServerConnection):
         logging.info(f"Connection from {websocket.remote_address} opened")
@@ -207,9 +253,7 @@ class WebsocketPolicyServer:
                 endpoint = obs["endpoint"]
                 del obs["endpoint"]
                 if endpoint == "reset":
-                    async with self._policy_lock:
-                        self._policy.reset(obs)
-                    to_return = "reset successful"
+                    to_return = await self._reset(obs)
                 else:
                     action = await self._infer(obs)
                     to_return = packer.pack(action)

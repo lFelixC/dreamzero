@@ -2035,6 +2035,13 @@ def main(args: Args) -> None:
             "Checkpoint mode %s is cache-order-sensitive; RTC requests will be ignored.",
             mot_inference_video_mode,
         )
+    action_head = getattr(getattr(policy, "trained_model", None), "action_head", None)
+    dynamic_cache_schedule = bool(getattr(action_head, "dynamic_cache_schedule", False))
+    supports_batching = not dynamic_cache_schedule
+    if dynamic_cache_schedule:
+        logger.warning(
+            "Disabling server-side request batching because DYNAMIC_CACHE_SCHEDULE uses batch-global skip state."
+        )
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
@@ -2085,7 +2092,7 @@ def main(args: Args) -> None:
         supports_rtc=not cache_order_sensitive,
         supports_async_prefetch=not cache_order_sensitive,
         supports_parallel_sessions=True,
-        supports_batching=True,
+        supports_batching=supports_batching,
         max_batch_size=args.batch_max_size,
         batch_timeout_ms=args.batch_timeout_ms,
     )
