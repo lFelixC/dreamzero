@@ -6,7 +6,7 @@ source .venv/bin/activate
 NO_ALBUMENTATIONS_UPDATE=1 \
 CUDA_VISIBLE_DEVICES=0,1 \
 python -m torch.distributed.run --standalone --nproc_per_node=2 \
-socket_test_optimized_AR.py \
+socket_test_robolab_AR.py \
   --port 5001 \
   --enable-dit-cache \
   --model-path /data/checkpoints/dreamzero/DreamZero-DROID
@@ -596,5 +596,4 @@ python /data/dreamzero/video_eval/run_batch_eval.py \
 * 输出目录在哪里
 * summary 文件在哪里
 * 当前已知限制有哪些
-
 

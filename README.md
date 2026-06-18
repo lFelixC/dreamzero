@@ -130,23 +130,40 @@ For RoboLab 120-task benchmark evaluation with SSH tunneling and the local RoboL
 
 ### Command Overview
 
-The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:
+DreamZero ships **two** websocket server entrypoints that share the same model
+code but speak different wire protocols. Pick the one that matches your client;
+they are **not** interchangeable.
+
+| Entrypoint | Protocol | Client | Sessions / batching |
+|---|---|---|---|
+| `socket_test_optimized_AR.py` | native DROID (`video.*` / `state.*` / `annotation.*`), sends plain `policy_metadata` | legacy DreamZero native websocket clients | single-session, no batching |
+| `socket_test_robolab_AR.py` | RoboArena (`observation/*` + `session_id` + `endpoint`), sends `PolicyServerConfig` | RoboLab, RoboArena, `test_client_AR.py` | per-`session_id`, server-side batching |
+
+The inference servers use PyTorch distributed training utilities to parallelize the model across multiple GPUs.
+
+RoboLab / RoboArena server (default for the 120-task benchmark and `run_parallel.py`):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint> --batch-max-size 8 --batch-timeout-ms 8.0
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_robolab_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint> --batch-max-size 8 --batch-timeout-ms 8.0
 ```
 
-The server keeps per-`session_id` temporal/cache state (`ActionHeadSessionStore`) and supports concurrent sessions plus server-side request batching, so multiple client processes (and `--num-envs > 1` within a single process) are state-safe. `--batch-max-size` caps how many concurrent requests are aggregated into one forward, and `--batch-timeout-ms` is the wait window to fill that batch; raise both as concurrency grows. Note that a batch is only actually filled when multiple **independent connections** query the server at the same time (e.g. several `run_parallel.py` workers) — within one process the RoboLab client queries its envs sequentially, so `--num-envs > 1` is state-safe but does not by itself fill the batch. The server logs a rolling `policy_batch_summary` every 5s (per-forward sizes are at DEBUG) so you can confirm batches are actually filling.
+Legacy native DROID server (original `video.*` clients):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint>
+```
+
+The RoboLab server keeps per-`session_id` temporal/cache state (`ActionHeadSessionStore`) and supports concurrent sessions plus server-side request batching, so multiple client processes (and `--num-envs > 1` within a single process) are state-safe. `--batch-max-size` caps how many concurrent requests are aggregated into one forward, and `--batch-timeout-ms` is the wait window to fill that batch; raise both as concurrency grows. Note that a batch is only actually filled when multiple **independent connections** query the server at the same time (e.g. several `run_parallel.py` workers) — within one process the RoboLab client queries its envs sequentially, so `--num-envs > 1` is state-safe but does not by itself fill the batch. The server logs a rolling `policy_batch_summary` every 5s (per-forward sizes are at DEBUG) so you can confirm batches are actually filling. The native `socket_test_optimized_AR.py` server does not expose these batching flags (it is single-session).
 
 (Optional only for GB200) Tensorrt enables faster generation
 ```bash
 export LOAD_TRT_ENGINE=<path/to/checkpoint>/tensorrt/wan/WanModel_nvfp4.trt 
 export DYNAMIC_CACHE_SCHEDULE=true 
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 /mnt/aws-lfs-02/shared/seonghyeony/dreamzero/socket_test_optimized_AR.py --port 8000 --enable-dit-cache --model-path <path/to/checkpoint>
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_robolab_AR.py --port 8000 --enable-dit-cache --model-path <path/to/checkpoint>
 ```
 
-> Note: `DYNAMIC_CACHE_SCHEDULE=true` uses batch-global skip state, so the server automatically disables request batching (`supports_batching=False`) in that mode. Concurrency across clients is still safe, but each request runs as its own forward rather than an aggregated batch.
-To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
+> Note: `DYNAMIC_CACHE_SCHEDULE=true` uses batch-global skip state, so the RoboLab server automatically disables request batching (`supports_batching=False`) in that mode. Concurrency across clients is still safe, but each request runs as its own forward rather than an aggregated batch.
+To verify the RoboLab server is working, run the RoboArena test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
 
 ```
 python test_client_AR.py --port 5000
@@ -154,12 +171,16 @@ python test_client_AR.py --port 5000
 
 ### Command-line Arguments
 
+Both servers accept the common flags below; only `socket_test_robolab_AR.py`
+additionally accepts the batching flags (`--batch-max-size` / `--batch-timeout-ms`).
+
 - `--port`: Port number for the WebSocket server (default: 8000)
 - `--model-path`: Path to the pretrained model checkpoint directory
 - `--enable-dit-cache`: Enable caching in DiT layers for faster inference (recommended)
 - `--max-chunk-size`: Override max_chunk_size for inference (optional)
 - `--timeout-seconds`: Server timeout in seconds (default: 50000)
 - `--index`: Index for output directory naming (default: 0)
+- (`socket_test_robolab_AR.py` only) `--batch-max-size` / `--batch-timeout-ms`: server-side request aggregation control.
 
 
 ### Output

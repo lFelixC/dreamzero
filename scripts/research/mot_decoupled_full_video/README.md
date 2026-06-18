@@ -2,7 +2,7 @@
 
 这组脚本只做薄封装，新的 checkpoint 仍然复用现有入口：
 
-- server: `/data/dreamzero/socket_test_optimized_AR.py`
+- server: `/data/dreamzero/socket_test_robolab_AR.py`（RoboArena/RoboLab 协议；真机 DROID client 用 `WebsocketClientPolicy` 读 `PolicyServerConfig`，必须用这个入口而不是原生 `socket_test_optimized_AR.py`）
 - client: `/data/dreamzero/droid-client/scripts/main_dreamzero_test.py`
 
 对齐契约：
@@ -57,7 +57,7 @@ PYTHONPATH=/data/dreamzero:${PYTHONPATH:-} \
 /data/dreamzero/.venv/bin/python -m torch.distributed.run \
   --nproc_per_node 2 \
   --standalone \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --model-path <NEW_CHECKPOINT_PATH> \
   --architecture auto \
   --host 0.0.0.0 \

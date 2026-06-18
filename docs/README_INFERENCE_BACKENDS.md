@@ -3,6 +3,7 @@
 This note collects the runtime flags for:
 
 - `socket_test_optimized_AR.py`
+- `socket_test_robolab_AR.py`
 - `socket_test_optimized_aloha_x5lite_bimanual.py`
 - `eval_utils/serve_dreamzero_wan22.py`
 
@@ -69,6 +70,10 @@ PY
 ## 3. AR Server Recipes
 
 All examples below use two GPUs. Replace `0,1` and `--nproc_per_node 2` as needed.
+The commands show the legacy native AR entrypoint; use
+`socket_test_robolab_AR.py` instead when the client expects RoboArena
+`PolicyServerConfig` metadata (RoboLab, `test_client_AR.py`, or
+`example/remote_infer/main_dreamzero.py`).
 
 ### 3.1 FA2 without `torch.compile`
 
