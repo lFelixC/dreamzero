@@ -68,7 +68,7 @@ echo "  MOT_DECOUPLED_INFERENCE_VIDEO_REFRESH_STEPS=${MOT_DECOUPLED_INFERENCE_VI
 exec "${PYTHON_BIN}" -m torch.distributed.run \
   --nproc_per_node "${NPROC_PER_NODE}" \
   --standalone \
-  "${REPO_ROOT}/socket_test_optimized_AR.py" \
+  "${REPO_ROOT}/socket_test_robolab_AR.py" \
   --model-path "${MODEL_PATH_RESOLVED}" \
   --architecture auto \
   --host "${HOST}" \

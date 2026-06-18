@@ -3,7 +3,7 @@
 
 Sends real video frames from debug_image/ directory instead of zero dummy images.
 
-Frame schedule (matching debug_inference.py):
+Frame schedule (matching the DROID video block cadence):
   - Step 0 (initial): send frame [0]             (1 frame, H W 3)
   - Step 1: send frames [0, 7, 15, 23]           (4 frames, 4 H W 3)
   - Step 2: send frames [24, 31, 39, 47]         (4 frames)
@@ -18,7 +18,7 @@ Expected server configuration:
 
 Usage:
     # Start server with roboarena interface:
-    torchrun --nproc_per_node=8 socket_test_optimized_AR.py --port 8000
+    torchrun --nproc_per_node=8 socket_test_robolab_AR.py --port 8000
 
     # Run this test:
     python test_client_AR.py --host <server_host> --port 8000
@@ -48,7 +48,7 @@ CAMERA_FILES = {
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
 
-# Frame schedule constants (matching debug_inference.py)
+# Frame schedule constants (matching the DROID video block cadence)
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
 ACTION_HORIZON = 24
 
@@ -223,7 +223,7 @@ def test_ar_droid_policy_server(
     """Test the AR_droid policy server with roboarena interface.
 
     When use_zero_images is False (default), loads real video frames from
-    debug_image/ and follows the frame schedule from debug_inference.py.
+    debug_image/ and follows the DROID video block cadence.
     """
     logging.info(f"Connecting to AR_droid server at {host}:{port}...")
     

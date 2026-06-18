@@ -109,7 +109,7 @@ bash scripts/train/droid_wan22_mot_full.sh
 
 ## 两卡推理命令
 
-`socket_test_optimized_AR.py` 会从 checkpoint 的 `config.json` 读取 `architecture` 和 `mot_action_video_attention`。因此 first-frame 与 full-video 需要使用对应配置的 checkpoint，或使用只改 `config.json` 的 checkpoint view。
+`socket_test_robolab_AR.py` 会从 checkpoint 的 `config.json` 读取 `architecture` 和 `mot_action_video_attention`，并向 `test_client_AR.py` / `example/remote_infer/main_dreamzero.py` 发送 RoboArena `PolicyServerConfig`。因此 first-frame 与 full-video 需要使用对应配置的 checkpoint，或使用只改 `config.json` 的 checkpoint view。原生 `video.*` client 才使用 `socket_test_optimized_AR.py`。
 
 本机已验证的 smoke checkpoint：
 
@@ -126,7 +126,7 @@ TORCH_COMPILE_BACKEND= \
 /data/dreamzero/.venv/bin/python -m torch.distributed.run \
   --nproc_per_node 2 \
   --standalone \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --model-path /data/checkpoints/dreamzero/dreamzero_droid_wan22_mot_smoke_first/checkpoint-1 \
   --architecture mot \
   --host 127.0.0.1 \
@@ -147,7 +147,7 @@ TORCH_COMPILE_BACKEND= \
 /data/dreamzero/.venv/bin/python -m torch.distributed.run \
   --nproc_per_node 2 \
   --standalone \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --model-path /data/checkpoints/dreamzero/dreamzero_droid_wan22_mot_smoke_full_config/checkpoint-1 \
   --architecture mot \
   --host 127.0.0.1 \
@@ -243,7 +243,7 @@ DISABLE_TORCH_COMPILE=true \
 /data/dreamzero/.venv/bin/python -m torch.distributed.run \
   --nproc_per_node 2 \
   --standalone \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --model-path /data/checkpoints/dreamzero/dreamzero_droid_wan22_mot_decoupled_smoke/checkpoint-1 \
   --architecture auto \
   --host 127.0.0.1 \

@@ -2,6 +2,12 @@
 
 本文档记录 DreamZero AR server 配合 RoboLab 进行本地/远程评测的完整流程。命令按“可以直接复制执行”的方式组织。
 
+> ⚠️ **两个 server 不要混用。** DreamZero 提供两个 websocket 入口：
+> - `socket_test_robolab_AR.py`：RoboArena/RoboLab 协议（`observation/*` + `session_id` + `endpoint`，连接后下发 `PolicyServerConfig`）。**RoboLab 评测用这个**，支持逐 `session_id` 状态隔离和 server 端 batching。
+> - `socket_test_optimized_AR.py`：原生 DROID 协议（`video.*` / `state.*` / `annotation.*`，下发 `policy_metadata`），单 session、无 batching。只给老的 `video.*` 原生 client 用。
+>
+> 两者**不兼容**，不能把 RoboLab client 指向原生 server，反之亦然。本文档所有命令都使用 `socket_test_robolab_AR.py`。
+
 ## 结论先看
 
 RoboLab 默认 benchmark 集合就是 120 个任务：
@@ -25,7 +31,7 @@ find /workspace/robolab/robolab/tasks/benchmark \
 
 ### 并发 session 与 server 端 batching
 
-`socket_test_optimized_AR.py` 启动的 AR server **不是单 temporal state**：
+`socket_test_robolab_AR.py` 启动的 AR server **不是单 temporal state**：
 
 - 它通过 `supports_parallel_sessions=True` + 逐 session 的 `ActionHeadSessionStore`，为每条连接上的 episode 独立保存 causal / frame buffer / KV-cache 等状态，按 `session_id` 区分，互不污染。
 - 它开启 server 端 batching：多个 client 的请求会在 server 进程内聚合成一个 `batch_size>1` 的 forward（受 `--batch-max-size` / `--batch-timeout-ms` 控制），用以提升单 GPU 的吞吐。
@@ -68,7 +74,7 @@ cd /workspace/dreamzero
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --standalone \
   --nproc_per_node=2 \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --host 127.0.0.1 \
   --port 8000 \
   --model-path /path/to/dreamzero/checkpoint \
@@ -92,7 +98,7 @@ cd /workspace/dreamzero
 CUDA_VISIBLE_DEVICES=0 torchrun \
   --standalone \
   --nproc_per_node=1 \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --host 127.0.0.1 \
   --port 8000 \
   --model-path /path/to/dreamzero/checkpoint \
@@ -456,7 +462,7 @@ ssh -N -L 5000:127.0.0.1:8000 liuf-nc118
 
 ### 多开 RoboLab 进程 / 多 env 连同一个 DreamZero server 安全吗
 
-安全。`socket_test_optimized_AR.py` 为每条连接按 `session_id` 独立保存 temporal cache / frame buffer / reset 状态（`ActionHeadSessionStore`），并发请求互不污染，并会在 server 端聚合成 batch forward。每个 RoboLab 进程 / 每个 env 只要用不同的 `session_id`（客户端默认会传）即可。
+安全。`socket_test_robolab_AR.py` 为每条连接按 `session_id` 独立保存 temporal cache / frame buffer / reset 状态（`ActionHeadSessionStore`），并发请求互不污染，并会在 server 端聚合成 batch forward。每个 RoboLab 进程 / 每个 env 只要用不同的 `session_id`（客户端默认会传）即可。
 
 只有在以下情况才需要串行 `--num-envs 1`，或多起几套独立 server：
 
@@ -480,7 +486,7 @@ server C: remote 8002 -> local 5002
 ```bash
 cd /workspace/dreamzero
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --host 127.0.0.1 \
   --port 8000 \
   --model-path /path/to/dreamzero/checkpoint \

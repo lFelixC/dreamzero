@@ -2,7 +2,7 @@
 
 这份文档对应当前的 inference-only RTC 改造，覆盖：
 
-- 单臂 server: `/data/dreamzero/socket_test_optimized_AR.py`
+- 单臂 server: `/data/dreamzero/socket_test_robolab_AR.py`（RoboArena 协议，配合 `main_dreamzero.py` 的 `PolicyServerConfig` 握手）
 - 双臂 server: `/data/dreamzero/socket_test_optimized_aloha_x5lite_bimanual.py`
 - 单臂 client: `/data/dreamzero/example/remote_infer/main_dreamzero.py`
 - 双臂 client: `/data/aloha_agilex_arx5/python/examples/X5lite_old/inference_dreamzero_aloha_sync.py`
@@ -58,7 +58,7 @@
 cd /data/dreamzero
 
 torchrun --standalone --nproc_per_node 1 \
-  socket_test_optimized_AR.py \
+  socket_test_robolab_AR.py \
   --model-path /path/to/checkpoint \
   --port 8000 \
   --enable-dit-cache \

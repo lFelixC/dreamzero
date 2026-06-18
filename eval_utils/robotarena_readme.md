@@ -3,7 +3,7 @@
 This note documents the exact RoboArena-compatible serving flow for the DreamZero 5B checkpoint:
 
 - Checkpoint: `/data/checkpoints/dreamzero/dreamzero_droid_wan22_5B_full_finetune/checkpoint-8000`
-- Server entrypoint: `/data/dreamzero/socket_test_optimized_AR.py`
+- Server entrypoint: `/data/dreamzero/socket_test_robolab_AR.py` (RoboArena/RoboLab protocol — sends `PolicyServerConfig` metadata; do NOT use the legacy native `socket_test_optimized_AR.py` here, it only sends `policy_metadata` and will fail the handshake)
 - GPUs: `CUDA_VISIBLE_DEVICES=6,7`
 - Port: `8000`
 
@@ -34,7 +34,7 @@ source /data/dreamzero/.venv/bin/activate
 
 CUDA_VISIBLE_DEVICES=6,7 \
 python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  /data/dreamzero/socket_test_optimized_AR.py \
+  /data/dreamzero/socket_test_robolab_AR.py \
   --port 8000 \
   --enable-dit-cache \
   --model-path /data/checkpoints/dreamzero/dreamzero_droid_wan22_5B_full_finetune/checkpoint-8000
@@ -141,7 +141,7 @@ Ctrl+C
 If it was launched in the background, stop the matching torchrun process:
 
 ```bash
-ps -ef | rg 'socket_test_optimized_AR.py|torch.distributed.run'
+ps -ef | rg 'socket_test_robolab_AR.py|torch.distributed.run'
 kill <pid>
 ```
 
