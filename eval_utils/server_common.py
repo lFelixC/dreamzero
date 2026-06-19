@@ -1557,6 +1557,55 @@ class WebsocketPolicyServer:
     def _reset_policy_temporal_state(self) -> None:
         self._session_store.reset_loaded_state()
 
+    @staticmethod
+    def _worker_scalar(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, bytes):
+            return value.decode()
+        return value
+
+    @classmethod
+    def _worker_session_ids(cls, value: Any) -> str | list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                scalar = cls._worker_scalar(value.item())
+                return None if scalar is None else str(scalar)
+            return [str(cls._worker_scalar(item)) for item in value.reshape(-1).tolist()]
+        if isinstance(value, (list, tuple)):
+            return [str(cls._worker_scalar(item)) for item in value]
+        scalar = cls._worker_scalar(value)
+        return None if scalar is None else str(scalar)
+
+    @classmethod
+    def _worker_reset_flags(cls, value: Any, count: int) -> list[bool]:
+        if count <= 0:
+            return []
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return [bool(cls._worker_scalar(value.item())) for _ in range(count)]
+            values = value.reshape(-1).tolist()
+        elif isinstance(value, (list, tuple)):
+            values = list(value)
+        else:
+            return [bool(cls._worker_scalar(value)) for _ in range(count)]
+
+        if len(values) == 1 and count != 1:
+            return [bool(cls._worker_scalar(values[0])) for _ in range(count)]
+        if len(values) != count:
+            raise ValueError(f"Expected {count} reset flag(s), got {len(values)}.")
+        return [bool(cls._worker_scalar(item)) for item in values]
+
+    @classmethod
+    def _worker_any_reset(cls, value: Any) -> bool:
+        if isinstance(value, np.ndarray):
+            return bool(np.any(value))
+        if isinstance(value, (list, tuple)):
+            return any(bool(cls._worker_scalar(item)) for item in value)
+        return bool(cls._worker_scalar(value))
+
     def _save_input_obs(self, obs: dict) -> None:
         """Save incoming observation images per message.
 
@@ -1694,23 +1743,21 @@ class WebsocketPolicyServer:
                 with nvtx_range("dreamzero.ar.worker.receive_payload"):
                     batch, model_kwargs = self._receive_batch_from_rank0()
                 reset_flag_raw = batch.obs.pop(RESET_FLAG_KEY, False)
-                reset_all_sessions = bool(batch.obs.pop(RESET_ALL_SESSIONS_KEY, False))
-                worker_session_id = batch.obs.pop(SESSION_ID_KEY, None)
+                reset_all_sessions = self._worker_any_reset(batch.obs.pop(RESET_ALL_SESSIONS_KEY, False))
+                worker_session_id = self._worker_session_ids(batch.obs.pop(SESSION_ID_KEY, None))
                 with nvtx_range("dreamzero.ar.worker.session_restore"):
                     if reset_all_sessions:
                         self._session_store.reset_all()
                     if isinstance(worker_session_id, list):
-                        if isinstance(reset_flag_raw, list):
-                            reset_flags = [bool(flag) for flag in reset_flag_raw]
-                        else:
-                            reset_flags = [bool(reset_flag_raw) for _ in worker_session_id]
+                        reset_flags = self._worker_reset_flags(reset_flag_raw, len(worker_session_id))
                         self._session_store.restore_many(
-                            [str(session_id) for session_id in worker_session_id],
+                            worker_session_id,
                             resets=reset_flags,
                         )
                     elif worker_session_id is not None:
-                        self._session_store.restore(str(worker_session_id), reset=bool(reset_flag_raw))
-                    elif bool(reset_flag_raw):
+                        reset_flag = self._worker_reset_flags(reset_flag_raw, 1)[0]
+                        self._session_store.restore(worker_session_id, reset=reset_flag)
+                    elif self._worker_any_reset(reset_flag_raw):
                         self._reset_policy_temporal_state()
                 # Participate in distributed forward pass
                 with nvtx_range("dreamzero.ar.worker.dist_barrier.pre_forward"):
@@ -1722,10 +1769,10 @@ class WebsocketPolicyServer:
                     dist.barrier()
                 if isinstance(worker_session_id, list):
                     with nvtx_range("dreamzero.ar.worker.session_capture"):
-                        self._session_store.capture_many([str(session_id) for session_id in worker_session_id])
+                        self._session_store.capture_many(worker_session_id)
                 elif worker_session_id is not None:
                     with nvtx_range("dreamzero.ar.worker.session_capture"):
-                        self._session_store.capture(str(worker_session_id))
+                        self._session_store.capture(worker_session_id)
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
