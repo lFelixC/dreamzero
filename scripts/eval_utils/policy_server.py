@@ -38,6 +38,10 @@ class PolicyServerConfig:
     cache_order_sensitive: bool = False
     supports_rtc: bool = True
     supports_async_prefetch: bool = True
+    supports_parallel_sessions: bool = False
+    supports_batching: bool = False
+    max_batch_size: int = 8
+    batch_timeout_ms: float = 2.0
 
 
 class WebsocketPolicyServer:
