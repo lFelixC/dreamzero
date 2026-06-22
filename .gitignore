@@ -14,8 +14,8 @@ __pycache__/
 results/
 scripts/results/
 video_*.mp4
-robot_camera_views.png
-scripts/robot_camera_views.png
+robot_camera_views*.png
+scripts/robot_camera_views*.png
 scripts/rtc_trace.jsonl
 
 # Local package artifacts
